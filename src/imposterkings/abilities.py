@@ -1,0 +1,397 @@
+"""Card semantics: the ``resolve(state, action)`` dispatcher and every ability's effect.
+
+This is the rules arbiter (bigtwo's ``combos.py`` analog). :mod:`state` owns the container and the
+turn/stack plumbing and delegates ``GameState.apply`` here. Everything is expressed as copy-on-write
+transitions on :class:`~imposterkings.state.GameState` via its ``advance`` / ``replace_top`` /
+``with_`` helpers, so an action either pushes more decision steps (ability sub-choices, reaction
+windows) or ends the turn when the resolution stack empties.
+
+Key conventions:
+- One ``ABILITY_MAY`` decision (and exactly one King's-Hand reaction window) gates each optional
+  on-play ability. Inner choices (Soldier's package, Mystic's number, Judge's queue) are NOT
+  separately counterable -- one window per played card.
+- A "may" ability is countered by discarding BOTH King's Hand and the played card (removing it from
+  the stack). Queen's mandatory disgrace and the passive overrides (Elder/Zealot/Warlord/Oathbound)
+  are never counterable.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import List, Optional, Tuple
+
+from . import cards, rules
+from .actions import Action, ActionKind, StepKind
+from .cards import Ability
+from .state import GameState, PendingStep, StackCard
+
+# Instance ids of the unique reaction cards (scanned once from the registry).
+KINGSHAND_ID = next(i for i, d in enumerate(cards.CARD_DEFS) if d.ability == Ability.KINGSHAND)
+ASSASSIN_ID = next(i for i, d in enumerate(cards.CARD_DEFS) if d.ability == Ability.ASSASSIN)
+
+# Optional ("may") on-play abilities, each gated by an ABILITY_MAY decision.
+_OPTIONAL_ONPLAY = frozenset({
+    Ability.PRINCESS, Ability.SENTRY, Ability.MYSTIC,
+    Ability.JUDGE, Ability.SOLDIER, Ability.INQUISITOR, Ability.FOOL,
+})
+
+# Guess abilities make their guess PUBLIC first, then open the King's-Hand window (so the defender
+# knows what they are countering). The other optional abilities open the window at declare time --
+# the source card on the stack already says what is being countered.
+_GUESS_ABILITIES = frozenset({Ability.JUDGE, Ability.SOLDIER, Ability.INQUISITOR})
+
+
+# --- tiny immutable-sequence helpers ---------------------------------------------------
+
+def _without(seq: Tuple[int, ...], item: int) -> Tuple[int, ...]:
+    i = seq.index(item)
+    return seq[:i] + seq[i + 1:]
+
+
+def _without_index(seq: tuple, i: int) -> tuple:
+    return seq[:i] + seq[i + 1:]
+
+
+def _set_index(seq: tuple, i: int, val) -> tuple:
+    return seq[:i] + (val,) + seq[i + 1:]
+
+
+def _add_to_hand(hand: Tuple[int, ...], card: int) -> Tuple[int, ...]:
+    return tuple(sorted(hand + (card,)))
+
+
+# --- legality (shared by generate.py and the win check) --------------------------------
+
+def _can_play(state: GameState, card: int, player: int,
+              v_top: Optional[int], lead, lead_royalty: bool) -> bool:
+    if v_top is None:
+        return True  # empty stack: first/fresh play is unrestricted
+    if state.effective_hand_value(card) >= v_top:
+        return True
+    ability = cards.card_ability(card)
+    if ability == Ability.OATHBOUND and v_top > 6 and len(state.hands[player]) >= 2:
+        return True  # disgrace the beaten card; Oathbound sits at 6, then play any card (needs a 2nd)
+    if ability == Ability.ELDER and lead_royalty:
+        return True  # Elder plays over any royalty
+    if ability == Ability.ZEALOT and state.kings[player] and lead is not None and not lead_royalty:
+        return True  # Zealot plays over any non-royalty once its own king is flipped
+    return False
+
+
+def legal_play_cards(state: GameState, player: int) -> List[int]:
+    """Distinct hand cards (one representative id per name) that may legally be played now."""
+    v_top = state.leading_value()
+    lead = state.leading
+    lead_royalty = lead is not None and state.active_royalty(lead)
+    out: List[int] = []
+    seen = set()
+    for c in state.hands[player]:
+        name = cards.card_name(c)
+        if name in seen:
+            continue
+        if _can_play(state, c, player, v_top, lead, lead_royalty):
+            out.append(c)
+            seen.add(name)
+    return out
+
+
+# --- placing a card on the stack + triggering its on-play ability ----------------------
+
+def _land(state: GameState, card: int, actor: int, *, ascended: bool, v_top: Optional[int]):
+    """Place ``card`` on the stack and return ``(new_state, substeps)`` for its on-play ability.
+
+    Oathbound override (played FROM HAND over a card > 6): the BEATEN card is disgraced, the Oathbound
+    stays live at value 6, and the substep is the free follow-up play. An ASCENDED Oathbound (from the
+    antechamber) does NOT trigger this -- ascension already let it beat the card -- so it just lands at
+    6 with no ability. Otherwise the card lands (Warlord at 9 if royalty present) and optional abilities
+    yield an ABILITY_MAY substep; Queen disgraces beneath immediately.
+    """
+    ability = cards.card_ability(card)
+
+    if (not ascended) and ability == Ability.OATHBOUND and v_top is not None and v_top > 6:
+        new_hand = _without(state.hands[actor], card)
+        beaten = replace(state.stack[-1], disgraced=True)         # disgrace the card it beat
+        new_stack = state.stack[:-1] + (beaten, StackCard(card))  # Oathbound stays live at value 6
+        st = state.with_(hands=_set_index(state.hands, actor, new_hand), stack=new_stack)
+        return st, (PendingStep(StepKind.OATHBOUND_SECOND, actor, source=card),)
+
+    override = 9 if (ability == Ability.WARLORD and state.royalty_present()) else None
+    new_stack = state.stack + (StackCard(card, value_override=override),)
+    if ascended:
+        new_hands = state.hands
+    else:
+        new_hands = _set_index(state.hands, actor, _without(state.hands[actor], card))
+    st = state.with_(hands=new_hands, stack=new_stack)
+
+    if ability == Ability.QUEEN:
+        beneath = tuple(replace(s, disgraced=True) for s in st.stack[:-1])
+        st = st.with_(stack=beneath + (st.stack[-1],))
+        return st, ()
+    if ability in _OPTIONAL_ONPLAY:
+        return st, (PendingStep(StepKind.ABILITY_MAY, actor, source=card),)
+    return st, ()
+
+
+def _proceed(state: GameState, substeps: tuple, *, pop_top: bool, end_turn_player: int) -> GameState:
+    """Push ``substeps`` either by popping the answered top step (normal play) or onto an empty
+    stack (ascension). With no substeps the turn is over and the opponent's turn begins."""
+    if pop_top:
+        return state.advance(*substeps)
+    if not substeps:
+        return state._begin_turn(1 - end_turn_player)
+    return state.with_(pending=tuple(reversed(substeps)))
+
+
+def ascend(state: GameState, player: int) -> GameState:
+    """Forced antechamber ascension: dequeue the front card, land it, trigger its ability."""
+    ante = state.antechambers[player]
+    card = ante[0]
+    st = state.with_(antechambers=_set_index(state.antechambers, player, ante[1:]))
+    st, substeps = _land(st, card, player, ascended=True, v_top=None)
+    return _proceed(st, substeps, pop_top=False, end_turn_player=player)
+
+
+# --- stack mutation helpers ------------------------------------------------------------
+
+def _stack_index_of(state: GameState, card: int) -> int:
+    for i in range(len(state.stack) - 1, -1, -1):
+        if state.stack[i].card == card:
+            return i
+    raise ValueError(f"card {card} not on stack")
+
+
+def _disgrace_card(state: GameState, card: int) -> GameState:
+    i = _stack_index_of(state, card)
+    return state.with_(stack=_set_index(state.stack, i, replace(state.stack[i], disgraced=True)))
+
+
+def _set_override(state: GameState, card: int, value: int) -> GameState:
+    i = _stack_index_of(state, card)
+    return state.with_(stack=_set_index(state.stack, i, replace(state.stack[i], value_override=value)))
+
+
+def _sentry_targets(state: GameState, source: int) -> List[int]:
+    return [i for i, sc in enumerate(state.stack)
+            if not sc.disgraced and not state.active_royalty(sc) and sc.card != source]
+
+
+def _fool_targets(state: GameState, source: int) -> List[int]:
+    """Fool may take back any non-disgraced stack card except itself."""
+    return [i for i, sc in enumerate(state.stack) if not sc.disgraced and sc.card != source]
+
+
+# --- ability resolution branches -------------------------------------------------------
+
+def _begin_resolution(state: GameState, source: int, owner: int) -> GameState:
+    """King's Hand was declined: push the ability's own sub-decisions (self-disgracing first
+    where the card does so). The current top is the reaction step, popped by ``advance``."""
+    ability = cards.card_ability(source)
+    if ability == Ability.PRINCESS:
+        if not state.hands[owner] or not state.hands[1 - owner]:
+            return state.advance()  # a swap needs a card from each player
+        return state.advance(PendingStep(StepKind.ABILITY_HAND_CARD, owner, source=source))
+    if ability == Ability.SENTRY:
+        st = _disgrace_card(state, source)
+        if not _sentry_targets(st, source) or not st.hands[owner]:
+            return st.advance()
+        return st.advance(PendingStep(StepKind.ABILITY_STACK_TARGET, owner, source=source, limit=1))
+    if ability == Ability.MYSTIC:
+        st = _disgrace_card(state, source)
+        return st.advance(PendingStep(StepKind.ABILITY_NUMBER, owner, source=source))
+    if ability == Ability.FOOL:
+        if not _fool_targets(state, source):
+            return state.advance()  # nothing legal to take back
+        return state.advance(PendingStep(StepKind.ABILITY_STACK_TARGET, owner, source=source, limit=1))
+    return state.advance()
+
+
+def _resolve_guess(state: GameState, step: PendingStep, action: Action) -> GameState:
+    """A guess is committed and made public. Open a King's-Hand window only if the guess actually
+    lands (the named card is held), since otherwise there is no effect to counter."""
+    source, owner = step.source, step.actor
+    defender = 1 - owner
+    held = any(cards.card_name(c) == action.name for c in state.hands[defender])
+    if held:
+        return state.advance(PendingStep(StepKind.REACTION_KINGSHAND, defender,
+                                         source=source, against=source, guess=action.name))
+    return state.advance()  # wrong guess (or named card not held) -> nothing happens
+
+
+def _after_guess_kingshand_declined(state: GameState, step: PendingStep) -> GameState:
+    """The defender did not counter a landed guess: apply the guess ability's effect."""
+    source, name = step.source, step.guess
+    owner = 1 - step.actor              # the active player who guessed
+    defender = step.actor
+    ability = cards.card_ability(source)
+    if ability == Ability.INQUISITOR:
+        held = tuple(c for c in state.hands[defender] if cards.card_name(c) == name)
+        new_def = tuple(c for c in state.hands[defender] if c not in held)
+        new_ante = state.antechambers[defender] + held
+        return state.advance(
+            hands=_set_index(state.hands, defender, new_def),
+            antechambers=_set_index(state.antechambers, defender, new_ante),
+        )
+    if ability == Ability.JUDGE:
+        return state.advance(PendingStep(StepKind.ABILITY_HAND_CARD, owner, source=source, guess=name))
+    if ability == Ability.SOLDIER:
+        # A correct (uncountered) guess immediately grants +2 -- it is tied to the guess, not a
+        # separate choice. The only remaining decision is which 0-3 stack cards to disgrace.
+        st = _set_override(state, source, cards.card_value(source) + rules.SOLDIER_BONUS)
+        return st.advance(PendingStep(StepKind.ABILITY_STACK_TARGET, owner,
+                                      source=source, limit=rules.SOLDIER_DISGRACE_CAP))
+    return state.advance()
+
+
+def _soldier_disgrace(state: GameState, chosen: Tuple[int, ...]) -> GameState:
+    new_stack = list(state.stack)
+    for pos in set(chosen):
+        new_stack[pos] = replace(new_stack[pos], disgraced=True)
+    return state.advance(stack=tuple(new_stack))
+
+
+def _flip_resolve(state: GameState, flipper: int) -> GameState:
+    """Complete a king-flip: disgrace the top card, mark the king used, take the hidden card."""
+    top = state.stack[-1]
+    new_stack = state.stack[:-1] + (replace(top, disgraced=True),)
+    new_kings = _set_index(state.kings, flipper, True)
+    hid = state.hidden[flipper]
+    if hid is not None:
+        new_hands = _set_index(state.hands, flipper, _add_to_hand(state.hands[flipper], hid))
+        new_hidden = _set_index(state.hidden, flipper, None)
+    else:
+        new_hands, new_hidden = state.hands, state.hidden
+    return state.advance(stack=new_stack, kings=new_kings, hands=new_hands, hidden=new_hidden)
+
+
+# --- the dispatcher --------------------------------------------------------------------
+
+def resolve(state: GameState, action: Action) -> GameState:
+    step = state.pending[-1]
+    k = step.kind
+    actor = step.actor
+
+    if k == StepKind.SETUP_HIDE:
+        return state.advance(
+            hands=_set_index(state.hands, actor, _without(state.hands[actor], action.card)),
+            hidden=_set_index(state.hidden, actor, action.card),
+        )
+
+    if k == StepKind.SETUP_DISCARD:
+        return state.advance(
+            hands=_set_index(state.hands, actor, _without(state.hands[actor], action.card)),
+            setup_discard=_set_index(state.setup_discard, actor, action.card),
+        )
+
+    if k == StepKind.MAIN:
+        if action.kind == ActionKind.FLIP_KING:
+            return state.advance(PendingStep(StepKind.REACTION_ASSASSIN, 1 - actor))
+        st, substeps = _land(state, action.card, actor, ascended=False, v_top=state.leading_value())
+        return _proceed(st, substeps, pop_top=True, end_turn_player=actor)
+
+    if k == StepKind.OATHBOUND_SECOND:
+        st, substeps = _land(state, action.card, actor, ascended=False, v_top=state.leading_value())
+        return _proceed(st, substeps, pop_top=True, end_turn_player=actor)
+
+    if k == StepKind.ABILITY_MAY:
+        if action.kind == ActionKind.DECLARE_ABILITY:
+            if cards.card_ability(step.source) in _GUESS_ABILITIES:
+                # Make the guess first (it becomes public), THEN offer the King's-Hand window.
+                return state.advance(PendingStep(StepKind.ABILITY_GUESS, actor, source=step.source))
+            return state.advance(PendingStep(StepKind.REACTION_KINGSHAND, 1 - actor,
+                                             source=step.source, against=step.source))
+        return state.advance()  # declined the ability
+
+    if k == StepKind.REACTION_KINGSHAND:
+        if action.kind == ActionKind.REVEAL_KINGSHAND:
+            reactor = step.actor
+            i = _stack_index_of(state, step.source)
+            return state.advance(
+                stack=_without_index(state.stack, i),
+                discard=state.discard + (step.source, KINGSHAND_ID),
+                hands=_set_index(state.hands, reactor, _without(state.hands[reactor], KINGSHAND_ID)),
+            )
+        # Declined: apply the effect. A guess ability carries its (public) guess on the step.
+        if step.guess is not None:
+            return _after_guess_kingshand_declined(state, step)
+        return _begin_resolution(state, step.source, owner=1 - step.actor)
+
+    if k == StepKind.ABILITY_GUESS:
+        return _resolve_guess(state, step, action)
+
+    if k == StepKind.ABILITY_NUMBER:
+        return state.advance(muted_values=state.muted_values | {action.number})
+
+    if k == StepKind.ABILITY_HAND_CARD:
+        if action.kind == ActionKind.STOP:           # Judge: decline to queue
+            return state.advance()
+        ability = cards.card_ability(step.source)
+        card = action.card
+        if ability == Ability.PRINCESS:
+            return state.advance(PendingStep(StepKind.ABILITY_SWAP_RESPOND, 1 - actor,
+                                             source=step.source, picked=card))
+        if ability == Ability.SENTRY:
+            pos = step.picked
+            grabbed = state.stack[pos].card
+            return state.advance(
+                stack=_set_index(state.stack, pos, StackCard(card)),
+                hands=_set_index(state.hands, actor, _add_to_hand(_without(state.hands[actor], card), grabbed)),
+            )
+        if ability == Ability.JUDGE:
+            return state.advance(
+                hands=_set_index(state.hands, actor, _without(state.hands[actor], card)),
+                antechambers=_set_index(state.antechambers, actor, state.antechambers[actor] + (card,)),
+            )
+
+    if k == StepKind.ABILITY_SWAP_RESPOND:  # Princess: responder picks their give-card
+        responder = step.actor
+        princess = 1 - responder
+        give_p, give_o = step.picked, action.card
+        new_hands = list(state.hands)
+        new_hands[princess] = _add_to_hand(_without(state.hands[princess], give_p), give_o)
+        new_hands[responder] = _add_to_hand(_without(state.hands[responder], give_o), give_p)
+        return state.advance(hands=tuple(new_hands))
+
+    if k == StepKind.ABILITY_STACK_TARGET:
+        ability = cards.card_ability(step.source)
+        if ability == Ability.FOOL:
+            pos = action.target
+            grabbed = state.stack[pos].card
+            return state.advance(
+                stack=_without_index(state.stack, pos),
+                hands=_set_index(state.hands, actor, _add_to_hand(state.hands[actor], grabbed)),
+            )
+        if ability == Ability.SENTRY:
+            return state.advance(PendingStep(StepKind.ABILITY_HAND_CARD, actor,
+                                             source=step.source, picked=action.target))
+        if ability == Ability.SOLDIER:
+            if action.kind == ActionKind.STOP:
+                return _soldier_disgrace(state, step.chosen)
+            new_chosen = step.chosen + (action.target,)
+            if len(new_chosen) >= rules.SOLDIER_DISGRACE_CAP:
+                return _soldier_disgrace(state, new_chosen)
+            return state.replace_top(replace(step, chosen=new_chosen, limit=step.limit - 1))
+
+    if k == StepKind.REACTION_ASSASSIN:
+        if action.kind == ActionKind.REVEAL_ASSASSIN:
+            reactor = step.actor
+            # A revealed Assassin is public and spent regardless of outcome -> commit it to the
+            # discard now, so it leaves the unknown pool (keeps determinized worlds consistent when
+            # the nested King's-Hand window is itself the search root).
+            st = state.with_(
+                hands=_set_index(state.hands, reactor, _without(state.hands[reactor], ASSASSIN_ID)),
+                discard=state.discard + (ASSASSIN_ID,),
+            )
+            return st.advance(PendingStep(StepKind.REACTION_KH_VS_ASSASSIN, st.turn_player))
+        return _flip_resolve(state, state.turn_player)
+
+    if k == StepKind.REACTION_KH_VS_ASSASSIN:
+        flipper = step.actor
+        assassin_player = 1 - flipper
+        if action.kind == ActionKind.REVEAL_KINGSHAND:
+            st = state.with_(
+                hands=_set_index(state.hands, flipper, _without(state.hands[flipper], KINGSHAND_ID)),
+                discard=state.discard + (KINGSHAND_ID,),  # Assassin already discarded on reveal
+            )
+            return _flip_resolve(st, flipper)
+        return state.with_(winner=assassin_player, pending=())  # Assassin resolves -> instant win
+
+    raise ValueError(f"resolve: unhandled step kind {k!r} for action {action!r}")

@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+
+# Generated data / models (future NN pipeline)
+data/
+models/
+results/
+*.npz
+*.pt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

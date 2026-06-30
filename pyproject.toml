@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imposterkings"
+version = "0.1.0"
+description = "ImposterKings: a hand-clearing card game engine, MCTS bot, and PyGame UI."
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+ui = ["pygame"]
+ml = ["torch"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not slow'"
+markers = [
+    "slow: long-running tests (MCTS strength, arenas); deselected by default",
+]
