@@ -19,13 +19,19 @@ OnDecision = Callable[[int, InformationSet, Action, object, GameState], None]
 
 def play_game(agents, rng: np.random.Generator,
               on_decision: Optional[OnDecision] = None,
-              starting_player: Optional[int] = None) -> Tuple[int, List[float], GameState]:
-    """Play one full game; return ``(winner, reward_vector, terminal_state)``."""
+              starting_player: Optional[int] = None,
+              play_rng: Optional[np.random.Generator] = None) -> Tuple[int, List[float], GameState]:
+    """Play one full game; return ``(winner, reward_vector, terminal_state)``.
+
+    ``rng`` deals the cards (and picks the starter). Agents draw from ``play_rng`` if given, else
+    ``rng`` -- so two games can share an identical deal but use independent play randomness."""
     state = GameState.deal(rng, starting_player=starting_player)
+    if play_rng is None:
+        play_rng = rng
     while not state.is_terminal():
         seat = state.to_play
         view = state.information_set(seat)
-        move = agents[seat].select_move(view, rng)
+        move = agents[seat].select_move(view, play_rng)
         if on_decision is not None:
             on_decision(seat, view, move, agents[seat], state)
         state = state.apply(move)

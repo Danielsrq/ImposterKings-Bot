@@ -79,6 +79,14 @@ class SearchResult:
             return {}
         return {s.move: s.visits / total for s in self.stats}
 
+    def root_value(self) -> float:
+        """Visit-weighted mean Q over the root's actions -- the search's value estimate of the
+        position for the player to move (in [-1, 1]). Also the value target the NN milestone will use."""
+        total = sum(s.visits for s in self.stats)
+        if total == 0:
+            return 0.0
+        return sum(s.visits * s.mean_q for s in self.stats) / total
+
 
 # --- the four phases -------------------------------------------------------------------
 

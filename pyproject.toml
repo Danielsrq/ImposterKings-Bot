@@ -13,6 +13,7 @@ dependencies = ["numpy"]
 dev = ["pytest"]
 ui = ["pygame"]
 ml = ["torch"]
+analysis = ["tqdm", "matplotlib", "joblib>=1.3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
