@@ -16,7 +16,7 @@ import numpy as np
 
 from .agents import MCTSAgent, RandomAgent
 from .arena import play_game
-from .explain import format_action, format_infoset, format_search_result
+from .explain import format_action, format_infoset, format_pv_lines, format_search_result
 from .infoset import InformationSet
 
 
@@ -73,6 +73,9 @@ def main(argv=None) -> None:
             print(f"  P{seat} ({agent.name}) -> {format_action(move, view)}")
             if args.explain and getattr(agent, "last_result", None) is not None:
                 print(format_search_result(agent.last_result, top=5))
+                pv = format_pv_lines(agent.last_result)
+                if pv:
+                    print(pv)
 
     print(f"ImposterKings: P0={args.p0} vs P1={args.p1} (seed {args.seed})")
     winner, reward, final = play_game(agents, rng, on_decision=on_decision,

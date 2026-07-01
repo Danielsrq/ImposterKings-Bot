@@ -27,6 +27,7 @@ GOLD = (235, 200, 90)
 RED = (200, 70, 70)
 BTN = (52, 56, 66)
 BTN_HOVER = (78, 96, 120)
+P_COLORS = {0: (95, 160, 240), 1: (240, 170, 90)}   # PV move colors by seat (P0 blue, P1 orange)
 
 PANEL_X = 1030
 PANEL_W = WINDOW[0] - PANEL_X - 12
@@ -100,31 +101,65 @@ def _reaction_context(view) -> str:
     return f"Counter opponent's {src}?"
 
 
+_SHORT_ACTION = {
+    ActionKind.DECLARE_ABILITY: "declare", ActionKind.DECLINE_ABILITY: "decline",
+    ActionKind.FLIP_KING: "flip-king", ActionKind.STOP: "stop",
+    ActionKind.REVEAL_KINGSHAND: "KingsHand!", ActionKind.REVEAL_ASSASSIN: "Assassin!",
+    ActionKind.DECLINE_REACTION: "no-react",
+}
+
+
 def _compact_action(action: Action) -> str:
-    """A short action label for the narrow reasoning table (drops the play_card()/#id noise)."""
-    if action.kind in (ActionKind.PLAY_CARD, ActionKind.HIDE_CARD, ActionKind.DISCARD_CARD,
-                        ActionKind.CHOOSE_HAND_CARD):
+    """A short action label for the narrow reasoning panel (drops the play_card()/#id noise)."""
+    k = action.kind
+    if k in (ActionKind.PLAY_CARD, ActionKind.HIDE_CARD, ActionKind.DISCARD_CARD,
+             ActionKind.CHOOSE_HAND_CARD):
         cdef = cards.card_def(action.card)
         return f"{cdef.name}({cdef.value})"
-    if action.kind == ActionKind.GUESS_CARD:
+    if k == ActionKind.GUESS_CARD:
         return f"guess {action.name}"
-    if action.kind == ActionKind.CHOOSE_NUMBER:
+    if k == ActionKind.CHOOSE_NUMBER:
         return f"mute {action.number}"
-    return action.kind.name.lower()
+    if k == ActionKind.CHOOSE_STACK_TARGET:
+        return f"target@{action.target}"
+    return _SHORT_ACTION.get(k, k.name.lower())
+
+
+def _draw_tokens(surface, font, tokens, x0: int, y: int, max_x: int, line_h: int, indent: int = 14) -> int:
+    """Draw ``(text, color)`` tokens left-to-right, wrapping (with a small indent) at ``max_x``.
+    Returns the y just below the block."""
+    space = font.size(" ")[0]
+    x = x0
+    for text, color in tokens:
+        w = font.size(text)[0]
+        if x > x0 and x + w > max_x:           # wrap (but always draw >=1 token per row)
+            y += line_h
+            x = x0 + indent
+        surface.blit(font.render(text, True, color), (x, y))
+        x += w + space
+    return y + line_h
 
 
 def _draw_explain(surface, fonts, bot_result, top: int):
-    """Render the MCTS candidate table (visits share + mean Q) for the bot's last decision at ``top``
-    (the section header + toggle are drawn by the caller)."""
+    """Render the top-2 principal-variation lines for the bot's last decision at ``top`` (chess-engine
+    style: [eval] then move labels colored by the player who moved). Header/toggle drawn by caller."""
     small = fonts["small"]
     x = PANEL_X + 12
-    _text(surface, small, f"{bot_result.iterations} sims, {bot_result.elapsed:.2f}s -> "
-                          f"{_compact_action(bot_result.best_move)}", (x, top), MUTE)
-    _text(surface, small, f"{'share':>5} {'meanQ':>6}  move", (x, top + 22), MUTE)
-    for i, s in enumerate(bot_result.stats[:6]):
-        color = GOLD if i == 0 else INK
-        _text(surface, small, f"{s.visit_share * 100:>4.0f}% {s.mean_q:>+6.2f}  {_compact_action(s.move)}",
-              (x, top + 42 + i * 19), color)
+    max_x = WINDOW[0] - 12
+    _text(surface, small, f"{bot_result.iterations} sims, {bot_result.elapsed:.2f}s", (x, top), MUTE)
+    _text(surface, small, "P0", (x + 150, top), P_COLORS[0])
+    _text(surface, small, "P1", (x + 178, top), P_COLORS[1])
+
+    lines = bot_result.principal_variations(top=2, depth=6)
+    if not lines:
+        _text(surface, small, "(no lines)", (x, top + 22), MUTE)
+        return
+    y = top + 24
+    for line in lines:
+        tokens = [(f"[{line[0].mean_q:+.2f}]", INK)]
+        tokens += [(_compact_action(step.move), P_COLORS.get(step.player, INK)) for step in line]
+        y = _draw_tokens(surface, small, tokens, x, y, max_x, 19)
+        y += 4   # gap between lines
 
 
 def render_frame(surface, view, fonts, legal_moves: List[Action], *,

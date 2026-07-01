@@ -32,3 +32,27 @@ def test_render_frame_draws_and_returns_buttons(tmp_path):
     pygame.image.save(screen, str(out))
     assert out.stat().st_size > 0
     pygame.display.quit()
+
+
+def test_render_frame_draws_pv_lines_from_a_real_search():
+    import numpy as np
+    from imposterkings.agents import MCTSAgent
+    from imposterkings.state import GameState
+    from imposterkings.actions import StepKind
+
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    rng = np.random.default_rng(0)
+    st = GameState.deal(rng, starting_player=0)
+    while st.phase in (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD):
+        st = st.apply(st.legal_moves()[0])
+    view = st.information_set(st.to_play)
+    agent = MCTSAgent(iterations=120)
+    agent.select_move(view, rng)                     # populates last_result (with retained tree)
+    assert agent.last_result.principal_variations()  # non-empty lines
+    # renders the PV reasoning panel without error
+    frame = render_frame(screen, view, fonts, view.legal_moves(), show_reasoning=True,
+                         bot_result=agent.last_result, seed=1)
+    assert frame.buttons
+    pygame.display.quit()

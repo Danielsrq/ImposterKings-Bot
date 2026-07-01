@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -63,6 +63,15 @@ class MoveStat:
     visit_share: float
 
 
+@dataclass(frozen=True)
+class PVStep:
+    """One move along a principal variation (a most-visited path through the tree)."""
+    move: Action
+    player: int          # seat that played the move (Node.player_just_moved)
+    visits: int
+    mean_q: float        # value from that mover's perspective, in [-1, 1]
+
+
 @dataclass
 class SearchResult:
     info: InformationSet
@@ -71,6 +80,7 @@ class SearchResult:
     iterations: int
     elapsed: float                   # seconds
     determinizations: int = 0
+    root: Optional["Node"] = field(default=None, repr=False)  # retained for PV extraction (in-memory)
 
     def policy_target(self) -> Dict[Action, float]:
         """Normalized visit counts -- the policy label the NN milestone will imitate."""
@@ -86,6 +96,29 @@ class SearchResult:
         if total == 0:
             return 0.0
         return sum(s.visits * s.mean_q for s in self.stats) / total
+
+    def principal_variations(self, top: int = 2, depth: int = 6,
+                             min_visits: int = 2) -> List[List[PVStep]]:
+        """Top-``top`` lines: each starts at a most-visited root move and descends by most-visited
+        child (chess-engine PV). Stops at ``depth``, at a leaf, or when a below-root node has
+        ``visits < min_visits`` (ISMCTS deep-PV noise cutoff). Empty if the tree wasn't retained."""
+        if self.root is None:
+            return []
+        lines: List[List[PVStep]] = []
+        for stat in self.stats[:top]:
+            node = self.root.children.get(stat.move)
+            line: List[PVStep] = []
+            while node is not None and len(line) < depth:
+                if line and node.n < min_visits:
+                    break  # below-root reliability cutoff
+                line.append(PVStep(node.incoming_move, node.player_just_moved, node.n,
+                                   node.w / node.n if node.n else 0.0))
+                if not node.children:
+                    break
+                node = max(node.children.values(), key=lambda c: c.n)
+            if line:
+                lines.append(line)
+        return lines
 
 
 # --- the four phases -------------------------------------------------------------------
@@ -166,4 +199,4 @@ def search(info: InformationSet, config: SearchConfig) -> SearchResult:
 
     return SearchResult(info=info, best_move=best_move, stats=stats,
                         iterations=config.iterations, elapsed=time.perf_counter() - start,
-                        determinizations=config.iterations)
+                        determinizations=config.iterations, root=root)

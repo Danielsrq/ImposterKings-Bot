@@ -77,3 +77,30 @@ def format_search_result(result, top: Optional[int] = None) -> str:  # pragma: n
         lines.append(f"  {format_action(s.move):<28} {s.visits:>7} {s.visit_share:>6.2f} "
                      f"{s.mean_q:>7.3f} {s.avail:>6}")
     return "\n".join(lines)
+
+
+def _pv_label(action) -> str:
+    """Compact move label for a PV line (card name+value / guess / etc.)."""
+    k = action.kind
+    if k in (ActionKind.PLAY_CARD, ActionKind.HIDE_CARD, ActionKind.DISCARD_CARD,
+             ActionKind.CHOOSE_HAND_CARD):
+        return f"{cards.card_name(action.card)}({cards.card_value(action.card)})"
+    if k == ActionKind.GUESS_CARD:
+        return f"guess {action.name}"
+    if k == ActionKind.CHOOSE_NUMBER:
+        return f"mute {action.number}"
+    if k == ActionKind.CHOOSE_STACK_TARGET:
+        return f"target@{action.target}"
+    return k.name.lower()
+
+
+def format_pv_lines(result, top: int = 2, depth: int = 6) -> str:
+    """Chess-engine-style principal variations: ``[eval] move[P0] move[P1] …`` for the top lines."""
+    lines = result.principal_variations(top=top, depth=depth)
+    if not lines:
+        return ""
+    out = ["Principal variations:"]
+    for line in lines:
+        moves = " ".join(f"{_pv_label(s.move)}[P{s.player}]" for s in line)
+        out.append(f"  [{line[0].mean_q:+.2f}] {moves}")
+    return "\n".join(out)
