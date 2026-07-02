@@ -29,6 +29,7 @@ def test_render_frame_draws_and_returns_buttons(tmp_path):
     assert hasattr(frame.new_game, "collidepoint")               # New Game button is hit-testable
     assert hasattr(frame.reasoning_toggle, "collidepoint")       # reasoning toggle is hit-testable
     assert hasattr(frame.hint_toggle, "collidepoint")            # hint toggle is hit-testable
+    assert frame.review is None                                  # Review button only shows at game over
     out = tmp_path / "frame.png"
     pygame.image.save(screen, str(out))
     assert out.stat().st_size > 0

@@ -50,6 +50,7 @@ class Frame(NamedTuple):
     new_game: "pygame.Rect"
     reasoning_toggle: Optional["pygame.Rect"]
     hint_toggle: Optional["pygame.Rect"]
+    review: Optional["pygame.Rect"]        # "Review game" button, shown only at game over
 
 # Friendly labels for the decision header (the raw StepKind names are long/cryptic).
 DECISION_LABELS = {
@@ -207,9 +208,17 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     new_game = pygame.Rect(ROW_MAX_X - 120, 12, 120, 30)
     pygame.draw.rect(surface, BTN, new_game, border_radius=4)
     _text(surface, small, "New Game", (new_game.x + 16, new_game.y + 7))
+    # "Review game" appears only at game over (no pending decision -> terminal).
+    review = None
+    left_anchor = new_game.x
+    if not view.pending:
+        review = pygame.Rect(new_game.x - 12 - 128, 12, 128, 30)
+        pygame.draw.rect(surface, BTN_HOVER, review, border_radius=4)
+        _text(surface, small, "Review game", (review.x + 14, review.y + 7))
+        left_anchor = review.x
     if seed is not None:
         seed_s = f"seed {seed}"
-        _text(surface, small, seed_s, (new_game.x - 12 - small.size(seed_s)[0], new_game.y + 7), MUTE)
+        _text(surface, small, seed_s, (left_anchor - 12 - small.size(seed_s)[0], new_game.y + 7), MUTE)
 
     # --- antechambers -------------------------------------------------------------------
     y = 150
@@ -283,7 +292,7 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                                                bot_result, show_reasoning, "(no search yet)")
     hint_toggle = _draw_reasoning_section(surface, fonts, HINT_TOP, "Hint (MCTS):",
                                           hint_result, show_hint, "(toggle on your turn for a hint)")
-    return Frame(buttons, new_game, reasoning_toggle, hint_toggle)
+    return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review)
 
 
 def make_fonts():

@@ -18,6 +18,7 @@ from ..agents import MCTSAgent, RandomAgent
 from ..explain import format_action
 from ..state import GameState
 from .render import BTN_H, BTN_TOP, PANEL_X, WINDOW, make_fonts, render_frame
+from .review import PlyRecord, run_review
 
 # Opponent's setup hide/discard are private -- never reveal the card identity in the log.
 _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
@@ -62,6 +63,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     hint_agent = MCTSAgent(iterations=iters if hint_iters is None else hint_iters)
     hint_rng = np.random.default_rng(1234567)     # dedicated so hints don't perturb the game rng
     hint: dict = {"state": None, "result": None}  # cached hint search, keyed by state identity
+    trajectory: list = []                          # per-ply PlyRecord(seat, move, view, result) for review
     game: dict = {}  # holds the resettable per-game state: state, rng, seed, bot
 
     def new_game(new_seed=None):
@@ -70,15 +72,17 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         game.update(seed=s, rng=rng, state=GameState.deal(rng, starting_player=start),
                     bot=_make_bot(p1, iters))
         log.clear()
+        trajectory.clear()
         hint["state"], hint["result"] = None, None
         pygame.display.set_caption(f"ImposterKings  (seed {s})")
         print(f"ImposterKings  (deck seed {s} -- pass --seed {s} to replay this deal)")
 
     new_game(seed)
 
-    def apply_logged(seat, move):
+    def apply_logged(seat, move, result=None):
         view_before = game["state"].information_set(human_seat)
         log.append(_describe(seat, view_before, move, human_seat, game["state"]))
+        trajectory.append(PlyRecord(seat, move, game["state"].information_set(seat), result))
         game["state"] = game["state"].apply(move)
 
     running = True
@@ -116,6 +120,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                              hint_result=hint_result, show_hint=show_hint)
         pygame.display.flip()
 
+        review_requested = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -125,6 +130,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 pos = event.pos
                 if frame.new_game.collidepoint(pos):            # clickable any time
                     new_game()
+                elif frame.review and frame.review.collidepoint(pos):
+                    review_requested = True
                 elif frame.reasoning_toggle and frame.reasoning_toggle.collidepoint(pos):
                     show_reasoning = not show_reasoning
                 elif frame.hint_toggle and frame.hint_toggle.collidepoint(pos):
@@ -132,13 +139,19 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 elif human_turn:
                     for rect, move in frame.buttons:
                         if rect.collidepoint(pos):
-                            apply_logged(human_seat, move)
+                            hres = hint["result"] if hint["state"] is game["state"] else None
+                            apply_logged(human_seat, move, hres)
                             break
+
+        # Deferred so the review's own event loop doesn't run mid-iteration of this one.
+        if review_requested and trajectory:
+            run_review(screen, fonts, list(trajectory))
 
         if (not game["state"].is_terminal()) and game["state"].to_play == bot_seat:
             pygame.time.delay(300)
             bview = game["state"].information_set(bot_seat)
-            apply_logged(bot_seat, game["bot"].select_move(bview, game["rng"]))
+            mv = game["bot"].select_move(bview, game["rng"])
+            apply_logged(bot_seat, mv, getattr(game["bot"], "last_result", None))
 
         clock.tick(30)
 
