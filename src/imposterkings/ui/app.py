@@ -48,7 +48,8 @@ def _describe(seat: int, view, move, human_seat: int, state) -> str:
     return line
 
 
-def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, start=None) -> None:
+def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, start=None,
+        hint_iters=None) -> None:
     import pygame  # local import so the engine/tests never require pygame
 
     pygame.init()
@@ -57,7 +58,10 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     fonts = make_fonts()
     bot_seat = 1 - human_seat
     log: deque = deque(maxlen=40)
-    show_reasoning = True
+    show_reasoning, show_hint = True, False
+    hint_agent = MCTSAgent(iterations=iters if hint_iters is None else hint_iters)
+    hint_rng = np.random.default_rng(1234567)     # dedicated so hints don't perturb the game rng
+    hint: dict = {"state": None, "result": None}  # cached hint search, keyed by state identity
     game: dict = {}  # holds the resettable per-game state: state, rng, seed, bot
 
     def new_game(new_seed=None):
@@ -66,6 +70,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         game.update(seed=s, rng=rng, state=GameState.deal(rng, starting_player=start),
                     bot=_make_bot(p1, iters))
         log.clear()
+        hint["state"], hint["result"] = None, None
         pygame.display.set_caption(f"ImposterKings  (seed {s})")
         print(f"ImposterKings  (deck seed {s} -- pass --seed {s} to replay this deal)")
 
@@ -99,9 +104,16 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         else:
             status = "Your move - click an action"
 
+        # Compute the hint once per human decision, and only while it's toggled on.
+        if show_hint and human_turn and game["state"] is not hint["state"]:
+            hint_agent.select_move(view, hint_rng)
+            hint["state"], hint["result"] = game["state"], hint_agent.last_result
+        hint_result = hint["result"] if (show_hint and human_turn) else None
+
         frame = render_frame(screen, view, fonts, legal, hover=hover, status=status,
                              log=list(log), bot_result=getattr(bot, "last_result", None),
-                             show_reasoning=show_reasoning, seed=game["seed"])
+                             show_reasoning=show_reasoning, seed=game["seed"],
+                             hint_result=hint_result, show_hint=show_hint)
         pygame.display.flip()
 
         for event in pygame.event.get():
@@ -115,6 +127,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     new_game()
                 elif frame.reasoning_toggle and frame.reasoning_toggle.collidepoint(pos):
                     show_reasoning = not show_reasoning
+                elif frame.hint_toggle and frame.hint_toggle.collidepoint(pos):
+                    show_hint = not show_hint
                 elif human_turn:
                     for rect, move in frame.buttons:
                         if rect.collidepoint(pos):
@@ -139,8 +153,11 @@ def main(argv=None) -> None:
                         help="fix the deck/deal (default: random each launch)")
     parser.add_argument("--human-seat", type=int, default=0, choices=[0, 1])
     parser.add_argument("--start", type=int, default=None, choices=[0, 1])
+    parser.add_argument("--hint-iters", type=int, default=None,
+                        help="MCTS iterations for the 'Your hint' panel (default: same as --iters)")
     args = parser.parse_args(argv)
-    run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start)
+    run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
+        hint_iters=args.hint_iters)
 
 
 if __name__ == "__main__":

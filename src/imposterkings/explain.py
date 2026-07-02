@@ -79,12 +79,15 @@ def format_search_result(result, top: Optional[int] = None) -> str:  # pragma: n
     return "\n".join(lines)
 
 
+_PV_PREFIX = {ActionKind.PLAY_CARD: "", ActionKind.HIDE_CARD: "hide ",
+              ActionKind.DISCARD_CARD: "discard ", ActionKind.CHOOSE_HAND_CARD: "give "}
+
+
 def _pv_label(action) -> str:
-    """Compact move label for a PV line (card name+value / guess / etc.)."""
+    """Compact move label for a PV line (hide/discard/play card / guess / etc.)."""
     k = action.kind
-    if k in (ActionKind.PLAY_CARD, ActionKind.HIDE_CARD, ActionKind.DISCARD_CARD,
-             ActionKind.CHOOSE_HAND_CARD):
-        return f"{cards.card_name(action.card)}({cards.card_value(action.card)})"
+    if k in _PV_PREFIX:
+        return f"{_PV_PREFIX[k]}{cards.card_name(action.card)}({cards.card_value(action.card)})"
     if k == ActionKind.GUESS_CARD:
         return f"guess {action.name}"
     if k == ActionKind.CHOOSE_NUMBER:

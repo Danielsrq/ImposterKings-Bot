@@ -34,12 +34,14 @@ PANEL_W = WINDOW[0] - PANEL_X - 12
 ROW_MAX_X = PANEL_X - 12     # right edge of the play area (cards never cross into the panel)
 DIVIDER = (60, 62, 70)
 
-# The side panel is three stacked sections: ACTIONS, LOG, REASONING.
+# The side panel stacks four sections: ACTIONS, LOG, (bot) REASONING, (your) HINT.
 BTN_TOP = 88        # y of the first action button (kept in sync with app's hover hit-test)
 BTN_H = 28
-ACT_BOTTOM = 520    # action buttons capped above this -> ~15 rows, fits all 14 guess names
-LOG_TOP = 540       # "Log" section header
-REASON_TOP = 740    # "Bot reasoning" section header (+ toggle)
+ACT_BOTTOM = 490    # action buttons capped above this -> fits all 14 guess names (88 + 14*28 = 480)
+LOG_TOP = 505       # "Log" section header
+LOG_LINES = 6       # recent log lines shown
+REASON_TOP = 645    # "Bot reasoning" section header (+ toggle)
+HINT_TOP = 815      # "Your hint" section header (+ toggle)
 
 
 class Frame(NamedTuple):
@@ -47,6 +49,7 @@ class Frame(NamedTuple):
     buttons: List[Tuple["pygame.Rect", Action]]
     new_game: "pygame.Rect"
     reasoning_toggle: Optional["pygame.Rect"]
+    hint_toggle: Optional["pygame.Rect"]
 
 # Friendly labels for the decision header (the raw StepKind names are long/cryptic).
 DECISION_LABELS = {
@@ -109,13 +112,17 @@ _SHORT_ACTION = {
 }
 
 
+_CARD_PREFIX = {ActionKind.PLAY_CARD: "", ActionKind.HIDE_CARD: "hide ",
+                ActionKind.DISCARD_CARD: "discard ", ActionKind.CHOOSE_HAND_CARD: "give "}
+
+
 def _compact_action(action: Action) -> str:
-    """A short action label for the narrow reasoning panel (drops the play_card()/#id noise)."""
+    """A short action label for the narrow reasoning panel (drops the play_card()/#id noise).
+    Card actions keep their kind (hide/discard/give) so the setup phase reads correctly."""
     k = action.kind
-    if k in (ActionKind.PLAY_CARD, ActionKind.HIDE_CARD, ActionKind.DISCARD_CARD,
-             ActionKind.CHOOSE_HAND_CARD):
+    if k in _CARD_PREFIX:
         cdef = cards.card_def(action.card)
-        return f"{cdef.name}({cdef.value})"
+        return f"{_CARD_PREFIX[k]}{cdef.name}({cdef.value})"
     if k == ActionKind.GUESS_CARD:
         return f"guess {action.name}"
     if k == ActionKind.CHOOSE_NUMBER:
@@ -140,17 +147,17 @@ def _draw_tokens(surface, font, tokens, x0: int, y: int, max_x: int, line_h: int
     return y + line_h
 
 
-def _draw_explain(surface, fonts, bot_result, top: int):
-    """Render the top-2 principal-variation lines for the bot's last decision at ``top`` (chess-engine
+def _draw_explain(surface, fonts, result, top: int, depth: int = 5):
+    """Render the top-2 principal-variation lines for a search ``result`` at ``top`` (chess-engine
     style: [eval] then move labels colored by the player who moved). Header/toggle drawn by caller."""
     small = fonts["small"]
     x = PANEL_X + 12
     max_x = WINDOW[0] - 12
-    _text(surface, small, f"{bot_result.iterations} sims, {bot_result.elapsed:.2f}s", (x, top), MUTE)
+    _text(surface, small, f"{result.iterations} sims, {result.elapsed:.2f}s", (x, top), MUTE)
     _text(surface, small, "P0", (x + 150, top), P_COLORS[0])
     _text(surface, small, "P1", (x + 178, top), P_COLORS[1])
 
-    lines = bot_result.principal_variations(top=2, depth=6)
+    lines = result.principal_variations(top=2, depth=depth)
     if not lines:
         _text(surface, small, "(no lines)", (x, top + 22), MUTE)
         return
@@ -162,9 +169,28 @@ def _draw_explain(surface, fonts, bot_result, top: int):
         y += 4   # gap between lines
 
 
+def _draw_reasoning_section(surface, fonts, top, title, result, shown, placeholder):
+    """Header + [hide]/[show] toggle at ``top``; render the PV lines when ``shown``. Returns the toggle
+    Rect. Shared by the bot-reasoning and human-hint panels."""
+    small = fonts["small"]
+    px = PANEL_X + 12
+    pygame.draw.line(surface, DIVIDER, (PANEL_X + 8, top - 12), (WINDOW[0] - 8, top - 12))
+    _text(surface, small, title, (px, top), GOLD)
+    toggle = pygame.Rect(WINDOW[0] - 12 - 64, top - 3, 64, 22)
+    pygame.draw.rect(surface, BTN, toggle, border_radius=4)
+    _text(surface, small, "[hide]" if shown else "[show]", (toggle.x + 7, toggle.y + 3))
+    if shown:
+        if result is not None:
+            _draw_explain(surface, fonts, result, top + 26)
+        else:
+            _text(surface, small, placeholder, (px, top + 26), MUTE)
+    return toggle
+
+
 def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                  hover: Optional[int] = None, status: str = "", log: Optional[List[str]] = None,
-                 bot_result=None, show_reasoning: bool = True, seed=None) -> Frame:
+                 bot_result=None, show_reasoning: bool = True, seed=None,
+                 hint_result=None, show_hint: bool = False) -> Frame:
     surface.fill(BG)
     big, med, small = fonts["big"], fonts["med"], fonts["small"]
     opp = 1 - view.observer
@@ -249,22 +275,15 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     # LOG
     pygame.draw.line(surface, DIVIDER, (PANEL_X + 8, LOG_TOP - 12), (WINDOW[0] - 8, LOG_TOP - 12))
     _text(surface, small, "Log:", (px, LOG_TOP), MUTE)
-    for i, line in enumerate((log or [])[-8:]):
+    for i, line in enumerate((log or [])[-LOG_LINES:]):
         _text(surface, small, line, (px, LOG_TOP + 22 + i * 20), INK)
 
-    # REASONING (with show/hide toggle)
-    pygame.draw.line(surface, DIVIDER, (PANEL_X + 8, REASON_TOP - 12), (WINDOW[0] - 8, REASON_TOP - 12))
-    _text(surface, small, "Bot reasoning (MCTS):", (px, REASON_TOP), GOLD)
-    reasoning_toggle = pygame.Rect(WINDOW[0] - 12 - 64, REASON_TOP - 3, 64, 22)
-    pygame.draw.rect(surface, BTN, reasoning_toggle, border_radius=4)
-    _text(surface, small, "[hide]" if show_reasoning else "[show]", (reasoning_toggle.x + 7, reasoning_toggle.y + 3))
-    if show_reasoning:
-        if bot_result is not None:
-            _draw_explain(surface, fonts, bot_result, REASON_TOP + 26)
-        else:
-            _text(surface, small, "(no search yet)", (px, REASON_TOP + 26), MUTE)
-
-    return Frame(buttons, new_game, reasoning_toggle)
+    # REASONING (bot) + HINT (you) -- two PV sections, each with its own show/hide toggle.
+    reasoning_toggle = _draw_reasoning_section(surface, fonts, REASON_TOP, "Bot reasoning (MCTS):",
+                                               bot_result, show_reasoning, "(no search yet)")
+    hint_toggle = _draw_reasoning_section(surface, fonts, HINT_TOP, "Hint (MCTS):",
+                                          hint_result, show_hint, "(toggle on your turn for a hint)")
+    return Frame(buttons, new_game, reasoning_toggle, hint_toggle)
 
 
 def make_fonts():

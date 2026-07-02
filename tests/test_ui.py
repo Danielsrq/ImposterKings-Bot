@@ -28,6 +28,7 @@ def test_render_frame_draws_and_returns_buttons(tmp_path):
     assert all(hasattr(rect, "collidepoint") for rect, _ in frame.buttons)
     assert hasattr(frame.new_game, "collidepoint")               # New Game button is hit-testable
     assert hasattr(frame.reasoning_toggle, "collidepoint")       # reasoning toggle is hit-testable
+    assert hasattr(frame.hint_toggle, "collidepoint")            # hint toggle is hit-testable
     out = tmp_path / "frame.png"
     pygame.image.save(screen, str(out))
     assert out.stat().st_size > 0
@@ -51,8 +52,10 @@ def test_render_frame_draws_pv_lines_from_a_real_search():
     agent = MCTSAgent(iterations=120)
     agent.select_move(view, rng)                     # populates last_result (with retained tree)
     assert agent.last_result.principal_variations()  # non-empty lines
-    # renders the PV reasoning panel without error
+    # renders both the bot-reasoning and the human-hint PV panels without error
     frame = render_frame(screen, view, fonts, view.legal_moves(), show_reasoning=True,
-                         bot_result=agent.last_result, seed=1)
+                         bot_result=agent.last_result, show_hint=True, hint_result=agent.last_result,
+                         seed=1)
     assert frame.buttons
+    assert hasattr(frame.hint_toggle, "collidepoint")
     pygame.display.quit()
