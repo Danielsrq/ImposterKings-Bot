@@ -74,6 +74,8 @@ class GameState:
         history: Tuple[Tuple[int, Action], ...],
         winner: Optional[int],
         setup_discard: Tuple[Optional[int], ...] = (None, None),
+        hand_lacks: Tuple[FrozenSet[str], FrozenSet[str]] = (frozenset(), frozenset()),
+        hand_has: Tuple[FrozenSet[str], FrozenSet[str]] = (frozenset(), frozenset()),
     ) -> None:
         self.hands = hands
         self.hidden = hidden
@@ -90,6 +92,11 @@ class GameState:
         self.pending = pending
         self.history = history
         self.winner = winner
+        # Guess-leaked knowledge, indexed by the KNOWER (their belief about the OTHER player's hand,
+        # by card name): hand_lacks[k] = names k knows the opponent's hand has 0 of; hand_has[k] =
+        # names k knows it holds >=1 of. Kept correct as cards move (see _reconcile_knowledge).
+        self.hand_lacks = hand_lacks
+        self.hand_has = hand_has
 
     # --- construction ------------------------------------------------------------------
 
@@ -141,7 +148,12 @@ class GameState:
     # --- copy-on-write plumbing --------------------------------------------------------
 
     def with_(self, **changes) -> "GameState":
-        """Return a new state with the given fields replaced (everything else shared)."""
+        """Return a new state with the given fields replaced (everything else shared).
+
+        Whenever ``hands`` changes, guess-leaked knowledge is reconciled from the hand diff first, so
+        stale facts are pruned automatically at every hand-exit/entry. An explicit ``hand_lacks`` /
+        ``hand_has`` in ``changes`` (recorded at a guess site) then overrides -- ``update`` runs last.
+        """
         fields = dict(
             hands=self.hands, hidden=self.hidden, kings=self.kings,
             antechambers=self.antechambers, stack=self.stack, discard=self.discard,
@@ -150,9 +162,36 @@ class GameState:
             muted_values=self.muted_values, turn_player=self.turn_player,
             starting_player=self.starting_player, pending=self.pending,
             history=self.history, winner=self.winner,
+            hand_lacks=self.hand_lacks, hand_has=self.hand_has,
         )
+        new_hands = changes.get("hands")
+        if new_hands is not None and new_hands != self.hands:
+            fields["hand_lacks"], fields["hand_has"] = self._reconcile_knowledge(new_hands)
         fields.update(changes)
         return GameState(**fields)
+
+    def _reconcile_knowledge(self, new_hands):
+        """Prune guess-knowledge against a hand change (self = old state). For each changed hand D
+        (knower K = 1-D): a card of name X leaving D's hand voids ``has[K]`` for X (we only knew >=1);
+        a card entering D's hand voids ``lacks[K]`` -- entirely if it is D's concealed hidden card
+        (king-flip pickup), else just for that name (a public grab/swap-in, which also adds to has)."""
+        lacks = list(self.hand_lacks)
+        has = list(self.hand_has)
+        for d in range(NUM_PLAYERS):
+            if self.hands[d] == new_hands[d]:
+                continue
+            k = 1 - d
+            old_ids, new_ids = set(self.hands[d]), set(new_hands[d])
+            for c in old_ids - new_ids:                       # removed -> a 'has' lower bound is void
+                has[k] = has[k] - {cards.card_name(c)}
+            for c in new_ids - old_ids:                       # added -> 'lacks' may be void
+                if c == self.hidden[d]:
+                    lacks[k] = frozenset()                    # concealed add: K can't see it
+                else:
+                    nm = cards.card_name(c)
+                    lacks[k] = lacks[k] - {nm}
+                    has[k] = has[k] | {nm}
+        return tuple(lacks), tuple(has)
 
     def replace_top(self, step: PendingStep, **changes) -> "GameState":
         """Replace the current top step in place (used by multi-select accumulation)."""

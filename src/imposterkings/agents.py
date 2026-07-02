@@ -39,9 +39,10 @@ class MCTSAgent:
 
     name = "mcts"
 
-    def __init__(self, iterations: int = 1000, c: float = DEFAULT_C) -> None:
+    def __init__(self, iterations: int = 1000, c: float = DEFAULT_C, use_knowledge: bool = True) -> None:
         self.iterations = iterations
         self.c = c
+        self.use_knowledge = use_knowledge     # False = ignore guess-leaked facts (A/B benchmarking)
         self.last_result: Optional[SearchResult] = None
 
     def select_move(self, view: InformationSet, rng: np.random.Generator) -> Action:
@@ -49,6 +50,7 @@ class MCTSAgent:
         if len(moves) == 1:
             self.last_result = None
             return moves[0]
-        config = SearchConfig(rng=rng, iterations=self.iterations, c=self.c)
+        config = SearchConfig(rng=rng, iterations=self.iterations, c=self.c,
+                              use_knowledge=self.use_knowledge)
         self.last_result = search(view, config)
         return self.last_result.best_move

@@ -28,6 +28,8 @@ def mainstate(
     muted=frozenset(),
     to_play: int = 0,
     discard: Tuple[int, ...] = (),
+    hand_lacks=(frozenset(), frozenset()),
+    hand_has=(frozenset(), frozenset()),
 ) -> GameState:
     """A state sitting at a MAIN decision for ``to_play`` (turn_player == to_play)."""
     return GameState(
@@ -45,6 +47,8 @@ def mainstate(
         pending=(PendingStep(StepKind.MAIN, to_play),),
         history=(),
         winner=None,
+        hand_lacks=hand_lacks,
+        hand_has=hand_has,
     )
 
 

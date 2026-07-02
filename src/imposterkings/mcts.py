@@ -52,6 +52,7 @@ class SearchConfig:
     iterations: int = 1000
     c: float = DEFAULT_C
     scaled: bool = True
+    use_knowledge: bool = True     # honor guess-leaked opponent-hand facts when determinizing
 
 
 @dataclass
@@ -179,7 +180,7 @@ def search(info: InformationSet, config: SearchConfig) -> SearchResult:
     root = Node(parent=None, incoming_move=None, player_just_moved=None)
 
     for _ in range(config.iterations):
-        state = info.determinize(config.rng)            # fresh determinization at the root
+        state = info.determinize(config.rng, use_knowledge=config.use_knowledge)  # fresh root determinization
         leaf, leaf_state, visited = _select(root, state, config)
         reward = _rollout(leaf_state, config)
         _backpropagate(leaf, reward, visited)

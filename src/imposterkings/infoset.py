@@ -43,6 +43,9 @@ class InformationSet:
     starting_player: int
     pending: Tuple[PendingStep, ...]
     history: Tuple[Tuple[int, Action], ...] = field(default_factory=tuple)
+    # Guess-leaked knowledge about the OPPONENT's hand, from the observer's view (by card name).
+    opp_hand_lacks: frozenset = field(default_factory=frozenset)   # names the opp hand has 0 of
+    opp_hand_has: frozenset = field(default_factory=frozenset)     # names the opp hand has >=1 of
 
     # --- projection --------------------------------------------------------------------
 
@@ -67,6 +70,8 @@ class InformationSet:
             starting_player=state.starting_player,
             pending=state.pending,
             history=state.history,
+            opp_hand_lacks=state.hand_lacks[observer],
+            opp_hand_has=state.hand_has[observer],
         )
 
     # --- queries -----------------------------------------------------------------------
@@ -109,28 +114,56 @@ class InformationSet:
         return pinned
 
     def _consistent(self, opp_hand: Tuple[int, ...]) -> bool:
-        """Hook for opponent inference (guess-leak voids). Uniform over consistent worlds for now."""
-        return True
+        """True if ``opp_hand`` respects the guess-leaked knowledge: none of the lacked names and at
+        least one of every 'has' name. Used to validate the constructive determinization."""
+        names = [cards.card_name(c) for c in opp_hand]
+        if any(n in self.opp_hand_lacks for n in names):
+            return False
+        return all(h in names for h in self.opp_hand_has)
 
     # --- the MCTS sampling seam --------------------------------------------------------
 
-    def determinize(self, rng: np.random.Generator) -> GameState:
+    def determinize(self, rng: np.random.Generator, use_knowledge: bool = True) -> GameState:
         """Sample a concrete GameState consistent with this information set.
 
         Distributes the unknown pool into the opponent's hand, their hidden card (if their king is
-        unflipped), and muck (their setup-discard + the face-down leftover, which never matter)."""
+        unflipped), and muck (their setup-discard + the face-down leftover, which never matter).
+        With ``use_knowledge`` (default), the sampled opponent HAND honors guess leaks: it excludes
+        every ``opp_hand_lacks`` name and includes >=1 of every ``opp_hand_has`` name. Cards of a
+        lacked name may still be the opponent's hidden card or muck -- the constraint is hand-only.
+        ``use_knowledge=False`` reproduces uniform sampling (A/B benchmarking + back-compat)."""
         unknown = self.unknown_cards()
         pinned = self._pinned_opp_cards() & set(unknown)
+        lacks = self.opp_hand_lacks if use_knowledge else frozenset()
+        has = self.opp_hand_has if use_knowledge else frozenset()
+
         free = [c for c in unknown if c not in pinned]
         free = [int(free[i]) for i in rng.permutation(len(free))]
 
-        # Honor committed cards first, then fill the opponent's hand from the free pool.
-        n_free_in_hand = self.opp_hand_count - len(pinned)
-        opp_hand = tuple(sorted(pinned | set(free[:n_free_in_hand])))
-        rest = free[n_free_in_hand:]
+        # Build the opponent's hand constructively (no rejection loops on tight constraints):
+        hand = set(pinned)                                       # committed cards always in hand
+        for nm in has:                                           # (a) force >=1 of each 'has' name
+            if any(cards.card_name(c) == nm for c in hand):
+                continue
+            pick = next((c for c in free if c not in hand and cards.card_name(c) == nm), None)
+            if pick is not None:
+                hand.add(pick)
+        for c in free:                                           # (b) fill from non-lacked cards
+            if len(hand) >= self.opp_hand_count:
+                break
+            if c not in hand and cards.card_name(c) not in lacks:
+                hand.add(c)
+        if len(hand) < self.opp_hand_count:                      # (c) infeasible-constraint fallback
+            for c in free:
+                if len(hand) >= self.opp_hand_count:
+                    break
+                hand.add(c)
+
+        opp_hand = tuple(sorted(hand))
+        rest = [c for c in free if c not in hand]                # lacked/leftover cards -> hidden + muck
 
         opp_hidden: Optional[int] = None
-        if self.opp_has_hidden:
+        if self.opp_has_hidden and rest:
             opp_hidden, rest = rest[0], rest[1:]
 
         opp_setup_discard = rest[0] if rest else None
@@ -146,6 +179,13 @@ class InformationSet:
         setup_discard = [None, None]
         setup_discard[observer] = self.own_setup_discard
         setup_discard[opp] = opp_setup_discard
+
+        # Carry the observer's knowledge into the reconstructed world (opp's beliefs are irrelevant
+        # to a search from the observer's seat) so in-tree moves keep it consistent.
+        hand_lacks = [frozenset(), frozenset()]
+        hand_lacks[observer] = self.opp_hand_lacks
+        hand_has = [frozenset(), frozenset()]
+        hand_has[observer] = self.opp_hand_has
 
         return GameState(
             hands=tuple(hands),
@@ -163,4 +203,6 @@ class InformationSet:
             history=self.history,
             winner=None,
             setup_discard=tuple(setup_discard),
+            hand_lacks=tuple(hand_lacks),
+            hand_has=tuple(hand_has),
         )

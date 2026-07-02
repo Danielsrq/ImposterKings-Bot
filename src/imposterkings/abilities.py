@@ -59,6 +59,19 @@ def _add_to_hand(hand: Tuple[int, ...], card: int) -> Tuple[int, ...]:
     return tuple(sorted(hand + (card,)))
 
 
+def _know_add(knowledge, seat: int, name: str):
+    """Guess-knowledge tuple ``(frozenset, frozenset)`` with ``name`` added at ``seat``."""
+    k = list(knowledge)
+    k[seat] = k[seat] | {name}
+    return tuple(k)
+
+
+def _know_drop(knowledge, seat: int, name: str):
+    k = list(knowledge)
+    k[seat] = k[seat] - {name}
+    return tuple(k)
+
+
 # --- legality (shared by generate.py and the win check) --------------------------------
 
 def _can_play(state: GameState, card: int, player: int,
@@ -211,9 +224,17 @@ def _resolve_guess(state: GameState, step: PendingStep, action: Action) -> GameS
     defender = 1 - owner
     held = any(cards.card_name(c) == action.name for c in state.hands[defender])
     if held:
-        return state.advance(PendingStep(StepKind.REACTION_KINGSHAND, defender,
-                                         source=source, against=source, guess=action.name))
-    return state.advance()  # wrong guess (or named card not held) -> nothing happens
+        # The guesser now knows the defender holds >=1 of that name (a King's-Hand counter discards
+        # the KH card, not the guessed one, so the fact stands).
+        return state.advance(
+            PendingStep(StepKind.REACTION_KINGSHAND, defender,
+                        source=source, against=source, guess=action.name),
+            hand_has=_know_add(state.hand_has, owner, action.name),
+            hand_lacks=_know_drop(state.hand_lacks, owner, action.name),
+        )
+    # Wrong guess -> nothing happens, but the guesser learns the defender's hand lacks that name.
+    return state.advance(hand_lacks=_know_add(state.hand_lacks, owner, action.name),
+                         hand_has=_know_drop(state.hand_has, owner, action.name))
 
 
 def _after_guess_kingshand_declined(state: GameState, step: PendingStep) -> GameState:
@@ -226,9 +247,11 @@ def _after_guess_kingshand_declined(state: GameState, step: PendingStep) -> Game
         held = tuple(c for c in state.hands[defender] if cards.card_name(c) == name)
         new_def = tuple(c for c in state.hands[defender] if c not in held)
         new_ante = state.antechambers[defender] + held
+        # All copies of the name are extracted to the (public) antechamber -> the hand now lacks it.
         return state.advance(
             hands=_set_index(state.hands, defender, new_def),
             antechambers=_set_index(state.antechambers, defender, new_ante),
+            hand_lacks=_know_add(state.hand_lacks, owner, name),
         )
     if ability == Ability.JUDGE:
         return state.advance(PendingStep(StepKind.ABILITY_HAND_CARD, owner, source=source, guess=name))
