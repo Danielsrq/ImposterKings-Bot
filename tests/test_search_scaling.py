@@ -6,7 +6,7 @@ import pytest
 pytest.importorskip("joblib")
 
 from imposterkings.search_scaling import (  # noqa: E402
-    _EVAL_COLS, flatten_evals, run_sweep, save_calibration_plot, save_csv, save_eval_csv,
+    _EVAL_COLS, _KNOW_COLS, flatten_evals, run_sweep, save_calibration_plot, save_csv, save_eval_csv,
     save_eval_plot, save_plot,
 )
 
@@ -59,6 +59,20 @@ def test_shared_rng_collapses_at_baseline_but_independent_does_not():
     rows2 = run_sweep(n_values=[16], deals=4, baseline=16, base_seed=0, workers=1,
                       collect_eval=False, independent_rng=True)
     assert 0.0 <= rows2[0]["winrate"] <= 1.0
+
+
+def test_knowledge_milestone_columns():
+    # With --knowledge the eval rows carry the per-game first-ply milestones (int, >= -1).
+    evals = flatten_evals(run_sweep(n_values=[8], deals=2, baseline=8, base_seed=0, workers=1,
+                                    knowledge=True))
+    assert evals and len(_KNOW_COLS) == 8
+    for e in evals:
+        assert set(_KNOW_COLS) <= set(e)
+        assert all(isinstance(e[c], int) and e[c] >= -1 for c in _KNOW_COLS)
+    # Columns are part of the schema even without --knowledge (defaulted to -1) so the CSV is stable.
+    off = flatten_evals(run_sweep(n_values=[8], deals=1, baseline=8, base_seed=0, workers=1))[0]
+    assert all(off[c] == -1 for c in _KNOW_COLS)
+    assert set(_KNOW_COLS) <= set(_EVAL_COLS)
 
 
 def test_plots_write_png(tmp_path):

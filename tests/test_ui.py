@@ -60,3 +60,18 @@ def test_render_frame_draws_pv_lines_from_a_real_search():
     assert frame.buttons
     assert hasattr(frame.hint_toggle, "collidepoint")
     pygame.display.quit()
+
+
+def test_render_frame_draws_knowledge_column():
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    st = mainstate(hand0=(cid("Queen"),), hand1=(cid("Fool"),), stack=(sc("Elder"),))
+    view = st.information_set(0)
+    knowledge = [
+        (frozenset({"Princess", "Warlord"}), frozenset({"Fool"}), "50-50"),
+        (frozenset({"Queen"}), frozenset(), "perfect"),
+    ]
+    frame = render_frame(screen, view, fonts, view.legal_moves(), knowledge=knowledge, seed=1)
+    assert frame.review is None and hasattr(frame.new_game, "collidepoint")  # drew without error
+    pygame.display.quit()

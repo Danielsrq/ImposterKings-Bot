@@ -15,7 +15,7 @@ from ..actions import Action, ActionKind, StepKind
 from ..explain import format_action
 from . import assets
 
-WINDOW = (1380, 1000)
+WINDOW = (1740, 1060)
 CARD = (96, 131)
 SMALL = (64, 87)
 
@@ -29,9 +29,20 @@ BTN = (52, 56, 66)
 BTN_HOVER = (78, 96, 120)
 P_COLORS = {0: (95, 160, 240), 1: (240, 170, 90)}   # PV move colors by seat (P0 blue, P1 orange)
 
-PANEL_X = 1030
+# Per-card-name colors (from the card art), shared by the tree view and the hand-knowledge column.
+CARD_COLORS = {
+    "Queen": (245, 87, 14), "Princess": (242, 92, 15), "Sentry": (224, 127, 59),
+    "KingsHand": (199, 103, 43), "Warlord": (240, 154, 9), "Mystic": (238, 154, 6),
+    "Oathbound": (226, 202, 32), "Soldier": (80, 172, 123), "Judge": (64, 145, 69),
+    "Inquisitor": (76, 155, 168), "Zealot": (122, 156, 194), "Elder": (106, 154, 220),
+    "Assassin": (168, 171, 224), "Fool": (167, 113, 175),
+}
+NEUTRAL = (80, 84, 94)      # non-card items (abilities, unknowns)
+
+PANEL_X = 1390              # side panel starts here
+KNOW_X = 1150               # hand-knowledge column occupies [KNOW_X, PANEL_X]
 PANEL_W = WINDOW[0] - PANEL_X - 12
-ROW_MAX_X = PANEL_X - 12     # right edge of the play area (cards never cross into the panel)
+ROW_MAX_X = KNOW_X - 12     # right edge of the play area (before the knowledge column)
 DIVIDER = (60, 62, 70)
 
 # The side panel stacks four sections: ACTIONS, LOG, (bot) REASONING, (your) HINT.
@@ -39,9 +50,9 @@ BTN_TOP = 88        # y of the first action button (kept in sync with app's hove
 BTN_H = 28
 ACT_BOTTOM = 490    # action buttons capped above this -> fits all 14 guess names (88 + 14*28 = 480)
 LOG_TOP = 505       # "Log" section header
-LOG_LINES = 6       # recent log lines shown
-REASON_TOP = 645    # "Bot reasoning" section header (+ toggle)
-HINT_TOP = 815      # "Your hint" section header (+ toggle)
+LOG_LINES = 8       # recent log lines shown
+REASON_TOP = 705    # "Bot reasoning" section header (+ toggle)
+HINT_TOP = 855      # "Your hint" section header (+ toggle)
 
 
 class Frame(NamedTuple):
@@ -188,10 +199,56 @@ def _draw_reasoning_section(surface, fonts, top, title, result, shown, placehold
     return toggle
 
 
+_TICK = (90, 200, 110)
+_AMBER = (224, 150, 60)
+
+
+def _tick(surface, x, y):     # small green checkmark (consolas lacks the glyph, so draw it)
+    pygame.draw.lines(surface, _TICK, False, [(x + 1, y + 8), (x + 5, y + 12), (x + 13, y + 1)], 2)
+
+
+def _cross(surface, x, y):    # small red X
+    pygame.draw.line(surface, RED, (x + 2, y + 2), (x + 12, y + 12), 2)
+    pygame.draw.line(surface, RED, (x + 12, y + 2), (x + 2, y + 12), 2)
+
+
+def _draw_know_panel(surface, fonts, x, y, max_x, title, facts):
+    """One knower's read on the other's hand: title + PERFECT/50-50 chip + a tick row and a cross row."""
+    small = fonts["small"]
+    has, lacks, level = facts
+    _text(surface, small, title, (x, y), MUTE)
+    yy = y + 20
+    if level:
+        txt = "PERFECT INFO" if level == "perfect" else "50-50"
+        chip = pygame.Rect(x, yy, small.size(txt)[0] + 12, 20)
+        pygame.draw.rect(surface, GOLD if level == "perfect" else _AMBER, chip, border_radius=4)
+        surface.blit(small.render(txt, True, (20, 20, 20)), (x + 6, yy + 2))
+        yy += 26
+    _tick(surface, x, yy + 2)
+    pos = [(n, CARD_COLORS.get(n, INK)) for n in sorted(has)] or [("(none)", MUTE)]
+    yy = _draw_tokens(surface, small, pos, x + 20, yy, max_x, 20)
+    _cross(surface, x, yy + 4)
+    neg = [(n, CARD_COLORS.get(n, INK)) for n in sorted(lacks)] or [("(none)", MUTE)]
+    _draw_tokens(surface, small, neg, x + 20, yy + 2, max_x, 20)
+
+
+def _draw_knowledge(surface, fonts, view, knowledge):
+    """Hand-knowledge column between the play area and the side panel: what each player has deduced
+    about the other's hand (all from public events, so both reads are legitimately shown)."""
+    if knowledge is None:
+        return
+    pygame.draw.line(surface, DIVIDER, (KNOW_X, 0), (KNOW_X, WINDOW[1]))
+    x0, max_x = KNOW_X + 10, PANEL_X - 10
+    _text(surface, fonts["med"], "Hand knowledge", (x0, 12), INK)
+    obs, opp = view.observer, 1 - view.observer
+    _draw_know_panel(surface, fonts, x0, 64, max_x, f"You (P{obs}) know — P{opp}'s hand", knowledge[obs])
+    _draw_know_panel(surface, fonts, x0, 804, max_x, f"P{opp} knows — your hand", knowledge[opp])
+
+
 def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                  hover: Optional[int] = None, status: str = "", log: Optional[List[str]] = None,
                  bot_result=None, show_reasoning: bool = True, seed=None,
-                 hint_result=None, show_hint: bool = False) -> Frame:
+                 hint_result=None, show_hint: bool = False, knowledge=None) -> Frame:
     surface.fill(BG)
     big, med, small = fonts["big"], fonts["med"], fonts["small"]
     opp = 1 - view.observer
@@ -228,6 +285,12 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
             for c, x in zip(ante, _row_x(360, len(ante), 70, SMALL[0])):
                 _draw_card(surface, assets.card_surface(c, SMALL), (x, y - 8))
             y += 84
+
+    # --- face-up leftover (known to both from the start; info only, NOT the leading card) -----
+    if view.leftover_faceup is not None and 0 <= view.leftover_faceup < cards.DECK_SIZE:
+        lx = ROW_MAX_X - SMALL[0] - 10
+        _text(surface, small, "leftover (face-up, info):", (lx - 130, 448), MUTE)
+        _draw_card(surface, assets.card_surface(view.leftover_faceup, SMALL), (lx, 466))
 
     # --- stack (center) -----------------------------------------------------------------
     _text(surface, med, "Throne / stack:", (24, 430))
@@ -292,6 +355,7 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                                                bot_result, show_reasoning, "(no search yet)")
     hint_toggle = _draw_reasoning_section(surface, fonts, HINT_TOP, "Hint (MCTS):",
                                           hint_result, show_hint, "(toggle on your turn for a hint)")
+    _draw_knowledge(surface, fonts, view, knowledge)
     return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review)
 
 

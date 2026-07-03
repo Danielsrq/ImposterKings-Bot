@@ -63,6 +63,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     hint_agent = MCTSAgent(iterations=iters if hint_iters is None else hint_iters)
     hint_rng = np.random.default_rng(1234567)     # dedicated so hints don't perturb the game rng
     hint: dict = {"state": None, "result": None}  # cached hint search, keyed by state identity
+    knowledge_cache: dict = {"state": None, "val": None}   # [seat -> (has, lacks, level)], per state
     trajectory: list = []                          # per-ply PlyRecord(seat, move, view, result) for review
     game: dict = {}  # holds the resettable per-game state: state, rng, seed, bot
 
@@ -74,6 +75,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         log.clear()
         trajectory.clear()
         hint["state"], hint["result"] = None, None
+        knowledge_cache["state"], knowledge_cache["val"] = None, None
         pygame.display.set_caption(f"ImposterKings  (seed {s})")
         print(f"ImposterKings  (deck seed {s} -- pass --seed {s} to replay this deal)")
 
@@ -114,10 +116,19 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             hint["state"], hint["result"] = game["state"], hint_agent.last_result
         hint_result = hint["result"] if (show_hint and human_turn) else None
 
+        # Hand-knowledge for both seats (recomputed once per state).
+        if game["state"] is not knowledge_cache["state"]:
+            kn = []
+            for s in (0, 1):
+                v = game["state"].information_set(s)
+                kn.append((v.opp_hand_has, v.opp_hand_lacks, v.knowledge_level()))
+            knowledge_cache["state"], knowledge_cache["val"] = game["state"], kn
+
         frame = render_frame(screen, view, fonts, legal, hover=hover, status=status,
                              log=list(log), bot_result=getattr(bot, "last_result", None),
                              show_reasoning=show_reasoning, seed=game["seed"],
-                             hint_result=hint_result, show_hint=show_hint)
+                             hint_result=hint_result, show_hint=show_hint,
+                             knowledge=knowledge_cache["val"])
         pygame.display.flip()
 
         review_requested = False

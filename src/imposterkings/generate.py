@@ -65,6 +65,10 @@ def legal_moves(state: GameState) -> List[Action]:
         return [DECLARE, DECLINE]
 
     if k == StepKind.ABILITY_GUESS:
+        # NOTE: all names are offered on purpose. Naming a card the opponent cannot hold is a legitimate
+        # *deliberate whiff* -- a landed guess opens a King's-Hand window that can discard the played
+        # Soldier/Judge from the throne, so a guaranteed miss protects it. (This is why MCTS may "guess"
+        # a card you hold, e.g. your own hidden card: it is choosing the safe miss, not a leaked belief.)
         return [Action(ActionKind.GUESS_CARD, name=n) for n in cards.CARD_NAMES]
 
     if k == StepKind.ABILITY_NUMBER:

@@ -14,6 +14,7 @@ information that guesses leak (a wrong Inquisitor/Soldier/Judge name proves the 
 """
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -120,6 +121,33 @@ class InformationSet:
         if any(n in self.opp_hand_lacks for n in names):
             return False
         return all(h in names for h in self.opp_hand_has)
+
+    # --- knowledge level (how narrowed the opponent's hand is) --------------------------
+
+    def possible_opp_hands(self, cap: int = 3) -> int:
+        """How many DISTINCT opponent hands (as card-name multisets) are still consistent with what
+        the observer knows -- guesses + card-counting (``unknown_cards`` already excludes public zones).
+        Counts stop early once ``cap`` distinct are found (we only care about 1 vs 2 vs more). The
+        hidden card is treated as an irrelevant unknown: we only constrain the HAND."""
+        candidates = [c for c in self.unknown_cards() if cards.card_name(c) not in self.opp_hand_lacks]
+        if self.opp_hand_count > len(candidates):
+            return 0  # over-constrained (shouldn't happen with consistent facts)
+        seen = set()
+        for combo in itertools.combinations(candidates, self.opp_hand_count):
+            names = tuple(sorted(cards.card_name(c) for c in combo))
+            if names in seen:
+                continue
+            if all(h in names for h in self.opp_hand_has):
+                seen.add(names)
+                if len(seen) >= cap:
+                    break
+        return len(seen)
+
+    def knowledge_level(self) -> Optional[str]:
+        """``"perfect"`` if the observer knows the opponent's exact hand (1 possibility), ``"binary"``
+        if it is a 50-50 between 2, else ``None``."""
+        n = self.possible_opp_hands(cap=3)
+        return "perfect" if n == 1 else "binary" if n == 2 else None
 
     # --- the MCTS sampling seam --------------------------------------------------------
 

@@ -42,8 +42,28 @@ def _summarize(result):
     return result.root_value(), q1, q2, result.best_move
 
 
+_KNOW_COLS = [f"g{cs}_p{s}_first_{lvl}"
+              for cs in (0, 1) for s in (0, 1) for lvl in ("binary", "perfect")]
+
+
+def _knowledge_tracker():
+    """An ``on_decision`` hook plus a dict recording the first ply each seat first reaches binary /
+    perfect knowledge of the opponent's hand (-1 = never). Cost is O(combinations) per ply."""
+    ms = {(s, lvl): -1 for s in (0, 1) for lvl in ("binary", "perfect")}
+    ply = [0]
+
+    def on_decision(seat, view, move, agent, state):
+        for s in (0, 1):
+            lvl = state.information_set(s).knowledge_level()
+            if lvl in ("binary", "perfect") and ms[(s, lvl)] < 0:
+                ms[(s, lvl)] = ply[0]
+        ply[0] += 1
+
+    return on_decision, ms
+
+
 def _eval_level(n: int, deals: int, baseline: int, base_seed: int, collect_eval: bool = True,
-                independent_rng: bool = False) -> Dict:
+                independent_rng: bool = False, knowledge: bool = False) -> Dict:
     """Worker: MCTS@n vs MCTS@baseline over ``deals`` mirrored, paired-seed deals -> one curve point,
     plus (optionally) both bots' starting-position evals and win/prediction calibration per deal.
 
@@ -57,13 +77,15 @@ def _eval_level(n: int, deals: int, baseline: int, base_seed: int, collect_eval:
         seed = base_seed + d
 
         # --- the two mirrored games (challenger in each seat), same deal ---
-        winners = {}
+        winners, game_ms = {}, {}
         for cs in (0, 1):
             agents = [None, None]
             agents[cs] = MCTSAgent(iterations=n)
             agents[1 - cs] = MCTSAgent(iterations=baseline)
             play_rng = np.random.default_rng([seed, cs]) if independent_rng else None
-            winners[cs], _, _ = play_game(agents, np.random.default_rng(seed), play_rng=play_rng)
+            on_dec, game_ms[cs] = _knowledge_tracker() if (knowledge and collect_eval) else (None, None)
+            winners[cs], _, _ = play_game(agents, np.random.default_rng(seed),
+                                          on_decision=on_dec, play_rng=play_rng)
         challenger_wins = int(winners[0] == 0) + int(winners[1] == 1)
         pair_scores.append(challenger_wins / 2.0)
 
@@ -83,6 +105,12 @@ def _eval_level(n: int, deals: int, baseline: int, base_seed: int, collect_eval:
         # @N is challenger; @N sits at p_seat in the game cs == p_seat, @baseline in cs == 1 - p_seat.
         n_start_won = int(winners[p_seat] == p_seat)
         b_start_won = int(winners[1 - p_seat] == p_seat)
+        km = {c: -1 for c in _KNOW_COLS}
+        if knowledge and collect_eval:
+            for cs in (0, 1):
+                for s in (0, 1):
+                    for lvl in ("binary", "perfect"):
+                        km[f"g{cs}_p{s}_first_{lvl}"] = game_ms[cs][(s, lvl)]
         evals.append({
             "n": n, "deal": d, "seed": seed, "start_seat": p_seat,
             "eval_n": val_n, "eval_baseline": val_b, "diff": val_n - val_b,
@@ -92,6 +120,7 @@ def _eval_level(n: int, deals: int, baseline: int, base_seed: int, collect_eval:
             "correct_n": int((val_n > 0) == bool(n_start_won)),
             "pred_baseline_win": int(val_b > 0), "baseline_start_won": b_start_won,
             "correct_baseline": int((val_b > 0) == bool(b_start_won)),
+            **km,
         })
 
     arr = np.array(pair_scores, dtype=float)
@@ -105,12 +134,13 @@ def _eval_level(n: int, deals: int, baseline: int, base_seed: int, collect_eval:
 
 
 def run_sweep(n_values: List[int], deals: int, baseline: int, base_seed: int,
-              workers: int, collect_eval: bool = True, independent_rng: bool = False) -> List[Dict]:
+              workers: int, collect_eval: bool = True, independent_rng: bool = False,
+              knowledge: bool = False) -> List[Dict]:
     """Run every N-level (in parallel when ``workers > 1``) and return rows sorted by N."""
     from joblib import Parallel, delayed
     from tqdm import tqdm
 
-    jobs = (delayed(_eval_level)(n, deals, baseline, base_seed, collect_eval, independent_rng)
+    jobs = (delayed(_eval_level)(n, deals, baseline, base_seed, collect_eval, independent_rng, knowledge)
             for n in n_values)
     gen = Parallel(n_jobs=workers, return_as="generator")(jobs)
     rows = list(tqdm(gen, total=len(n_values), desc="N-levels", unit="level"))
@@ -153,7 +183,7 @@ def save_csv(path: str, rows: List[Dict]) -> None:
 _EVAL_COLS = ["n", "deal", "seed", "start_seat", "eval_n", "eval_baseline", "diff",
               "q1_n", "q2_n", "q1_baseline", "q2_baseline", "bestmove_agree",
               "pred_n_win", "n_start_won", "correct_n",
-              "pred_baseline_win", "baseline_start_won", "correct_baseline"]
+              "pred_baseline_win", "baseline_start_won", "correct_baseline"] + _KNOW_COLS
 
 
 def save_eval_csv(path: str, eval_rows: List[Dict]) -> None:
@@ -263,6 +293,8 @@ def main(argv=None) -> None:
     p.add_argument("--no-eval", action="store_true", help="skip eval + calibration collection")
     p.add_argument("--independent-rng", action="store_true",
                    help="give the two mirrored games independent play randomness (same deal)")
+    p.add_argument("--knowledge", action="store_true",
+                   help="record the first ply each seat reaches binary/perfect hand-knowledge (per game)")
     args = p.parse_args(argv)
 
     n_values = list(range(args.min, args.max + 1, args.step))
@@ -273,7 +305,8 @@ def main(argv=None) -> None:
 
     t0 = time.perf_counter()
     rows = run_sweep(n_values, args.deals, args.baseline, args.base_seed, args.workers,
-                     collect_eval=not args.no_eval, independent_rng=args.independent_rng)
+                     collect_eval=not args.no_eval, independent_rng=args.independent_rng,
+                     knowledge=args.knowledge)
     print(f"\n{format_table(rows, args.baseline)}")
     print(f"\ntotal wall time: {time.perf_counter() - t0:.0f}s")
 

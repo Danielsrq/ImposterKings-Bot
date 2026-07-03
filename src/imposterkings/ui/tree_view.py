@@ -15,19 +15,10 @@ import pygame
 
 from ..actions import Action, ActionKind
 from ..cards import card_name
-from .render import DIVIDER, GOLD, INK, MUTE, _compact_action, _text
+from .render import CARD_COLORS, DIVIDER, GOLD, INK, MUTE, NEUTRAL, _compact_action, _text
 
 RGB = Tuple[int, int, int]
 
-# One color per card name (14 in cards.CARD_NAMES), matching the card art (user-supplied hex codes).
-CARD_COLORS: Dict[str, RGB] = {
-    "Queen": (245, 87, 14), "Princess": (242, 92, 15), "Sentry": (224, 127, 59),
-    "KingsHand": (199, 103, 43), "Warlord": (240, 154, 9), "Mystic": (238, 154, 6),
-    "Oathbound": (226, 202, 32), "Soldier": (80, 172, 123), "Judge": (64, 145, 69),
-    "Inquisitor": (76, 155, 168), "Zealot": (122, 156, 194), "Elder": (106, 154, 220),
-    "Assassin": (168, 171, 224), "Fool": (167, 113, 175),
-}
-NEUTRAL: RGB = (80, 84, 94)          # non-card micro-decisions (declare/mute/guess/react)
 _CARD_KINDS = {ActionKind.PLAY_CARD, ActionKind.HIDE_CARD,
                ActionKind.DISCARD_CARD, ActionKind.CHOOSE_HAND_CARD}
 

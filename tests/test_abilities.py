@@ -64,10 +64,19 @@ def test_sentry_swaps_exact_position_not_top():
     assert next(s for s in st.stack if cards.card_name(s.card) == "Sentry").disgraced
 
 
+def test_soldier_guess_is_mandatory_no_decline():
+    # Playing a Soldier goes straight to the guess -- there is no declare/decline step.
+    st = mainstate(hand0=(cid("Soldier"),), hand1=(cid("Warlord"),), stack=(sc("Fool"),))
+    st = run(st, _play(cid("Soldier")))
+    assert st.phase == StepKind.ABILITY_GUESS
+    kinds = {m.kind for m in st.legal_moves()}
+    assert kinds == {ActionKind.GUESS_CARD}                        # only guesses; no DECLARE/DECLINE
+
+
 def test_soldier_correct_guess_grants_plus_two_immediately_then_disgrace():
     st = mainstate(hand0=(cid("Soldier"),), hand1=(cid("Warlord"),), stack=(sc("Fool"),))
-    # Guess is made public first; the defender (no King's Hand here) then gets the counter window.
-    st = run(st, _play(cid("Soldier")), DECLARE, _guess("Warlord"))
+    # The guess is mandatory + made public; the defender (no King's Hand here) then gets the counter window.
+    st = run(st, _play(cid("Soldier")), _guess("Warlord"))
     assert st.phase == StepKind.REACTION_KINGSHAND
     st = run(st, DECLINE_REACTION)
     # +2 is applied automatically on the correct guess; we go straight to the disgrace choice.
@@ -81,7 +90,7 @@ def test_soldier_correct_guess_grants_plus_two_immediately_then_disgrace():
 
 def test_soldier_plus_two_holds_even_when_disgracing_nothing():
     st = mainstate(hand0=(cid("Soldier"),), hand1=(cid("Warlord"),), stack=(sc("Fool"),))
-    st = run(st, _play(cid("Soldier")), DECLARE, _guess("Warlord"), DECLINE_REACTION, STOP)
+    st = run(st, _play(cid("Soldier")), _guess("Warlord"), DECLINE_REACTION, STOP)
     soldier_sc = next(s for s in st.stack if cards.card_name(s.card) == "Soldier")
     assert st.effective_stack_value(soldier_sc) == 7  # +2 kept even with 0 cards disgraced
     assert not next(s for s in st.stack if cards.card_name(s.card) == "Fool").disgraced
@@ -89,15 +98,23 @@ def test_soldier_plus_two_holds_even_when_disgracing_nothing():
 
 def test_soldier_wrong_guess_offers_no_counter_and_does_nothing():
     st = mainstate(hand0=(cid("Soldier"),), hand1=(cid("Warlord"),), stack=(sc("Fool"),))
-    st = run(st, _play(cid("Soldier")), DECLARE, _guess("Queen"))  # wrong -> no window, no effect
+    st = run(st, _play(cid("Soldier")), _guess("Queen"))  # wrong -> no window, no effect
     soldier_sc = next(s for s in st.stack if cards.card_name(s.card) == "Soldier")
     assert st.effective_stack_value(soldier_sc) == 5  # no +2
     assert not next(s for s in st.stack if cards.card_name(s.card) == "Fool").disgraced
 
 
+def test_judge_guess_is_mandatory_no_decline():
+    # Playing a Judge goes straight to the guess -- like Soldier, there is no declare/decline step.
+    st = mainstate(hand0=(cid("Judge"), cid("Fool")), hand1=(cid("Warlord"),), stack=(sc("Elder"),))
+    st = run(st, _play(cid("Judge")))
+    assert st.phase == StepKind.ABILITY_GUESS
+    assert {m.kind for m in st.legal_moves()} == {ActionKind.GUESS_CARD}
+
+
 def test_judge_correct_guess_queues_to_own_antechamber():
     st = mainstate(hand0=(cid("Judge"), cid("Fool")), hand1=(cid("Warlord"),), stack=(sc("Elder"),))
-    st = run(st, _play(cid("Judge")), DECLARE, _guess("Warlord"), DECLINE_REACTION)
+    st = run(st, _play(cid("Judge")), _guess("Warlord"), DECLINE_REACTION)
     assert st.phase == StepKind.ABILITY_HAND_CARD
     assert STOP in st.legal_moves()  # may decline to queue
     st = run(st, _hand(cid("Fool")))

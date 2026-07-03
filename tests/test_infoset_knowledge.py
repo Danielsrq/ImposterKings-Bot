@@ -8,12 +8,40 @@ from __future__ import annotations
 
 import numpy as np
 
-from imposterkings.actions import Action, ActionKind, StepKind
+from imposterkings import cards
+from imposterkings.actions import Action, ActionKind, DECLARE, DECLINE_REACTION, StepKind
 from imposterkings.cards import card_name
 from imposterkings.mcts import SearchConfig, search
 from imposterkings.state import GameState, PendingStep
 
-from .helpers import cid, mainstate, sc
+from .helpers import cid, mainstate, run, sc
+
+
+def _visible_all_except(*names):
+    """All card ids except every copy of the given names (used to shrink the observer's unknown pool)."""
+    excl = set()
+    for n in names:
+        excl.update(cards.card_ids_for_name(n))
+    return tuple(c for c in range(cards.DECK_SIZE) if c not in excl)
+
+
+def _play(c):
+    return Action(ActionKind.PLAY_CARD, card=c)
+
+
+def _hand(c):
+    return Action(ActionKind.CHOOSE_HAND_CARD, card=c)
+
+
+def _target(i):
+    return Action(ActionKind.CHOOSE_STACK_TARGET, target=i)
+
+
+def _opp_always_has(view, name, n=50):
+    """True if every determinization puts a card named ``name`` in the opponent's hand."""
+    opp = 1 - view.observer
+    return all(any(card_name(c) == name for c in view.determinize(np.random.default_rng(i)).hands[opp])
+               for i in range(n))
 
 
 def _guessstate(owner: int, source: int, hand0, hand1) -> GameState:
@@ -136,3 +164,71 @@ def test_search_eval_improves_when_opponent_is_known_to_lack_strong_cards():
     v_off = mean_root_value(st_off, use=False)
     v_on = mean_root_value(st_on, use=True)
     assert v_on - v_off > 0.12, f"expected a clear gain from the knowledge, got on={v_on:.3f} off={v_off:.3f}"
+
+
+# --- non-guess cards that reveal a known card into the opponent's hand feed determinize too ------
+# (Sentry/Fool/Princess move a PUBLIC card into a hand -> the generic with_ reconciliation records it
+# as a 'has' fact, which determinize then honors. These prove that end-to-end.)
+
+def test_sentry_grab_is_known_and_feeds_determinize():
+    # Opponent (seat 1) plays a Sentry and swaps the live Warlord off the stack into hand.
+    st = mainstate(hand0=(cid("Queen"),), hand1=(cid("Sentry"), cid("Fool")),
+                   stack=(sc("Warlord"),), to_play=1)
+    st = run(st, _play(cid("Sentry")), DECLARE, DECLINE_REACTION, _target(0), _hand(cid("Fool")))
+    assert cid("Warlord") in st.hands[1] and "Warlord" in st.hand_has[0]
+    assert _opp_always_has(st.information_set(0), "Warlord")
+
+
+def test_fool_takeback_is_known_and_feeds_determinize():
+    # Opponent (seat 1) plays a Fool over a disgraced lead and takes the live Warlord back to hand.
+    st = mainstate(hand0=(cid("Queen"),), hand1=(cid("Fool"),),
+                   stack=(sc("Warlord"), sc("Elder", disgraced=True)), to_play=1)
+    st = run(st, _play(cid("Fool")), DECLARE, DECLINE_REACTION, _target(0))
+    assert cid("Warlord") in st.hands[1] and "Warlord" in st.hand_has[0]
+    assert _opp_always_has(st.information_set(0), "Warlord")
+
+
+def test_princess_swap_is_known_and_feeds_determinize():
+    # Observer (seat 0) plays Princess and gives its Fool to the opponent -> knows the opp now holds it.
+    st = mainstate(hand0=(cid("Princess"), cid("Fool")), hand1=(cid("Soldier"),), stack=(sc("Elder"),))
+    st = run(st, _play(cid("Princess")), DECLARE, DECLINE_REACTION, _hand(cid("Fool")), _hand(cid("Soldier")))
+    assert cid("Fool") in st.hands[1] and "Fool" in st.hand_has[0]
+    assert _opp_always_has(st.information_set(0), "Fool")
+
+
+def test_landed_judge_guess_feeds_determinize():
+    # A landed (correct) Judge guess proves the opponent holds the name -> determinize must include it.
+    st = _guessstate(0, cid("Judge"), hand0=(cid("Judge"),), hand1=(cid("Warlord"), cid("Fool")))
+    st = st.apply(Action(ActionKind.GUESS_CARD, name="Warlord"))
+    assert "Warlord" in st.hand_has[0]
+    assert _opp_always_has(st.information_set(0), "Warlord")
+
+
+def test_determinize_never_leaks_own_hidden_card_to_opponent():
+    # The observer's own hidden card can never be sampled into the opponent's hand.
+    st = mainstate(hand0=(cid("Queen"), cid("Fool")),
+                   hand1=(cid("Warlord"), cid("Mystic"), cid("Soldier")),
+                   hidden=(cid("Zealot"), None))
+    view = st.information_set(0)
+    zealot = cid("Zealot")
+    assert zealot not in view.unknown_cards()
+    assert all(zealot not in view.determinize(np.random.default_rng(i)).hands[1] for i in range(300))
+
+
+# --- knowledge level: perfect / binary / none -------------------------------------------
+
+def test_knowledge_level_binary_perfect_and_none():
+    disc = _visible_all_except("Queen", "Fool")            # only Queen + Fool unknown to observer 0
+    v = mainstate(hand0=(), hand1=(cid("Queen"),), discard=disc).information_set(0)
+    assert v.opp_hand_count == 1 and set(v.unknown_cards()) == {cid("Queen"), cid("Fool")}
+    assert v.possible_opp_hands() == 2 and v.knowledge_level() == "binary"
+
+    # Proving the opponent lacks the Fool leaves only the Queen -> perfect information.
+    v2 = mainstate(hand0=(), hand1=(cid("Queen"),), discard=disc,
+                   hand_lacks=(frozenset({"Fool"}), frozenset())).information_set(0)
+    assert v2.possible_opp_hands() == 1 and v2.knowledge_level() == "perfect"
+
+    # A third unknown card -> more than two possibilities -> no chip.
+    v3 = mainstate(hand0=(), hand1=(cid("Queen"),),
+                   discard=_visible_all_except("Queen", "Fool", "Zealot")).information_set(0)
+    assert v3.possible_opp_hands() >= 3 and v3.knowledge_level() is None

@@ -28,11 +28,15 @@ from .state import GameState, PendingStep, StackCard
 KINGSHAND_ID = next(i for i, d in enumerate(cards.CARD_DEFS) if d.ability == Ability.KINGSHAND)
 ASSASSIN_ID = next(i for i, d in enumerate(cards.CARD_DEFS) if d.ability == Ability.ASSASSIN)
 
-# Optional ("may") on-play abilities, each gated by an ABILITY_MAY decision.
+# Optional ("may") on-play abilities, each gated by an ABILITY_MAY decision. Soldier/Judge are NOT here:
+# their guess is mandatory (you must name a card), so they go straight to ABILITY_GUESS on play.
 _OPTIONAL_ONPLAY = frozenset({
-    Ability.PRINCESS, Ability.SENTRY, Ability.MYSTIC,
-    Ability.JUDGE, Ability.SOLDIER, Ability.INQUISITOR, Ability.FOOL,
+    Ability.PRINCESS, Ability.SENTRY, Ability.MYSTIC, Ability.INQUISITOR, Ability.FOOL,
 })
+
+# Mandatory on-play guesses: no declare/decline -- you must name a card (King's Hand still counters
+# after the name, in _resolve_guess). Inquisitor's guess, by contrast, is a genuine "may".
+_MANDATORY_GUESS = frozenset({Ability.SOLDIER, Ability.JUDGE})
 
 # Guess abilities make their guess PUBLIC first, then open the King's-Hand window (so the defender
 # knows what they are countering). The other optional abilities open the window at declare time --
@@ -139,6 +143,10 @@ def _land(state: GameState, card: int, actor: int, *, ascended: bool, v_top: Opt
         beneath = tuple(replace(s, disgraced=True) for s in st.stack[:-1])
         st = st.with_(stack=beneath + (st.stack[-1],))
         return st, ()
+    if ability in _MANDATORY_GUESS:
+        # Mandatory guess (no decline). The King's-Hand window opens after the name is declared
+        # (in _resolve_guess); the ability's effect only applies on a correct, uncountered guess.
+        return st, (PendingStep(StepKind.ABILITY_GUESS, actor, source=card),)
     if ability in _OPTIONAL_ONPLAY:
         return st, (PendingStep(StepKind.ABILITY_MAY, actor, source=card),)
     return st, ()
