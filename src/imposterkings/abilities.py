@@ -35,13 +35,9 @@ _OPTIONAL_ONPLAY = frozenset({
 })
 
 # Mandatory on-play guesses: no declare/decline -- you must name a card (King's Hand still counters
-# after the name, in _resolve_guess). Inquisitor's guess, by contrast, is a genuine "may".
+# after the name, in _resolve_guess). Inquisitor's guess is a "may" but is flattened into ABILITY_MAY
+# (offered as {decline} + guesses) so it also opens the window only after the name is chosen.
 _MANDATORY_GUESS = frozenset({Ability.SOLDIER, Ability.JUDGE})
-
-# Guess abilities make their guess PUBLIC first, then open the King's-Hand window (so the defender
-# knows what they are countering). The other optional abilities open the window at declare time --
-# the source card on the stack already says what is being countered.
-_GUESS_ABILITIES = frozenset({Ability.JUDGE, Ability.SOLDIER, Ability.INQUISITOR})
 
 
 # --- tiny immutable-sequence helpers ---------------------------------------------------
@@ -203,8 +199,9 @@ def _fool_targets(state: GameState, source: int) -> List[int]:
 # --- ability resolution branches -------------------------------------------------------
 
 def _begin_resolution(state: GameState, source: int, owner: int) -> GameState:
-    """King's Hand was declined: push the ability's own sub-decisions (self-disgracing first
-    where the card does so). The current top is the reaction step, popped by ``advance``."""
+    """King's Hand was declined on a bare declaration (Sentry/Princess): push the ability's own swap
+    sub-decisions. Mystic/Fool are flattened (their parameter is chosen before the window), so they
+    never reach here. The current top is the reaction step, popped by ``advance``."""
     ability = cards.card_ability(source)
     if ability == Ability.PRINCESS:
         if not state.hands[owner] or not state.hands[1 - owner]:
@@ -215,13 +212,6 @@ def _begin_resolution(state: GameState, source: int, owner: int) -> GameState:
         if not _sentry_targets(st, source) or not st.hands[owner]:
             return st.advance()
         return st.advance(PendingStep(StepKind.ABILITY_STACK_TARGET, owner, source=source, limit=1))
-    if ability == Ability.MYSTIC:
-        st = _disgrace_card(state, source)
-        return st.advance(PendingStep(StepKind.ABILITY_NUMBER, owner, source=source))
-    if ability == Ability.FOOL:
-        if not _fool_targets(state, source):
-            return state.advance()  # nothing legal to take back
-        return state.advance(PendingStep(StepKind.ABILITY_STACK_TARGET, owner, source=source, limit=1))
     return state.advance()
 
 
@@ -323,13 +313,20 @@ def resolve(state: GameState, action: Action) -> GameState:
         return _proceed(st, substeps, pop_top=True, end_turn_player=actor)
 
     if k == StepKind.ABILITY_MAY:
-        if action.kind == ActionKind.DECLARE_ABILITY:
-            if cards.card_ability(step.source) in _GUESS_ABILITIES:
-                # Make the guess first (it becomes public), THEN offer the King's-Hand window.
-                return state.advance(PendingStep(StepKind.ABILITY_GUESS, actor, source=step.source))
+        if action.kind == ActionKind.DECLINE_ABILITY:
+            return state.advance()
+        if action.kind == ActionKind.DECLARE_ABILITY:   # Sentry/Princess: window on the bare declaration
             return state.advance(PendingStep(StepKind.REACTION_KINGSHAND, 1 - actor,
                                              source=step.source, against=step.source))
-        return state.advance()  # declined the ability
+        # Flattened abilities declare their PARAMETER here; open the King's-Hand window carrying it.
+        if action.kind == ActionKind.GUESS_CARD:        # Inquisitor -- window only if the guess lands
+            return _resolve_guess(state, step, action)
+        if action.kind == ActionKind.CHOOSE_NUMBER:     # Mystic
+            return state.advance(PendingStep(StepKind.REACTION_KINGSHAND, 1 - actor,
+                                             source=step.source, against=step.source, number=action.number))
+        if action.kind == ActionKind.CHOOSE_STACK_TARGET:  # Fool
+            return state.advance(PendingStep(StepKind.REACTION_KINGSHAND, 1 - actor,
+                                             source=step.source, against=step.source, picked=action.target))
 
     if k == StepKind.REACTION_KINGSHAND:
         if action.kind == ActionKind.REVEAL_KINGSHAND:
@@ -340,9 +337,21 @@ def resolve(state: GameState, action: Action) -> GameState:
                 discard=state.discard + (step.source, KINGSHAND_ID),
                 hands=_set_index(state.hands, reactor, _without(state.hands[reactor], KINGSHAND_ID)),
             )
-        # Declined: apply the effect. A guess ability carries its (public) guess on the step.
+        # Declined: apply the declared ability. Guesses carry their name; the flattened Mystic/Fool carry
+        # their parameter (number / stack index); Sentry/Princess fall through to their own sub-decisions.
         if step.guess is not None:
             return _after_guess_kingshand_declined(state, step)
+        ability = cards.card_ability(step.source)
+        if ability == Ability.MYSTIC:
+            st = _disgrace_card(state, step.source)
+            return st.advance(muted_values=st.muted_values | {step.number})
+        if ability == Ability.FOOL:
+            owner = 1 - step.actor
+            grabbed = state.stack[step.picked].card
+            return state.advance(
+                stack=_without_index(state.stack, step.picked),
+                hands=_set_index(state.hands, owner, _add_to_hand(state.hands[owner], grabbed)),
+            )
         return _begin_resolution(state, step.source, owner=1 - step.actor)
 
     if k == StepKind.ABILITY_GUESS:

@@ -183,7 +183,7 @@ def test_fool_takeback_is_known_and_feeds_determinize():
     # Opponent (seat 1) plays a Fool over a disgraced lead and takes the live Warlord back to hand.
     st = mainstate(hand0=(cid("Queen"),), hand1=(cid("Fool"),),
                    stack=(sc("Warlord"), sc("Elder", disgraced=True)), to_play=1)
-    st = run(st, _play(cid("Fool")), DECLARE, DECLINE_REACTION, _target(0))
+    st = run(st, _play(cid("Fool")), _target(0), DECLINE_REACTION)   # take-card is the declaration
     assert cid("Warlord") in st.hands[1] and "Warlord" in st.hand_has[0]
     assert _opp_always_has(st.information_set(0), "Warlord")
 

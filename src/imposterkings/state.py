@@ -54,6 +54,7 @@ class PendingStep:
     limit: int = 0
     guess: Optional[str] = None
     against: Optional[int] = None
+    number: Optional[int] = None      # a declared Mystic mute value, carried onto its King's-Hand step
 
 
 class GameState:

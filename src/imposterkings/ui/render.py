@@ -74,6 +74,13 @@ DECISION_LABELS = {
     StepKind.REACTION_ASSASSIN: "Assassin?", StepKind.REACTION_KH_VS_ASSASSIN: "King's Hand vs Assassin?",
 }
 
+# The flattened abilities declare their parameter at ABILITY_MAY, so give them a clearer header.
+_ABILITY_MAY_LABEL = {
+    cards.Ability.MYSTIC: "Mystic: pick a value (or decline)",
+    cards.Ability.INQUISITOR: "Interrogate: name a card (or decline)",
+    cards.Ability.FOOL: "Fool: take a stack card (or decline)",
+}
+
 
 def _text(surf, font, s, pos, color=INK):
     surf.blit(font.render(s, True, color), pos)
@@ -327,6 +334,8 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     # ACTIONS
     kind = view.pending[-1].kind if view.pending else None
     decision = DECISION_LABELS.get(kind, "GAME OVER") if kind is not None else "GAME OVER"
+    if kind == StepKind.ABILITY_MAY and view.pending[-1].source is not None:
+        decision = _ABILITY_MAY_LABEL.get(cards.card_ability(view.pending[-1].source), decision)
     _text(surface, med, decision, (px, 14))
     if status:
         _text(surface, small, status, (px, 42), GOLD)

@@ -62,7 +62,19 @@ def legal_moves(state: GameState) -> List[Action]:
         return [Action(ActionKind.PLAY_CARD, card=c) for c in _dedupe_by_name(state.hands[actor])]
 
     if k == StepKind.ABILITY_MAY:
-        return [DECLARE, DECLINE]
+        ability = cards.card_ability(step.source)
+        # Flattened abilities declare their PARAMETER here (King's Hand then reacts to it): one decision
+        # instead of declare -> window -> parameter. Decline is always available.
+        if ability == Ability.MYSTIC:
+            from . import rules
+            return [DECLINE] + [Action(ActionKind.CHOOSE_NUMBER, number=n)
+                                for n in range(rules.MYSTIC_MIN, rules.MYSTIC_MAX + 1)]
+        if ability == Ability.INQUISITOR:
+            return [DECLINE] + [Action(ActionKind.GUESS_CARD, name=n) for n in cards.CARD_NAMES]
+        if ability == Ability.FOOL:
+            return [DECLINE] + [Action(ActionKind.CHOOSE_STACK_TARGET, target=i)
+                                for i in abilities._fool_targets(state, step.source)]
+        return [DECLARE, DECLINE]   # Sentry / Princess: King's Hand blocks the bare declaration
 
     if k == StepKind.ABILITY_GUESS:
         # NOTE: all names are offered on purpose. Naming a card the opponent cannot hold is a legitimate

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from imposterkings import cards
 from imposterkings.actions import (
-    Action, ActionKind, DECLARE, DECLINE_REACTION, STOP, StepKind,
+    Action, ActionKind, DECLARE, DECLINE_REACTION, REVEAL_KINGSHAND, STOP, StepKind,
 )
 from imposterkings.state import StackCard
 
@@ -34,15 +34,27 @@ def _num(n):
     return Action(ActionKind.CHOOSE_NUMBER, number=n)
 
 
+def test_flattened_kingshand_reacts_after_the_declared_parameter():
+    # Mystic: declaring "mute 7" goes straight to the King's-Hand window (no separate ABILITY_NUMBER step),
+    # and revealing King's Hand there discards the Mystic and cancels the mute.
+    st = mainstate(hand0=(cid("Mystic"),), hand1=(cid("KingsHand"),), stack=(sc("Warlord"),))
+    st = run(st, _play(cid("Mystic")), _num(7))
+    assert st.phase == StepKind.REACTION_KINGSHAND        # window is AFTER the number
+    st = run(st, REVEAL_KINGSHAND)
+    assert all(cards.card_name(s.card) != "Mystic" for s in st.stack)  # countered off the throne
+    assert 7 not in st.muted_values                       # mute never applied
+
+
 def test_mystic_mutes_retroactively_and_only_offers_1_to_8():
     # Warlord sits beneath; muting 7 should retroactively drop it to value 3.
     st = mainstate(hand0=(cid("Mystic"),), hand1=(cid("Queen"),),
                    stack=(sc("Warlord"), sc("Fool")))
-    st = run(st, _play(cid("Mystic")), DECLARE, DECLINE_REACTION)
-    assert st.phase == StepKind.ABILITY_NUMBER
-    numbers = sorted(m.number for m in st.legal_moves())
+    st = run(st, _play(cid("Mystic")))
+    assert st.phase == StepKind.ABILITY_MAY               # declare+number are one decision now
+    numbers = sorted(m.number for m in st.legal_moves() if m.kind == ActionKind.CHOOSE_NUMBER)
     assert numbers == list(range(1, 9))  # 9 (Queen/Princess) can never be targeted
-    st = run(st, _num(7))
+    # declaring the mute value opens the King's-Hand window (which sees the number); opponent declines
+    st = run(st, _num(7), DECLINE_REACTION)
     warlord_sc = next(s for s in st.stack if cards.card_name(s.card) == "Warlord")
     assert st.effective_stack_value(warlord_sc) == 3
     assert 7 in st.muted_values
@@ -127,7 +139,7 @@ def test_inquisitor_forces_opponent_card_into_opponent_antechamber():
     # player1's antechamber, where it ascends on player1's turn, passing control back to player0.
     st = mainstate(hand0=(cid("Inquisitor"),), hand1=(cid("Warlord"), cid("Fool")),
                    stack=(sc("Zealot"),))
-    st = run(st, _play(cid("Inquisitor")), DECLARE, _guess("Warlord"), DECLINE_REACTION)
+    st = run(st, _play(cid("Inquisitor")), _guess("Warlord"), DECLINE_REACTION)  # guess is the declaration
     assert cid("Warlord") not in st.hands[1]
     assert cards.card_name(st.stack[-1].card) == "Warlord"  # ascended to lead
     assert st.antechambers[1] == ()
@@ -138,15 +150,15 @@ def test_fool_takes_a_non_disgraced_card_and_cannot_take_disgraced_or_itself():
     # Leading card is a disgraced Soldier (value 0) so Fool is playable; a live Warlord sits beneath.
     st = mainstate(hand0=(cid("Fool"),), hand1=(cid("Queen"),),
                    stack=(sc("Warlord"), sc("Soldier", disgraced=True)))
-    st = run(st, _play(cid("Fool")), DECLARE, DECLINE_REACTION)
-    assert st.phase == StepKind.ABILITY_STACK_TARGET
-    targets = {m.target for m in st.legal_moves()}
+    st = run(st, _play(cid("Fool")))
+    assert st.phase == StepKind.ABILITY_MAY    # declare+which-card are one decision now
+    targets = {m.target for m in st.legal_moves() if m.kind == ActionKind.CHOOSE_STACK_TARGET}
     warlord_pos = next(i for i, s in enumerate(st.stack) if cards.card_name(s.card) == "Warlord")
     soldier_pos = next(i for i, s in enumerate(st.stack) if cards.card_name(s.card) == "Soldier")
     fool_pos = next(i for i, s in enumerate(st.stack) if cards.card_name(s.card) == "Fool")
     assert targets == {warlord_pos}            # only the live Warlord; not the disgraced Soldier or itself
     assert soldier_pos not in targets and fool_pos not in targets
-    st = run(st, _target(warlord_pos))
+    st = run(st, _target(warlord_pos), DECLINE_REACTION)   # choosing the card opens the window
     assert cid("Warlord") in st.hands[0]
     assert all(cards.card_name(s.card) != "Warlord" for s in st.stack)
 
