@@ -71,6 +71,8 @@ def test_oathbound_from_antechamber_does_not_trigger_override():
     st = mainstate(hand0=(cid("Fool"),), hand1=(cid("Queen"),), stack=(sc("KingsHand"),),
                    antechambers=((cid("Oathbound"),), ()))  # leading value 8 > 6
     st = st._begin_turn(0)
+    assert st.phase == StepKind.ASCEND       # ascension is now a forced, recorded turn
+    st = st.apply(st.legal_moves()[0])
     top = st.stack[-1]
     assert cards.card_name(top.card) == "Oathbound" and not top.disgraced
     assert st.effective_stack_value(top) == 6

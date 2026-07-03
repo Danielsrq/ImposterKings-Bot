@@ -158,13 +158,15 @@ def _proceed(state: GameState, substeps: tuple, *, pop_top: bool, end_turn_playe
     return state.with_(pending=tuple(reversed(substeps)))
 
 
-def ascend(state: GameState, player: int) -> GameState:
-    """Forced antechamber ascension: dequeue the front card, land it, trigger its ability."""
-    ante = state.antechambers[player]
+def _resolve_ascend(state: GameState, actor: int) -> GameState:
+    """Answer a StepKind.ASCEND (forced): dequeue the front card, land it, trigger its ability. Pops the
+    ASCEND step (``pop_top=True``) just like MAIN+PLAY_CARD, so with no substeps the opponent's turn
+    begins and with substeps the ascended card's ability sub-decisions surface next."""
+    ante = state.antechambers[actor]
     card = ante[0]
-    st = state.with_(antechambers=_set_index(state.antechambers, player, ante[1:]))
-    st, substeps = _land(st, card, player, ascended=True, v_top=None)
-    return _proceed(st, substeps, pop_top=False, end_turn_player=player)
+    st = state.with_(antechambers=_set_index(state.antechambers, actor, ante[1:]))
+    st, substeps = _land(st, card, actor, ascended=True, v_top=None)
+    return _proceed(st, substeps, pop_top=True, end_turn_player=actor)
 
 
 # --- stack mutation helpers ------------------------------------------------------------
@@ -301,6 +303,9 @@ def resolve(state: GameState, action: Action) -> GameState:
             hands=_set_index(state.hands, actor, _without(state.hands[actor], action.card)),
             setup_discard=_set_index(state.setup_discard, actor, action.card),
         )
+
+    if k == StepKind.ASCEND:
+        return _resolve_ascend(state, actor)
 
     if k == StepKind.MAIN:
         if action.kind == ActionKind.FLIP_KING:

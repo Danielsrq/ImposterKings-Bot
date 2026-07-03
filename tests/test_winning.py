@@ -29,6 +29,9 @@ def test_antechamber_ascension_prevents_loss_and_is_the_turn():
                    kings=(True, False), antechambers=((cid("Elder"),), ()))
     st = st._begin_turn(0)
     assert not st.is_terminal()
+    # Ascension is surfaced as player 0's own forced turn (single legal move) before it resolves.
+    assert st.phase == StepKind.ASCEND and st.to_play == 0 and len(st.legal_moves()) == 1
+    st = st.apply(st.legal_moves()[0])
     assert cards.card_name(st.stack[-1].card) == "Elder"  # ascended to lead
     assert st.antechambers[0] == ()
     assert st.to_play == 1  # ascension consumed the whole turn

@@ -218,7 +218,11 @@ class GameState:
         """Start ``player``'s turn: forced antechamber ascension, else the win check + MAIN."""
         from . import abilities
         if self.antechambers[player]:
-            return abilities.ascend(self.with_(turn_player=player), player)
+            # Ascension IS this turn's play, but surface it as a real (forced, single-move) decision so
+            # it is recorded as its own turn/ply -- resolve() runs the actual ascend when it's answered.
+            return self.with_(turn_player=player,
+                              pending=(PendingStep(StepKind.ASCEND, player,
+                                                   source=self.antechambers[player][0]),))
 
         st = self.with_(turn_player=player,
                         pending=(PendingStep(StepKind.MAIN, player),))

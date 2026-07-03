@@ -67,13 +67,29 @@ class Block:
     label: str
     persp_eval: float
     color: RGB
-    is_played: bool
+    on_path: bool          # lies on the actually-played line through this turn
     move: Action
+    node: object           # the MCTS Node (for click-to-zoom)
+    visits: int
+    visit_pct: float       # node.n / (layout root).n * 100
+
+
+def path_node_ids(root, played_path) -> Set[int]:
+    """Ids of the nodes on the actually-played line: walk ``root`` following ``played_path`` moves."""
+    ids: Set[int] = set()
+    cur = root
+    for m in (played_path or []):
+        nxt = next((c for c in cur.children.values() if c.incoming_move == m), None)
+        if nxt is None:
+            break
+        ids.add(id(nxt))
+        cur = nxt
+    return ids
 
 
 def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, *,
                   top_k: int = 6, max_turns: int = 6,
-                  played_move: Optional[Action] = None) -> List[Block]:
+                  on_path_ids: Set[int] = frozenset()) -> List[Block]:
     """Ply-banded icicle layout for ``root``'s subtree within ``rect`` = (x, y, w, h).
 
     x: recursive visit partition (child width = parent width * child.n / parent.n, top-``top_k`` kids).
@@ -81,13 +97,12 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
     deepest micro-turn within it, so shorter branches pad blank until the next player's band.
     """
     x0, y0, W, H = rect
-    raw: List[list] = []                  # [node, x, w, turn_index, local_depth, is_played]
+    raw: List[list] = []                  # [node, x, w, turn_index, local_depth]
     band_maxlocal: Dict[int, int] = {}
 
-    def walk(node, x, w, turn_index, local_depth, is_root_child):
+    def walk(node, x, w, turn_index, local_depth):
         band_maxlocal[turn_index] = max(band_maxlocal.get(turn_index, 0), local_depth)
-        played = bool(is_root_child and played_move is not None and node.incoming_move == played_move)
-        raw.append([node, x, w, turn_index, local_depth, played])
+        raw.append([node, x, w, turn_index, local_depth])
         total = node.n
         if not total:
             return
@@ -99,14 +114,14 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
             else:
                 ct, cl = turn_index + 1, 0
             if ct < max_turns:
-                walk(c, cx, cw, ct, cl, False)
+                walk(c, cx, cw, ct, cl)
             cx += cw
 
-    total = root.n or 1
+    root_n = root.n or 1
     cx = x0
     for c in sorted(root.children.values(), key=lambda c: c.n, reverse=True)[:top_k]:
-        walk(c, cx, W * (c.n / total), 0, 0, True)
-        cx += W * (c.n / total)
+        walk(c, cx, W * (c.n / root_n), 0, 0)
+        cx += W * (c.n / root_n)
 
     band_top: Dict[int, int] = {}
     acc = 0
@@ -118,12 +133,13 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
     row_h = H / max(1, acc)
 
     blocks: List[Block] = []
-    for node, x, w, ti, ld, played in raw:
+    for node, x, w, ti, ld in raw:
         y = y0 + (band_top[ti] + ld) * row_h
         mq = node.w / node.n if node.n else 0.0
         persp = mq if node.player_just_moved == observer else -mq
         blocks.append(Block(x, y, w, row_h, _compact_action(node.incoming_move), persp,
-                            move_color(node.incoming_move), played, node.incoming_move))
+                            move_color(node.incoming_move), id(node) in on_path_ids,
+                            node.incoming_move, node, node.n, 100.0 * node.n / root_n))
     return blocks
 
 
@@ -131,24 +147,68 @@ _MIN_LABEL_W = 30
 
 
 def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
-                played_move: Optional[Action] = None, top_k: int = 6, max_turns: int = 6) -> List[Block]:
-    """Draw the ply-banded icicle for a SearchResult into ``rect``; returns the laid-out blocks."""
+                played_path=None, zoom_root=None, dim: bool = False,
+                top_k: int = 6, max_turns: int = 6) -> List[Block]:
+    """Draw the ply-banded icicle for a SearchResult into ``rect``; returns the laid-out blocks.
+
+    ``played_path`` (moves) highlights the played line (trail + the current, deepest box). ``zoom_root``
+    lays out that node's subtree full-panel instead of the whole tree. ``dim`` fades a persisted/stale
+    tree (a forced move that had no search)."""
     x0, y0, W, H = rect
     small = fonts["small"]
     if result is None or getattr(result, "root", None) is None or not result.root.children:
         _text(surface, small, "(no search tree)", (x0 + 6, y0 + 6), MUTE)
         return []
-    blocks = layout_icicle(result.root, rect, result.info.observer,
-                           top_k=top_k, max_turns=max_turns, played_move=played_move)
+    on_ids = path_node_ids(result.root, played_path)
+    layout_root = zoom_root if (zoom_root is not None and zoom_root.children) else result.root
+    blocks = layout_icicle(layout_root, rect, result.info.observer,
+                           top_k=top_k, max_turns=max_turns, on_path_ids=on_ids)
+    line_h = small.get_linesize()
     for b in blocks:
         r = pygame.Rect(int(b.x), int(b.y), max(1, int(b.w) - 1), max(1, int(b.h) - 1))
         pygame.draw.rect(surface, b.color, r)
         if b.w > _MIN_LABEL_W and b.h >= 11:
-            txt = _truncate(small, f"{b.label} {b.persp_eval:+.2f}", int(b.w) - 6)
-            surface.blit(small.render(txt, True, _ink_for(b.color)), (int(b.x) + 3, int(b.y) + 1))
-        if b.is_played:
+            ink = _ink_for(b.color)
+            surface.blit(small.render(_truncate(small, b.label, int(b.w) - 6), True, ink),
+                         (int(b.x) + 3, int(b.y) + 1))
+            if b.h >= 2 * line_h:                      # room for a second line -> eval below the action
+                surface.blit(small.render(f"{b.persp_eval:+.2f}", True, ink),
+                             (int(b.x) + 3, int(b.y) + 1 + line_h))
+        if b.on_path:
             pygame.draw.rect(surface, GOLD, r, 2)
+    current = max((b for b in blocks if b.on_path), key=lambda b: b.y, default=None)
+    if current is not None:                            # emphasize the box just stepped to
+        pygame.draw.rect(surface, INK, pygame.Rect(int(current.x), int(current.y),
+                         max(1, int(current.w) - 1), max(1, int(current.h) - 1)), 3)
+    if dim:
+        fade = pygame.Surface((int(W), int(H)), pygame.SRCALPHA)
+        fade.fill((18, 20, 26, 150))
+        surface.blit(fade, (int(x0), int(y0)))
     return blocks
+
+
+def block_at(blocks: List[Block], pos) -> Optional[Block]:
+    """The block under ``pos`` (icicle blocks don't overlap, so the first containing rect wins)."""
+    x, y = pos
+    for b in blocks:
+        if b.x <= x < b.x + b.w and b.y <= y < b.y + b.h:
+            return b
+    return None
+
+
+def draw_tooltip(surface, fonts, block: Block, pos) -> None:
+    """A floating box near ``pos`` showing a hovered block's action, eval, and visit share."""
+    small = fonts["small"]
+    lines = [block.label, f"eval {block.persp_eval:+.2f}", f"visits {block.visits} ({block.visit_pct:.0f}%)"]
+    lh = small.get_linesize()
+    w = max(small.size(s)[0] for s in lines) + 12
+    h = len(lines) * lh + 8
+    tx = min(pos[0] + 14, surface.get_width() - w - 4)
+    ty = min(pos[1] + 14, surface.get_height() - h - 4)
+    pygame.draw.rect(surface, (16, 18, 24), (tx, ty, w, h))
+    pygame.draw.rect(surface, MUTE, (tx, ty, w, h), 1)
+    for i, s in enumerate(lines):
+        surface.blit(small.render(s, True, INK), (tx + 6, ty + 4 + i * lh))
 
 
 _ROW_H = 20

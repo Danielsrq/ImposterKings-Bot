@@ -30,6 +30,11 @@ def card_surface(card: int, size: Tuple[int, int], alt: bool = False) -> "pygame
     return _load_scaled(cards.asset_path(card, alt=alt), size)
 
 
+def image(filename: str, size: Tuple[int, int]) -> "pygame.Surface":
+    """Load and cache a non-deck image from ``assets/`` (e.g. ``Crown.jpg``) scaled to ``size``."""
+    return _load_scaled(filename, size)
+
+
 def back_surface(size: Tuple[int, int]) -> "pygame.Surface":
     return _load_scaled(cards.CARD_BACK_ASSET, size)
 

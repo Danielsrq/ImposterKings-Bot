@@ -58,6 +58,11 @@ def legal_moves(state: GameState) -> List[Action]:
             moves.append(FLIP_KING)
         return moves
 
+    if k == StepKind.ASCEND:
+        # Forced: the front antechamber card is this turn's only play (reuse PLAY_CARD so downstream
+        # consumers -- MCTS keys, the review strip -- treat it as the card that was played).
+        return [Action(ActionKind.PLAY_CARD, card=step.source)]
+
     if k == StepKind.OATHBOUND_SECOND:
         return [Action(ActionKind.PLAY_CARD, card=c) for c in _dedupe_by_name(state.hands[actor])]
 

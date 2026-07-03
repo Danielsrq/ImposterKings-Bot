@@ -96,8 +96,8 @@ def _row_x(x0: int, count: int, gap: int, card_w: int, x_max: int = ROW_MAX_X) -
     return [int(x0 + i * g) for i in range(count)]
 
 
-def _draw_card(surf, image, pos, *, highlight=False, dim=False):
-    rect = pygame.Rect(pos, CARD)
+def _draw_card(surf, image, pos, *, highlight=False, dim=False, size=CARD):
+    rect = pygame.Rect(pos, size)                      # border matches the image size (pass SMALL for minis)
     if dim:
         image = image.copy()
         image.fill((90, 90, 90), special_flags=pygame.BLEND_RGB_MULT)
@@ -295,10 +295,12 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
             y += 84
 
     # --- face-up leftover (known to both from the start; info only, NOT the leading card) -----
+    # Sits in the free band above the stack (which fills top-y 466 rightward on a dense stack) and left
+    # of the knowledge column; its border is SMALL-sized so it no longer overhangs past KNOW_X.
     if view.leftover_faceup is not None and 0 <= view.leftover_faceup < cards.DECK_SIZE:
-        lx = ROW_MAX_X - SMALL[0] - 10
-        _text(surface, small, "leftover (face-up, info):", (lx - 130, 448), MUTE)
-        _draw_card(surface, assets.card_surface(view.leftover_faceup, SMALL), (lx, 466))
+        lx = ROW_MAX_X - SMALL[0] - 16
+        _text(surface, small, "leftover (face-up, info):", (lx - 130, 342), MUTE)
+        _draw_card(surface, assets.card_surface(view.leftover_faceup, SMALL), (lx, 360), size=SMALL)
 
     # --- stack (center) -----------------------------------------------------------------
     _text(surface, med, "Throne / stack:", (24, 430))

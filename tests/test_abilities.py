@@ -141,9 +141,24 @@ def test_inquisitor_forces_opponent_card_into_opponent_antechamber():
                    stack=(sc("Zealot"),))
     st = run(st, _play(cid("Inquisitor")), _guess("Warlord"), DECLINE_REACTION)  # guess is the declaration
     assert cid("Warlord") not in st.hands[1]
+    # Warlord is queued into P1's antechamber; its ascension is now P1's own forced turn.
+    assert st.phase == StepKind.ASCEND and st.to_play == 1
+    st = st.apply(st.legal_moves()[0])
     assert cards.card_name(st.stack[-1].card) == "Warlord"  # ascended to lead
     assert st.antechambers[1] == ()
     assert st.to_play == 0  # ascension consumed player1's whole turn
+
+
+def test_ascension_surfaces_as_its_own_forced_decision():
+    # Regression: a queued card's ascension must be a REAL decision (StepKind.ASCEND, single forced
+    # PLAY_CARD) so the driver loop records it as its own turn -- not silently auto-resolved in apply().
+    st = mainstate(hand0=(cid("Queen"),), hand1=(cid("Fool"),), stack=(sc("Soldier"),),
+                   antechambers=((cid("Elder"),), ()))
+    st = st._begin_turn(0)
+    assert st.to_play == 0 and st.phase == StepKind.ASCEND
+    assert st.legal_moves() == [Action(ActionKind.PLAY_CARD, card=cid("Elder"))]
+    st = st.apply(st.legal_moves()[0])
+    assert cards.card_name(st.stack[-1].card) == "Elder" and st.to_play == 1
 
 
 def test_fool_takes_a_non_disgraced_card_and_cannot_take_disgraced_or_itself():

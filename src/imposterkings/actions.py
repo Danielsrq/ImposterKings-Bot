@@ -32,6 +32,7 @@ class StepKind(IntEnum):
     REACTION_ASSASSIN = 12    # opponent may reveal Assassin in response to a king-flip
     REACTION_KH_VS_ASSASSIN = 13  # flipper may reveal King's Hand to counter the Assassin (nested)
     ABILITY_CHOICE = 14       # an inner accept/decline with NO reaction window (Soldier's package)
+    ASCEND = 15               # forced antechamber ascension: the queued card is this turn's (only) play
 
 
 class ActionKind(IntEnum):
