@@ -35,22 +35,29 @@ class RandomAgent:
 class MCTSAgent:
     """SO-ISMCTS bot. After each move ``last_result`` holds the search stats for explainability.
 
-    A single legal action is returned without searching (common at forced reaction windows)."""
+    A single legal action is normally returned without searching (common at forced reaction windows),
+    since there is no decision to make. With ``evaluate_forced`` the agent searches even then -- the
+    move is still forced, but the search yields a real value estimate of the position (a position's
+    eval is well-defined even when the policy is degenerate). Used for post-game review so forced turns
+    (ascensions, sole reactions) still carry an eval; left off in live play to avoid needless latency."""
 
     name = "mcts"
 
-    def __init__(self, iterations: int = 1000, c: float = DEFAULT_C, use_knowledge: bool = True) -> None:
+    def __init__(self, iterations: int = 1000, c: float = DEFAULT_C, use_knowledge: bool = True,
+                 evaluate_forced: bool = False) -> None:
         self.iterations = iterations
         self.c = c
         self.use_knowledge = use_knowledge     # False = ignore guess-leaked facts (A/B benchmarking)
+        self.evaluate_forced = evaluate_forced
         self.last_result: Optional[SearchResult] = None
 
     def select_move(self, view: InformationSet, rng: np.random.Generator) -> Action:
         moves = view.legal_moves()
-        if len(moves) == 1:
+        if len(moves) == 1 and not self.evaluate_forced:
             self.last_result = None
             return moves[0]
         config = SearchConfig(rng=rng, iterations=self.iterations, c=self.c,
                               use_knowledge=self.use_knowledge)
         self.last_result = search(view, config)
-        return self.last_result.best_move
+        # The move is still forced when there is only one; return it explicitly (best_move agrees).
+        return moves[0] if len(moves) == 1 else self.last_result.best_move

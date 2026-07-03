@@ -11,6 +11,8 @@ from imposterkings.mcts import SearchConfig, SearchResult, search
 from imposterkings.record import play_and_record
 from imposterkings.state import GameState
 
+from .helpers import mainstate, cid, sc
+
 
 def _dealt_to_main(seed: int) -> GameState:
     rng = np.random.default_rng(seed)
@@ -47,6 +49,25 @@ def test_principal_variations():
     # a result with no retained tree yields no lines (and doesn't error)
     empty = SearchResult(info=view, best_move=result.best_move, stats=[], iterations=0, elapsed=0.0)
     assert empty.principal_variations() == []
+
+
+def test_mcts_evaluates_forced_turns_only_when_asked():
+    # A forced turn: antechamber ascension has exactly one legal move. By default the agent skips search
+    # (no decision to make); evaluate_forced still returns the forced move but computes a position eval.
+    st = mainstate(hand0=(cid("Queen"),), hand1=(cid("Fool"),), stack=(sc("Soldier"),),
+                   antechambers=((cid("Elder"),), ()))._begin_turn(0)
+    view = st.information_set(0)
+    forced = view.legal_moves()
+    assert len(forced) == 1
+
+    plain = MCTSAgent(iterations=30)
+    assert plain.select_move(view, np.random.default_rng(0)) == forced[0]
+    assert plain.last_result is None                        # default: no eval on a forced turn
+
+    evaluated = MCTSAgent(iterations=30, evaluate_forced=True)
+    assert evaluated.select_move(view, np.random.default_rng(0)) == forced[0]  # still the forced move
+    assert evaluated.last_result is not None               # ...but now it carries a real eval
+    assert len(evaluated.last_result.stats) == 1 and -1.0 <= evaluated.last_result.root_value() <= 1.0
 
 
 def test_play_and_record_backfills_reward():

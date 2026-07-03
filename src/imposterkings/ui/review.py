@@ -59,8 +59,11 @@ def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = Non
         traj.append(PlyRecord(seat, move, view, getattr(agent, "last_result", None), state))
 
     rng = np.random.default_rng(seed)
-    play_game([MCTSAgent(iterations=iters), MCTSAgent(iterations=iters)], rng,
-              on_decision=collect, starting_player=start)
+    # evaluate_forced: search even on forced turns (ascensions, sole reactions) so every turn -- not just
+    # ones with a real choice -- carries an eval. A position's value is well-defined even when forced.
+    agents = [MCTSAgent(iterations=iters, evaluate_forced=True),
+              MCTSAgent(iterations=iters, evaluate_forced=True)]
+    play_game(agents, rng, on_decision=collect, starting_player=start)
     return traj
 
 
@@ -214,7 +217,7 @@ def _draw_panel(surface, fonts, traj, seat, tb, cursor, tree_rect, mode, ost, zo
     rec0 = traj[start]
     path = played_path(traj, start, min(cursor, end))
     tag = "  ◄ active" if active == seat else ""
-    if rec0.result is None:                                   # forced move -> persist previous, dimmed
+    if rec0.result is None:                                   # no search at all -> persist previous, dimmed
         _text(surface, med, f"P{seat} — forced move: {_compact_action(traj[min(cursor, end)].move)}{tag}",
               (tx + 4, ty - 24), MUTE)
         prev = last_tree[seat]
@@ -225,7 +228,10 @@ def _draw_panel(surface, fonts, traj, seat, tb, cursor, tree_rect, mode, ost, zo
         return []
     last_tree[seat] = (rec0.result, path)
     zoom_note = "  [zoomed — Backspace out]" if zoom_stack else ""
-    _text(surface, med, f"P{seat} — {_compact_action(rec0.move)}{zoom_note}{tag}", (tx + 4, ty - 24), P_COLORS[seat])
+    # A single root action means the turn was forced; the search still yields a real position eval.
+    forced_note = f"  · forced (eval {rec0.result.root_value():+.2f})" if len(rec0.result.stats) == 1 else ""
+    _text(surface, med, f"P{seat} — {_compact_action(rec0.move)}{forced_note}{zoom_note}{tag}",
+          (tx + 4, ty - 24), P_COLORS[seat])
     if mode == "icicle":
         return draw_icicle(surface, fonts, rec0.result, tree_rect, played_path=path,
                            zoom_root=(zoom_stack[-1] if zoom_stack else None))
