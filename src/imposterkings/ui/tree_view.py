@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import pygame
 
 from ..actions import Action, ActionKind
-from ..cards import card_name
+from ..cards import CARD_DEFS, card_name
 from .render import CARD_COLORS, DIVIDER, GOLD, INK, MUTE, NEUTRAL, _compact_action, _text
 
 RGB = Tuple[int, int, int]
@@ -22,11 +22,23 @@ RGB = Tuple[int, int, int]
 _CARD_KINDS = {ActionKind.PLAY_CARD, ActionKind.HIDE_CARD,
                ActionKind.DISCARD_CARD, ActionKind.CHOOSE_HAND_CARD}
 
+# A representative card color per value (for Mystic's "mute N" -- a value maps to 1-2 cards; pick one).
+_VALUE_COLOR = {}
+for _d in CARD_DEFS:
+    _VALUE_COLOR.setdefault(_d.value, CARD_COLORS.get(_d.name, NEUTRAL))
+
 
 def move_color(move: Optional[Action]) -> RGB:
-    """Card color for a card move; a neutral grey for abilities/selections/reactions."""
-    if move is not None and move.kind in _CARD_KINDS and move.card is not None:
+    """Color a move by the card it concerns: the played/hidden/given card, the GUESSED card's color,
+    or (for a Mystic mute) a representative card of that value. Neutral grey for abilities/reactions."""
+    if move is None:
+        return NEUTRAL
+    if move.kind in _CARD_KINDS and move.card is not None:
         return CARD_COLORS.get(card_name(move.card), NEUTRAL)
+    if move.kind == ActionKind.GUESS_CARD and move.name:
+        return CARD_COLORS.get(move.name, NEUTRAL)
+    if move.kind == ActionKind.CHOOSE_NUMBER and move.number is not None:
+        return _VALUE_COLOR.get(move.number, NEUTRAL)
     return NEUTRAL
 
 

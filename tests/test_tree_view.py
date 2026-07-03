@@ -30,9 +30,13 @@ def _searched():
     return search(view, SearchConfig(rng=np.random.default_rng(0), iterations=300))
 
 
-def test_move_color_card_vs_noncard():
+def test_move_color_card_guess_and_number():
     assert move_color(Action(ActionKind.PLAY_CARD, card=0)) == CARD_COLORS[card_name(0)]
     assert move_color(Action(ActionKind.DECLARE_ABILITY)) == NEUTRAL
+    # a guess is colored by the guessed card; a Mystic mute by a card of that value
+    assert move_color(Action(ActionKind.GUESS_CARD, name="Queen")) == CARD_COLORS["Queen"]
+    assert move_color(Action(ActionKind.CHOOSE_NUMBER, number=7)) in (CARD_COLORS["Warlord"],
+                                                                      CARD_COLORS["Mystic"])
 
 
 def test_layout_icicle_partition_and_bands():

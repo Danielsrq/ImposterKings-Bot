@@ -39,8 +39,8 @@ CARD_COLORS = {
 }
 NEUTRAL = (80, 84, 94)      # non-card items (abilities, unknowns)
 
-PANEL_X = 1390              # side panel starts here
-KNOW_X = 1150               # hand-knowledge column occupies [KNOW_X, PANEL_X]
+PANEL_X = 1290              # side panel starts here (wider panel -> less PV wrapping in reasoning/hint)
+KNOW_X = 1050               # hand-knowledge column occupies [KNOW_X, PANEL_X] (~240 wide)
 PANEL_W = WINDOW[0] - PANEL_X - 12
 ROW_MAX_X = KNOW_X - 12     # right edge of the play area (before the knowledge column)
 DIVIDER = (60, 62, 70)
@@ -50,9 +50,9 @@ BTN_TOP = 88        # y of the first action button (kept in sync with app's hove
 BTN_H = 28
 ACT_BOTTOM = 490    # action buttons capped above this -> fits all 14 guess names (88 + 14*28 = 480)
 LOG_TOP = 505       # "Log" section header
-LOG_LINES = 8       # recent log lines shown
-REASON_TOP = 705    # "Bot reasoning" section header (+ toggle)
-HINT_TOP = 855      # "Your hint" section header (+ toggle)
+LOG_LINES = 7       # recent log lines shown
+REASON_TOP = 690    # "Bot reasoning" section header (+ toggle)
+HINT_TOP = 875      # "Your hint" section header (+ toggle)
 
 
 class Frame(NamedTuple):
@@ -241,8 +241,9 @@ def _draw_knowledge(surface, fonts, view, knowledge):
     x0, max_x = KNOW_X + 10, PANEL_X - 10
     _text(surface, fonts["med"], "Hand knowledge", (x0, 12), INK)
     obs, opp = view.observer, 1 - view.observer
-    _draw_know_panel(surface, fonts, x0, 64, max_x, f"You (P{obs}) know — P{opp}'s hand", knowledge[obs])
-    _draw_know_panel(surface, fonts, x0, 804, max_x, f"P{opp} knows — your hand", knowledge[opp])
+    # Each knower's read sits on that player's side: opponent (P{opp}) at top, you (P{obs}) at bottom.
+    _draw_know_panel(surface, fonts, x0, 64, max_x, f"P{opp} knows — your hand", knowledge[opp])
+    _draw_know_panel(surface, fonts, x0, 804, max_x, f"You (P{obs}) know — P{opp}'s hand", knowledge[obs])
 
 
 def render_frame(surface, view, fonts, legal_moves: List[Action], *,
