@@ -136,6 +136,8 @@ def _select(node: Node, state, config: SearchConfig
     visited: List[Tuple[Node, frozenset]] = []
     while not state.is_terminal():
         legal = state.legal_moves()             # from the concrete world, never info.legal_moves()
+        if not legal:                           # non-terminal with no move: to_play loses -> score at leaf
+            break                               # (only reachable at a determinized root sampled by others)
         legal_set = frozenset(legal)
         untried = [m for m in legal if m not in node.children]
         if untried:
@@ -154,6 +156,8 @@ def _rollout(state, config: SearchConfig) -> List[float]:
     """Uniform-random playout to a terminal state; return the per-seat reward vector."""
     while not state.is_terminal():
         legal = state.legal_moves()
+        if not legal:                           # no legal move -> the player to move loses (game rule)
+            return state.with_(winner=1 - state.to_play).result(scaled=config.scaled)
         state = state.apply(legal[int(config.rng.integers(len(legal)))])
     return state.result(scaled=config.scaled)
 

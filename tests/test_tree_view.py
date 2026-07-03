@@ -129,3 +129,15 @@ def test_build_trajectory_small():
     assert traj and all(r.seat in (0, 1) for r in traj)
     assert any(r.result is not None and r.result.root is not None for r in traj)
     assert all(r.state is not None for r in traj)           # full state still captured (for later use)
+
+
+def test_build_trajectory_cross_evals_both_seats_every_turn():
+    traj = build_trajectory(iters=30, seed=0)
+    for s, e, owner in turns_of(traj):
+        rec = traj[s]
+        eb = rec.eval_by_seat                               # every turn start carries BOTH seats' reads
+        assert eb is not None and len(eb) == 2 and all(-1.0 <= v <= 1.0 for v in eb)
+        if rec.result is not None:                          # mover side reuses that seat's own search
+            assert abs(eb[rec.seat] - rec.result.root_value()) < 1e-9
+    plain = build_trajectory(iters=20, seed=0, cross_eval=False)
+    assert all(r.eval_by_seat is None for r in plain)       # opt-out leaves it unset

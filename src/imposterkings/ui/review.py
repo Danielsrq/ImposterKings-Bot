@@ -46,10 +46,25 @@ class PlyRecord:
     view: InformationSet
     result: object            # Optional[SearchResult] (with .root); None for a forced/no-search move
     state: object = None      # the full pre-move GameState (for the board view)
+    eval_by_seat: Optional[Tuple[float, float]] = None  # each seat's own-perspective eval at a turn start
 
 
-def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = None) -> List[PlyRecord]:
-    """Play one MCTS-vs-MCTS game and record (seat, move, pre-move view, SearchResult, state) per ply."""
+def _position_eval(state, observer: int, iters: int, rng) -> float:
+    """Seat ``observer``'s own-perspective eval of ``state`` (+1 = good for observer). Runs a search from
+    the observer's information set; ``root_value()`` is always the *mover's* perspective, so it is negated
+    when the observer is not the one to move (the game is zero-sum at the leaves)."""
+    from ..mcts import SearchConfig, search
+    rv = search(state.information_set(observer), SearchConfig(rng=rng, iterations=iters)).root_value()
+    return rv if state.to_play == observer else -rv
+
+
+def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = None,
+                     cross_eval: bool = True) -> List[PlyRecord]:
+    """Play one MCTS-vs-MCTS game and record (seat, move, pre-move view, SearchResult, state) per ply.
+
+    With ``cross_eval`` (default), also fill each turn-start ply's ``eval_by_seat`` with BOTH players'
+    own-perspective evals of that position -- the mover's from its own search, the opponent's from one
+    extra search of the same state -- so the review graph can show every player's read on every turn."""
     from ..agents import MCTSAgent
     from ..arena import play_game
 
@@ -64,6 +79,20 @@ def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = Non
     agents = [MCTSAgent(iterations=iters, evaluate_forced=True),
               MCTSAgent(iterations=iters, evaluate_forced=True)]
     play_game(agents, rng, on_decision=collect, starting_player=start)
+
+    if cross_eval:
+        xrng = np.random.default_rng(seed)
+        for start_i, _end, _owner in turns_of(traj):
+            rec = traj[start_i]
+            if rec.state is None:
+                continue
+            mover = rec.state.to_play                 # the seat that searched here (== owner except in setup)
+            other = 1 - mover
+            mv = rec.result.root_value() if rec.result is not None else _position_eval(rec.state, mover, iters, xrng)
+            ov = _position_eval(rec.state, other, iters, xrng)
+            eb = [0.0, 0.0]
+            eb[mover], eb[other] = mv, ov
+            rec.eval_by_seat = (eb[0], eb[1])
     return traj
 
 
@@ -110,11 +139,21 @@ def _current_turn(turns, cursor) -> int:
     return next((i for i, (s, e, o) in enumerate(turns) if s <= cursor <= e), 0)
 
 
+def _turn_eval(rec, owner: int, seat: int) -> Optional[float]:
+    """Seat ``seat``'s own-perspective eval at a turn start. Uses the both-players ``eval_by_seat`` when
+    present; otherwise falls back to the mover's search (owner side only)."""
+    if rec.eval_by_seat is not None:
+        return rec.eval_by_seat[seat]
+    if seat == owner and rec.result is not None:
+        return rec.result.root_value()
+    return None
+
+
 def _draw_graph(surface, fonts, traj, turns, cursor, top):
     """The combined eval graph: BOTH players' lines on one set of shared axes (x = turns, y = -1..+1).
-    Each seat only has points on turns it owns (that's when it searched); its line connects across the
-    opponent's turns. Each line stays in its own owner's perspective (+1 = good for that player), so the
-    two lines together show the P0/P1 asymmetry on the same axes."""
+    With cross-evals every turn carries both seats' reads, so each line has a point on EVERY turn (a
+    seat's line moves the turn right after it learns something). Each line stays in its own owner's
+    perspective (+1 = good for that player), so the two lines together show the P0/P1 asymmetry."""
     import pygame
     small = fonts["small"]
     x0, w, h = X0, WINDOW[0] - 16, GRAPH_H
@@ -131,13 +170,11 @@ def _draw_graph(surface, fonts, traj, turns, cursor, top):
     for seat in (0, 1):                                # both lines on the same axes
         prev = None
         for i, (s, e, owner) in enumerate(turns):
-            if owner != seat:
-                continue                               # keep prev — connect across the opponent's turns
-            rv = traj[s].result.root_value() if traj[s].result is not None else None
-            if rv is None:
-                prev = None                            # a searchless (forced) own turn breaks the line
+            v = _turn_eval(traj[s], owner, seat)
+            if v is None:                              # no eval for this seat here -> break the line
+                prev = None
                 continue
-            x, y = _turn_x(i, n), ypx(rv)
+            x, y = _turn_x(i, n), ypx(v)
             if prev is not None:
                 pygame.draw.line(surface, P_COLORS[seat], prev, (x, y), 2)
             pygame.draw.circle(surface, P_COLORS[seat], (int(x), int(y)), 3)
@@ -232,6 +269,10 @@ def _draw_panel(surface, fonts, traj, seat, tb, cursor, tree_rect, mode, ost, zo
     forced_note = f"  · forced (eval {rec0.result.root_value():+.2f})" if len(rec0.result.stats) == 1 else ""
     _text(surface, med, f"P{seat} — {_compact_action(rec0.move)}{forced_note}{zoom_note}{tag}",
           (tx + 4, ty - 24), P_COLORS[seat])
+    if rec0.eval_by_seat is not None:                          # the opponent's read of this same position
+        opp = 1 - seat
+        _text(surface, small, f"P{opp} reads this position {rec0.eval_by_seat[opp]:+.2f} (their perspective)",
+              (tx + 4, ty - 6), MUTE)
     if mode == "icicle":
         return draw_icicle(surface, fonts, rec0.result, tree_rect, played_path=path,
                            zoom_root=(zoom_stack[-1] if zoom_stack else None))
