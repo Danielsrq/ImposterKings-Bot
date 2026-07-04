@@ -62,6 +62,7 @@ class Frame(NamedTuple):
     reasoning_toggle: Optional["pygame.Rect"]
     hint_toggle: Optional["pygame.Rect"]
     review: Optional["pygame.Rect"]        # "Review game" button, shown only at game over
+    settings: "pygame.Rect"                # opens the engine-settings modal
 
 # Friendly labels for the decision header (the raw StepKind names are long/cryptic).
 DECISION_LABELS = {
@@ -378,7 +379,63 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                                           hint_result, show_hint, "(toggle for your read of this position)",
                                           own_eval=hint_eval, seat=view.observer)
     _draw_knowledge(surface, fonts, view, knowledge)
-    return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review)
+
+    settings = pygame.Rect(WINDOW[0] - 12 - 84, 12, 84, 24)   # engine-settings button (panel top-right)
+    pygame.draw.rect(surface, BTN, settings, border_radius=4)
+    _text(surface, small, "Settings", (settings.x + 10, settings.y + 4))
+    return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review, settings)
+
+
+# The three engine (bot + analysis) modes, in pill order: (mode key, label).
+ENGINE_PILLS = [("mcts", "Fixed iters"), ("branching", "Branch"), ("hybrid", "Branch + hand scaling")]
+
+
+def draw_settings_overlay(surface, fonts, engine, mouse):
+    """Draw the engine-settings modal over the board and return its clickable controls:
+    ``{"pills": {mode: rect}, "slider": (track_rect, lo, hi, is_k), "close": rect}``.
+
+    ``engine`` = ``{"mode", "N", "k"}``. Slider is ``N`` (25-1024) for fixed, else ``k`` (10-100)."""
+    med, small = fonts["med"], fonts["small"]
+    W, H = WINDOW
+    dim = pygame.Surface((W, H), pygame.SRCALPHA)
+    dim.fill((0, 0, 0, 160))
+    surface.blit(dim, (0, 0))
+    bw, bh = 680, 270
+    bx, by = (W - bw) // 2, (H - bh) // 2
+    pygame.draw.rect(surface, PANEL, (bx, by, bw, bh), border_radius=8)
+    pygame.draw.rect(surface, GOLD, (bx, by, bw, bh), 2, border_radius=8)
+    _text(surface, med, "Engine settings  (bot + hint)", (bx + 20, by + 16), INK)
+
+    pills, pw, ph = {}, (bw - 40 - 16) // 3, 36
+    x, y = bx + 20, by + 56
+    for mode, label in ENGINE_PILLS:
+        r = pygame.Rect(x, y, pw, ph)
+        sel = engine["mode"] == mode
+        pygame.draw.rect(surface, GOLD if sel else BTN, r, border_radius=18)
+        tw = small.size(label)[0]
+        _text(surface, small, label, (r.centerx - tw // 2, r.y + 9), (20, 20, 20) if sel else INK)
+        pills[mode] = r
+        x += pw + 8
+
+    is_k = engine["mode"] != "mcts"
+    lo, hi = (10, 100) if is_k else (25, 1024)
+    val = engine["k"] if is_k else engine["N"]
+    sy = by + 140
+    _text(surface, small, f"{'k' if is_k else 'N'} = {val}", (bx + 20, sy - 24), GOLD)
+    _text(surface, small, f"[{lo} .. {hi}]", (bx + bw - 20 - small.size(f'[{lo} .. {hi}]')[0], sy - 24), MUTE)
+    track = pygame.Rect(bx + 20, sy, bw - 40, 8)
+    pygame.draw.rect(surface, BTN, track, border_radius=4)
+    kx = int(track.x + (val - lo) / (hi - lo) * track.w)
+    pygame.draw.circle(surface, GOLD, (kx, track.centery), 10)
+    preview = ("clamp(k * n_legal * (1 + opp_cards), 64, 4096)" if engine["mode"] == "hybrid"
+               else "clamp(k * n_legal, 64, 4096)" if engine["mode"] == "branching"
+               else f"~ {val} simulations / decision")
+    _text(surface, small, preview, (bx + 20, sy + 26), MUTE)
+
+    close = pygame.Rect(bx + bw - 20 - 78, by + bh - 44, 78, 28)
+    pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
+    _text(surface, small, "Close", (close.x + 18, close.y + 5), INK)
+    return {"pills": pills, "slider": (track, lo, hi, is_k), "close": close}
 
 
 def make_fonts():

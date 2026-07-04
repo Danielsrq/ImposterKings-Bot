@@ -9,7 +9,9 @@ pygame = pytest.importorskip("pygame")
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-from imposterkings.ui.render import WINDOW, make_fonts, render_frame  # noqa: E402
+from imposterkings.ui.render import (  # noqa: E402
+    WINDOW, draw_settings_overlay, make_fonts, render_frame,
+)
 
 from .helpers import cid, mainstate, sc  # noqa: E402
 
@@ -29,6 +31,7 @@ def test_render_frame_draws_and_returns_buttons(tmp_path):
     assert hasattr(frame.new_game, "collidepoint")               # New Game button is hit-testable
     assert hasattr(frame.reasoning_toggle, "collidepoint")       # reasoning toggle is hit-testable
     assert hasattr(frame.hint_toggle, "collidepoint")            # hint toggle is hit-testable
+    assert hasattr(frame.settings, "collidepoint")               # Settings button is hit-testable
     assert frame.review is None                                  # Review button only shows at game over
     out = tmp_path / "frame.png"
     pygame.image.save(screen, str(out))
@@ -60,6 +63,22 @@ def test_render_frame_draws_pv_lines_from_a_real_search():
                          bot_eval=-rv, hint_eval=rv, seed=1)
     assert frame.buttons
     assert hasattr(frame.hint_toggle, "collidepoint")
+    pygame.display.quit()
+
+
+def test_settings_overlay_renders_and_returns_controls():
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    for engine in ({"mode": "mcts", "N": 500, "k": 100},
+                   {"mode": "branching", "N": 800, "k": 40},
+                   {"mode": "hybrid", "N": 800, "k": 100}):
+        ctrl = draw_settings_overlay(screen, fonts, engine, (0, 0))
+        assert set(ctrl["pills"]) == {"mcts", "branching", "hybrid"}
+        assert all(hasattr(r, "collidepoint") for r in ctrl["pills"].values())
+        track, lo, hi, is_k = ctrl["slider"]
+        assert hasattr(track, "collidepoint") and hasattr(ctrl["close"], "collidepoint")
+        assert (lo, hi, is_k) == ((10, 100, True) if engine["mode"] != "mcts" else (25, 1024, False))
     pygame.display.quit()
 
 
