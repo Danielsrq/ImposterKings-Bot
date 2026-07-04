@@ -18,8 +18,8 @@ import numpy as np
 from .. import cards
 from ..actions import Action, ActionKind, StepKind
 from ..infoset import InformationSet
-from .render import (BTN, BTN_HOVER, CARD_COLORS, DIVIDER, GOLD, INK, MUTE, P_COLORS, PANEL,
-                     WINDOW, _compact_action, _text, make_fonts)
+from .render import (BTN, BTN_HOVER, CARD_COLORS, DIVIDER, GOLD, INK, MUTE, P_COLORS, PANEL, RED,
+                     WINDOW, _compact_action, _cross, _text, _tick, make_fonts)
 from . import assets
 from .tree_view import block_at, draw_crown, draw_icicle, draw_outline, draw_tooltip
 
@@ -330,6 +330,76 @@ def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, 
     return blocks
 
 
+_POPUP_CW, _POPUP_CH = 36, 50       # card jpgs in the true-board popup (~strip size)
+
+
+def _name_surface(name: str, size):
+    """Card art for a card NAME (uses a representative instance) -- for the has/lacks knowledge rows."""
+    ids = cards.card_ids_for_name(name)
+    return assets.card_surface(ids[0], size) if ids else None
+
+
+def _draw_board_popup(surface, fonts, state, anchor) -> None:
+    """Hover popup: the TRUE board at a turn (post-game, so full info). R1 = P0 hand / hidden / antechamber
+    card art; R2 = P1 likewise; R3 = each player's has(tick)/lacks(cross) deductions about the OTHER's hand
+    as card art, then the starting face-up card. All from ``state`` (a GameState). No-op if ``state`` None."""
+    import pygame
+    if state is None:
+        return
+    small = fonts["small"]
+    cw, ch, g, pad = _POPUP_CW, _POPUP_CH, 3, 8
+    lh = small.get_linesize()
+    art = lambda c: assets.card_surface(c, (cw, ch))
+
+    # each row = list of ("label", text) | ("cards", [surf]) | ("tick"/"cross", [surf])
+    rows = []
+    for seat in (0, 1):
+        row = [("label", f"P{seat}"), ("cards", [art(c) for c in state.hands[seat]])]
+        if state.hidden[seat] is not None:
+            row += [("label", "hid"), ("cards", [art(state.hidden[seat])])]
+        if state.antechambers[seat]:
+            row += [("label", "ante"), ("cards", [art(c) for c in state.antechambers[seat]])]
+        rows.append(row)
+    r3 = []
+    for seat in (0, 1):
+        v = state.information_set(seat)
+        r3 += [("label", f"P{seat}?"),
+               ("tick", [_name_surface(n, (cw, ch)) for n in sorted(v.opp_hand_has)]),
+               ("cross", [_name_surface(n, (cw, ch)) for n in sorted(v.opp_hand_lacks)])]
+    r3 += [("label", "up"), ("cards", [art(state.leftover_faceup)])]
+    rows.append(r3)
+
+    def seg_w(kind, val):
+        if kind == "label":
+            return small.size(val)[0] + 6
+        icon = 16 if kind in ("tick", "cross") else 0
+        return icon + (len(val) * (cw + g) if val else 14)     # 14 = "-" for an empty tick/cross
+
+    W = max(sum(seg_w(k, v) for k, v in row) for row in rows) + 2 * pad
+    H = len(rows) * (ch + 6) + 2 * pad
+    x = max(4, min(anchor[0] + 14, WINDOW[0] - W - 4))
+    y = max(4, min(anchor[1] + 14, WINDOW[1] - H - 4))
+    pygame.draw.rect(surface, PANEL, (x, y, W, H))
+    pygame.draw.rect(surface, MUTE, (x, y, W, H), 1)
+    for i, row in enumerate(rows):
+        cy, cx = y + pad + i * (ch + 6), x + pad
+        for kind, val in row:
+            if kind == "label":
+                _text(surface, small, val, (cx, cy + (ch - lh) // 2), MUTE)
+                cx += small.size(val)[0] + 6
+                continue
+            if kind in ("tick", "cross"):
+                (_tick if kind == "tick" else _cross)(surface, cx, cy + (ch - 14) // 2)
+                cx += 16
+            if not val:
+                _text(surface, small, "-", (cx, cy + (ch - lh) // 2), MUTE)
+                cx += 14
+            for s in val:
+                if s is not None:
+                    surface.blit(s, (cx, cy))
+                cx += cw + g
+
+
 def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
     import pygame
     if not traj:
@@ -380,7 +450,10 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
             1: _draw_panel(screen, fonts, traj, 1, cur_turn, cursor, rrect, mode,
                            ost[1], zoom[1], last_tree),
         }
-        if mode == "icicle":                    # hover tooltip
+        hover_turn = next((s for r, s in strip_hits if r.collidepoint(mouse)), None)
+        if hover_turn is not None:               # hovering a strip card -> the true-board popup for its turn
+            _draw_board_popup(screen, fonts, traj[hover_turn].state, mouse)
+        elif mode == "icicle":                   # else the icicle hover tooltip
             hseat = 0 if mouse[0] < mid else 1
             hb = block_at(blocks[hseat], mouse)
             if hb is not None:

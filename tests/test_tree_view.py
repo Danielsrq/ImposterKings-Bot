@@ -187,3 +187,18 @@ def test_build_trajectory_with_budget_uses_variable_iters():
     assert len(its) > 1                                       # per-turn budget varies -> not a flat number
     for s, e, o in turns_of(traj):
         assert traj[s].eval_by_seat is not None and traj[s].result_by_seat is not None
+
+
+def test_board_popup_renders_headless():
+    from imposterkings.ui.render import WINDOW
+    from imposterkings.ui.review import _draw_board_popup
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    traj = build_trajectory(iters=30, seed=0)
+    turns = turns_of(traj)
+    s = turns[min(6, len(turns) - 1)][0]                     # a turn-start state (hands/hidden/etc. present)
+    assert traj[s].state is not None
+    _draw_board_popup(screen, fonts, traj[s].state, (60, 60))  # true-board popup renders without error
+    _draw_board_popup(screen, fonts, None, (60, 60))           # None state -> no-op
+    pygame.display.quit()
