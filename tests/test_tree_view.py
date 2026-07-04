@@ -172,3 +172,18 @@ def test_annotate_dual_evals_fills_a_bare_trajectory_and_reuses():
         assert rbs is not None and rbs[0].info.observer == 0 and rbs[1].info.observer == 1
     # a second pass reuses everything already present -> no recomputation
     assert annotate_dual_evals(traj, 20, np.random.default_rng(0)) == 0
+    # a budget POLICY (callable) is also accepted: gap searches are sized per-turn (app review uses this)
+    from imposterkings.budget import hybrid
+    traj2 = build_trajectory(iters=20, seed=1, cross_eval=False)
+    assert annotate_dual_evals(traj2, hybrid(20, 3), np.random.default_rng(0)) > 0
+    assert all(traj2[s].result_by_seat is not None for s, e, o in turns_of(traj2))
+
+
+def test_build_trajectory_with_budget_uses_variable_iters():
+    # standalone ui.review can run the bot-vs-bot game + dual-eval under a budget policy (hybrid default).
+    from imposterkings.budget import hybrid
+    traj = build_trajectory(iters=20, seed=0, budget=hybrid(20, 3))
+    its = {traj[s].result.iterations for s, e, o in turns_of(traj) if traj[s].result is not None}
+    assert len(its) > 1                                       # per-turn budget varies -> not a flat number
+    for s, e, o in turns_of(traj):
+        assert traj[s].eval_by_seat is not None and traj[s].result_by_seat is not None

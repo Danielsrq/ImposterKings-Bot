@@ -19,7 +19,7 @@ from ..agents import MCTSAgent, RandomAgent
 from ..explain import format_action
 from ..state import GameState
 from .render import BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_settings_overlay, make_fonts, render_frame
-from .review import PlyRecord, annotate_dual_evals, run_review, _result_eval, _search_from
+from .review import PlyRecord, annotate_dual_evals, budget_iters, run_review, _result_eval, _search_from
 
 # Opponent's setup hide/discard are private -- never reveal the card identity in the log.
 _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
@@ -28,17 +28,10 @@ _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
 def _engine_budget(engine: dict):
     """A budget policy for the current engine config (drives BOTH the bot and the analysis)."""
     if engine["mode"] == "hybrid":
-        return budget_mod.hybrid(engine["k"])
+        return budget_mod.hybrid(engine["k"], engine["l"])
     if engine["mode"] == "branching":
-        return budget_mod.branching(engine["k"])
-    return budget_mod.fixed(engine["N"])   # "mcts": fixed N
-
-
-def _analysis_iters(state, observer: int, bud) -> int:
-    """Iterations for a dual-eval analysis search from ``observer``'s view, sized by the engine budget:
-    root branching = the mover's decision, opponent-card uncertainty from the observer's own view."""
-    n_legal = len(state.information_set(state.to_play).legal_moves())
-    return bud(state.information_set(observer), n_legal)
+        return budget_mod.branching(engine["k"], engine["l"])
+    return budget_mod.fixed(engine["N"])   # "mcts": fixed N (l/k unused)
 
 
 def _make_bot(random_bot: bool, engine: dict):
@@ -67,7 +60,7 @@ def _describe(seat: int, view, move, human_seat: int, state) -> str:
 
 
 def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, start=None,
-        k: int = 100) -> None:
+        k: int = 100, l: int = 3) -> None:
     import pygame  # local import so the engine/tests never require pygame
 
     pygame.init()
@@ -78,10 +71,11 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     log: deque = deque(maxlen=40)
     show_reasoning, show_hint = True, False
     # One engine config drives BOTH the bot and the dual-eval analysis (so the panels' sims match the bot).
-    engine = {"mode": p1 if p1 in ("mcts", "branching", "hybrid") else "mcts", "N": iters, "k": k}
+    engine = {"mode": p1 if p1 in ("mcts", "branching", "hybrid") else "mcts",
+              "N": iters, "k": k, "l": l}
     random_bot = (p1 == "random")
     engine_budget = _engine_budget(engine)          # rebuilt by apply_engine() on any settings change
-    settings_open, dragging = False, False
+    settings_open, dragging = False, None      # dragging = the active slider key ("N"/"k"/"l") or None
     analysis_rng = np.random.default_rng(1234567)   # dedicated so analysis never perturbs the game rng
     # Per-state dual analysis: BOTH seats' read of the current position (keyed by state identity), so the
     # two side panels are live every turn -- like ui.review. Each entry is a SearchResult (or None).
@@ -154,7 +148,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             for s in (0, 1):
                 shown = show_reasoning if s == bot_seat else show_hint
                 if shown and analysis[s] is None:
-                    its = _analysis_iters(state, s, engine_budget)
+                    its = budget_iters(state, s, engine_budget)
                     analysis[s] = _search_from(state, s, its, analysis_rng)
         bot_res, hint_res = analysis[bot_seat], analysis[human_seat]
         bot_eval = _result_eval(bot_res, state, bot_seat) if bot_res is not None else None
@@ -178,10 +172,18 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         controls = draw_settings_overlay(screen, fonts, engine, mouse) if settings_open else None
         pygame.display.flip()
 
-        def _slider_set(px):                        # map the modal slider x -> N/k (rounded, clamped)
-            track, lo, hi, is_k = controls["slider"]
-            frac = max(0.0, min(1.0, (px - track.x) / track.w))
-            engine["k" if is_k else "N"] = int(round(lo + frac * (hi - lo)))
+        def _slider_at(pos):                        # the modal slider whose (padded) track contains pos
+            for sl in (controls["sliders"] if controls else []):
+                if sl[0].inflate(24, 28).collidepoint(pos):
+                    return sl
+            return None
+
+        def _slider_set(key, px):                   # map x -> N/k/l (rounded, clamped to the slider range)
+            for track, lo, hi, k_ in (controls["sliders"] if controls else []):
+                if k_ == key:
+                    frac = max(0.0, min(1.0, (px - track.x) / track.w))
+                    engine[key] = int(round(lo + frac * (hi - lo)))
+                    return
 
         review_requested = False
         for event in pygame.event.get():
@@ -193,17 +195,18 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 else:
                     running = False
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                if dragging:                        # end of a slider drag -> apply the new value
-                    dragging = False
+                if dragging is not None:            # end of a slider drag -> apply the new value
+                    dragging = None
                     apply_engine()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 pos = event.pos
                 if settings_open:                   # modal: route clicks to it, ignore the board
+                    sl = _slider_at(pos)
                     if controls["close"].collidepoint(pos) or frame.settings.collidepoint(pos):
                         settings_open = False
-                    elif controls["slider"][0].inflate(20, 24).collidepoint(pos):
-                        dragging = True
-                        _slider_set(pos[0])
+                    elif sl is not None:
+                        dragging = sl[3]
+                        _slider_set(dragging, pos[0])
                     else:
                         for mode, r in controls["pills"].items():
                             if r.collidepoint(pos):
@@ -226,20 +229,21 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                             hres = analysis[human_seat] if analysis["state"] is game["state"] else None
                             apply_logged(human_seat, move, hres)
                             break
-        if dragging:                                # live-drag the slider while the button is held
+        if dragging is not None:                    # live-drag the active slider while the button is held
             if pygame.mouse.get_pressed()[0] and controls is not None:
-                _slider_set(mouse[0])
+                _slider_set(dragging, mouse[0])
             else:
-                dragging = False
+                dragging = None
 
         # Deferred so the review's own event loop doesn't run mid-iteration of this one. Fill any per-turn
         # evals NOT already computed live (e.g. a seat whose panel was off) so the review shows the full
         # dual-eval graph + dual icicles; turns analyzed live during play are reused, not recomputed.
         if review_requested and trajectory:
             annotated = list(trajectory)
-            n = annotate_dual_evals(annotated, engine["N"], np.random.default_rng(7))
+            n = annotate_dual_evals(annotated, engine_budget, np.random.default_rng(7))
             if n:
-                print(f"computing {n} dual-eval searches for turns not analyzed live during play...")
+                print(f"computing {n} dual-eval searches (at the current engine budget) for turns not "
+                      f"analyzed live during play...")
             run_review(screen, fonts, annotated)
 
         if (not settings_open) and (not game["state"].is_terminal()) and game["state"].to_play == bot_seat:
@@ -260,13 +264,15 @@ def main(argv=None) -> None:
     parser.add_argument("--iters", type=int, default=800, help="MCTS iterations per decision (mcts mode)")
     parser.add_argument("--k", type=int, default=100,
                         help="budget multiplier for the hybrid/branching bot modes")
+    parser.add_argument("--l", type=int, default=3,
+                        help="effective legal-moves for a sub-decision card at selection (branch/hybrid)")
     parser.add_argument("--seed", type=int, default=None,
                         help="fix the deck/deal (default: random each launch)")
     parser.add_argument("--human-seat", type=int, default=0, choices=[0, 1])
     parser.add_argument("--start", type=int, default=None, choices=[0, 1])
     args = parser.parse_args(argv)
     run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
-        k=args.k)
+        k=args.k, l=args.l)
 
 
 if __name__ == "__main__":

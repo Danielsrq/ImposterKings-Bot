@@ -64,9 +64,19 @@ def _result_eval(res, state, observer: int) -> float:
     return rv if state.to_play == observer else -rv
 
 
+def budget_iters(state, observer: int, bud) -> int:
+    """Iterations for a search from ``observer``'s view under a budget policy ``bud`` (mover-weighted
+    branching + the observer's opp-card uncertainty). Shared by the app's live analysis and the review."""
+    mover_moves = state.information_set(state.to_play).legal_moves()
+    return bud(state.information_set(observer), mover_moves)
+
+
 def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = None,
-                     cross_eval: bool = True) -> List[PlyRecord]:
+                     cross_eval: bool = True, budget=None) -> List[PlyRecord]:
     """Play one MCTS-vs-MCTS game and record (seat, move, pre-move view, SearchResult, state) per ply.
+
+    ``budget`` (a :mod:`imposterkings.budget` policy) makes both self-play agents AND the dual-eval use
+    that per-decision budget (e.g. the hybrid schedule); ``None`` falls back to fixed ``iters``.
 
     With ``cross_eval`` (default), also fill each turn-start ply's ``eval_by_seat`` with BOTH players'
     own-perspective evals of that position -- the mover's from its own search, the opponent's from one
@@ -82,22 +92,23 @@ def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = Non
     rng = np.random.default_rng(seed)
     # evaluate_forced: search even on forced turns (ascensions, sole reactions) so every turn -- not just
     # ones with a real choice -- carries an eval. A position's value is well-defined even when forced.
-    agents = [MCTSAgent(iterations=iters, evaluate_forced=True),
-              MCTSAgent(iterations=iters, evaluate_forced=True)]
-    play_game(agents, rng, on_decision=collect, starting_player=start)
+    def _agent():
+        return (MCTSAgent(budget=budget, evaluate_forced=True) if budget is not None
+                else MCTSAgent(iterations=iters, evaluate_forced=True))
+    play_game([_agent(), _agent()], rng, on_decision=collect, starting_player=start)
 
     if cross_eval:
-        annotate_dual_evals(traj, iters, np.random.default_rng(seed))
+        annotate_dual_evals(traj, budget if budget is not None else iters, np.random.default_rng(seed))
     return traj
 
 
-def annotate_dual_evals(traj: List[PlyRecord], iters: int, rng) -> int:
+def annotate_dual_evals(traj: List[PlyRecord], iters, rng) -> int:
     """Fill each turn-start ply's ``result_by_seat``/``eval_by_seat`` with BOTH seats' reads of that
     position, REUSING any already present (e.g. stored live by the app during play) and only searching
     the GAPS: a missing mover seat reuses the ply's own recorded ``result`` if it has one, else searches;
-    a missing opponent seat searches. Perspective via ``_result_eval``. Returns the number of fresh
-    searches performed (0 if everything was already computed live). Used by ``build_trajectory`` and by
-    the live app before opening its review, so both show the dual-eval graph + dual icicles."""
+    a missing opponent seat searches. ``iters`` is a fixed int OR a budget policy callable (then each gap
+    search is sized per-turn via ``budget_iters`` -- so an app review reuses its hybrid/branch budget, not
+    a flat number). Returns the number of fresh searches performed (0 if everything was computed live)."""
     computed = 0
     for start_i, _end, _owner in turns_of(traj):
         rec = traj[start_i]
@@ -111,7 +122,8 @@ def annotate_dual_evals(traj: List[PlyRecord], iters: int, rng) -> int:
             if s == mover and rec.result is not None:
                 rbs[s] = rec.result                   # reuse the mover's actual decision search
             else:
-                rbs[s] = _search_from(rec.state, s, iters, rng)
+                its = iters if isinstance(iters, int) else budget_iters(rec.state, s, iters)
+                rbs[s] = _search_from(rec.state, s, its, rng)
                 computed += 1
         rec.result_by_seat = (rbs[0], rbs[1])
         rec.eval_by_seat = (_result_eval(rbs[0], rec.state, 0), _result_eval(rbs[1], rec.state, 1))
@@ -437,20 +449,28 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
 
 def main(argv=None) -> None:
     import pygame
+    from .. import budget as budget_mod
 
     p = argparse.ArgumentParser(description="Post-game review of an MCTS-vs-MCTS game.")
-    p.add_argument("--iters", type=int, default=800, help="MCTS iterations per decision")
+    p.add_argument("--p1", default="hybrid", choices=["mcts", "hybrid", "branching"],
+                   help="engine mode for both bots + the dual-eval (default: hybrid)")
+    p.add_argument("--iters", type=int, default=800, help="MCTS iterations per decision (mcts mode)")
+    p.add_argument("--k", type=int, default=50, help="budget multiplier (hybrid/branching)")
+    p.add_argument("--l", type=int, default=3,
+                   help="effective legal-moves for a sub-decision card at selection (hybrid/branching)")
     p.add_argument("--seed", type=int, default=0, help="deck/deal seed")
     p.add_argument("--start", type=int, default=None, choices=[0, 1], help="force the starting player")
     args = p.parse_args(argv)
 
-    print(f"Generating MCTS-vs-MCTS game (iters={args.iters}, seed={args.seed})...")
-    traj = build_trajectory(args.iters, args.seed, args.start)
+    bud = None if args.p1 == "mcts" else budget_mod.make_budget(args.p1, k=args.k, l=args.l)
+    cfg = f"iters={args.iters}" if bud is None else bud.label
+    print(f"Generating MCTS-vs-MCTS game ({cfg}, seed={args.seed})...")
+    traj = build_trajectory(args.iters, args.seed, args.start, budget=bud)
     print(f"  {len(traj)} decisions recorded. Opening review window...")
 
     pygame.init()
     screen = pygame.display.set_mode(WINDOW)
-    pygame.display.set_caption(f"ImposterKings review  (seed {args.seed}, {args.iters} sims)")
+    pygame.display.set_caption(f"ImposterKings review  (seed {args.seed}, {cfg})")
     run_review(screen, make_fonts(), traj)
     pygame.quit()
 

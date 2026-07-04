@@ -70,15 +70,17 @@ def test_settings_overlay_renders_and_returns_controls():
     pygame.display.init()
     screen = pygame.display.set_mode(WINDOW)
     fonts = make_fonts()
-    for engine in ({"mode": "mcts", "N": 500, "k": 100},
-                   {"mode": "branching", "N": 800, "k": 40},
-                   {"mode": "hybrid", "N": 800, "k": 100}):
+    for engine in ({"mode": "mcts", "N": 500, "k": 100, "l": 3},
+                   {"mode": "branching", "N": 800, "k": 40, "l": 3},
+                   {"mode": "hybrid", "N": 800, "k": 100, "l": 5}):
         ctrl = draw_settings_overlay(screen, fonts, engine, (0, 0))
         assert set(ctrl["pills"]) == {"mcts", "branching", "hybrid"}
         assert all(hasattr(r, "collidepoint") for r in ctrl["pills"].values())
-        track, lo, hi, is_k = ctrl["slider"]
-        assert hasattr(track, "collidepoint") and hasattr(ctrl["close"], "collidepoint")
-        assert (lo, hi, is_k) == ((10, 100, True) if engine["mode"] != "mcts" else (25, 1024, False))
+        assert hasattr(ctrl["close"], "collidepoint")
+        keys = [key for _track, _lo, _hi, key in ctrl["sliders"]]
+        assert all(hasattr(t, "collidepoint") for t, *_ in ctrl["sliders"])
+        # fixed -> just N; branch/hybrid -> k and l
+        assert keys == (["N"] if engine["mode"] == "mcts" else ["k", "l"])
     pygame.display.quit()
 
 

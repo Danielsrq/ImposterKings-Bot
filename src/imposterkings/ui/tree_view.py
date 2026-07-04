@@ -235,13 +235,16 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
     for b in blocks:
         if b.band not in band_top or b.y < band_top[b.band][0]:
             band_top[b.band] = (b.y, b.mover)
+    root_band = min(band_top) if band_top else 0
     for band in sorted(band_top):
         by, mover = band_top[band]
         strip_y = int(by) - bh                         # the reserved header strip (blank, no boxes)
         pygame.draw.rect(surface, P_COLORS.get(mover, MUTE), (int(x0), strip_y, int(W), bh))
         pygame.draw.line(surface, (10, 10, 10), (int(x0), strip_y), (int(x0 + W), strip_y))
         pygame.draw.line(surface, (10, 10, 10), (int(x0), strip_y + bh), (int(x0 + W), strip_y + bh))
-        surface.blit(bf.render(f"P{mover}", True, (20, 20, 20)), (int(x0) + 3, strip_y))
+        # root band (card selection) also shows the total search visits funding this decision
+        tag = f"P{mover}  {layout_root.n} sims" if band == root_band else f"P{mover}"
+        surface.blit(bf.render(tag, True, (20, 20, 20)), (int(x0) + 3, strip_y))
     if dim:
         fade = pygame.Surface((int(W), int(H)), pygame.SRCALPHA)
         fade.fill((18, 20, 26, 150))

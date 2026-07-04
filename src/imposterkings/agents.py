@@ -61,7 +61,7 @@ class MCTSAgent:
         if len(moves) == 1 and not self.evaluate_forced:
             self.last_result = None
             return moves[0]
-        iters = self.budget(view, len(moves)) if self.budget is not None else self.iterations
+        iters = self.budget(view, moves) if self.budget is not None else self.iterations
         config = SearchConfig(rng=rng, iterations=iters, c=self.c, use_knowledge=self.use_knowledge)
         self.last_result = search(view, config)
         # The move is still forced when there is only one; return it explicitly (best_move agrees).
