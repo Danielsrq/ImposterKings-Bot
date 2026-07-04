@@ -16,7 +16,7 @@ import pygame
 from ..actions import Action, ActionKind
 from ..cards import CARD_DEFS, card_name
 from . import assets
-from .render import CARD_COLORS, DIVIDER, GOLD, INK, MUTE, NEUTRAL, _compact_action, _text
+from .render import CARD_COLORS, DIVIDER, GOLD, INK, MUTE, NEUTRAL, P_COLORS, _compact_action, _text
 
 WHITE = (245, 245, 245)     # flip-king / setup cells (crown on white)
 
@@ -95,6 +95,8 @@ class Block:
     node: object           # the MCTS Node (for click-to-zoom)
     visits: int
     visit_pct: float       # node.n / (layout root).n * 100
+    band: int = 0          # ply-band index (increments each time the mover changes)
+    mover: int = 0         # the player who moved into this node (player_just_moved)
 
 
 def path_node_ids(root, played_path) -> Set[int]:
@@ -111,7 +113,7 @@ def path_node_ids(root, played_path) -> Set[int]:
 
 
 def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, *,
-                  top_k: int = 6, max_turns: int = 6,
+                  top_k: int = 6, max_turns: int = 6, band_gap: float = 0.0,
                   on_path_ids: Set[int] = frozenset()) -> List[Block]:
     """Ply-banded icicle layout for ``root``'s subtree within ``rect`` = (x, y, w, h).
 
@@ -146,27 +148,45 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
         walk(c, cx, W * (c.n / root_n), 0, 0)
         cx += W * (c.n / root_n)
 
-    band_top: Dict[int, int] = {}
+    bands_present: List[int] = []
     acc = 0
     for b in range(max_turns):
         if b not in band_maxlocal:
             break
-        band_top[b] = acc
+        bands_present.append(b)
         acc += band_maxlocal[b] + 1
-    row_h = H / max(1, acc)
+    # ``band_gap`` reserves a header strip above each band (for the P{mover} bar) -- the boxes shrink to
+    # make room, so the bar never overlaps them. band_gap=0 reproduces the original tight layout.
+    row_h = (H - len(bands_present) * band_gap) / max(1, acc)
+    band_pixel_top: Dict[int, float] = {}
+    ypos = float(y0)
+    for b in bands_present:
+        ypos += band_gap
+        band_pixel_top[b] = ypos
+        ypos += (band_maxlocal[b] + 1) * row_h
 
     blocks: List[Block] = []
     for node, x, w, ti, ld in raw:
-        y = y0 + (band_top[ti] + ld) * row_h
+        y = band_pixel_top[ti] + ld * row_h
         mq = node.w / node.n if node.n else 0.0
         persp = mq if node.player_just_moved == observer else -mq
         blocks.append(Block(x, y, w, row_h, _compact_action(node.incoming_move), persp,
                             move_color(node.incoming_move), id(node) in on_path_ids,
-                            node.incoming_move, node, node.n, 100.0 * node.n / root_n))
+                            node.incoming_move, node, node.n, 100.0 * node.n / root_n,
+                            ti, node.player_just_moved if node.player_just_moved is not None else 0))
     return blocks
 
 
 _MIN_LABEL_W = 30
+_BAND_FONT = None
+
+
+def _band_font():
+    """Small font for the turn-band header bars (lazy; pygame.font must be initialized by draw time)."""
+    global _BAND_FONT
+    if _BAND_FONT is None:
+        _BAND_FONT = pygame.font.SysFont("consolas,arial", 11)
+    return _BAND_FONT
 
 
 def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
@@ -184,8 +204,10 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
         return []
     on_ids = path_node_ids(result.root, played_path)
     layout_root = zoom_root if (zoom_root is not None and zoom_root.children) else result.root
+    bf = _band_font()
+    bh = bf.get_linesize()
     blocks = layout_icicle(layout_root, rect, result.info.observer,
-                           top_k=top_k, max_turns=max_turns, on_path_ids=on_ids)
+                           top_k=top_k, max_turns=max_turns, band_gap=bh, on_path_ids=on_ids)
     line_h = small.get_linesize()
     for b in blocks:
         r = pygame.Rect(int(b.x), int(b.y), max(1, int(b.w) - 1), max(1, int(b.h) - 1))
@@ -207,6 +229,19 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
     if current is not None:                            # emphasize the box just stepped to
         pygame.draw.rect(surface, INK, pygame.Rect(int(current.x), int(current.y),
                          max(1, int(current.w) - 1), max(1, int(current.h) - 1)), 3)
+    # --- turn-band separators: a thin full-width colored bar in the reserved strip ABOVE each band,
+    # with the P{mover} label left-aligned INSIDE it -- delimits turns without covering any box. ------
+    band_top: Dict[int, Tuple[float, int]] = {}        # band -> (min box top-y, mover)
+    for b in blocks:
+        if b.band not in band_top or b.y < band_top[b.band][0]:
+            band_top[b.band] = (b.y, b.mover)
+    for band in sorted(band_top):
+        by, mover = band_top[band]
+        strip_y = int(by) - bh                         # the reserved header strip (blank, no boxes)
+        pygame.draw.rect(surface, P_COLORS.get(mover, MUTE), (int(x0), strip_y, int(W), bh))
+        pygame.draw.line(surface, (10, 10, 10), (int(x0), strip_y), (int(x0 + W), strip_y))
+        pygame.draw.line(surface, (10, 10, 10), (int(x0), strip_y + bh), (int(x0 + W), strip_y + bh))
+        surface.blit(bf.render(f"P{mover}", True, (20, 20, 20)), (int(x0) + 3, strip_y))
     if dim:
         fade = pygame.Surface((int(W), int(H)), pygame.SRCALPHA)
         fade.fill((18, 20, 26, 150))

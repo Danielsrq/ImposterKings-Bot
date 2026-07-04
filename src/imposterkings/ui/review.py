@@ -87,22 +87,35 @@ def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = Non
     play_game(agents, rng, on_decision=collect, starting_player=start)
 
     if cross_eval:
-        xrng = np.random.default_rng(seed)
-        for start_i, _end, _owner in turns_of(traj):
-            rec = traj[start_i]
-            if rec.state is None:
-                continue
-            mover = rec.state.to_play                 # the seat that searched here (== owner except in setup)
-            other = 1 - mover
-            mover_res = rec.result if rec.result is not None else _search_from(rec.state, mover, iters, xrng)
-            other_res = _search_from(rec.state, other, iters, xrng)   # the opponent's read of this position
-            rbs, eb = [None, None], [0.0, 0.0]
-            rbs[mover], rbs[other] = mover_res, other_res
-            eb[mover] = _result_eval(mover_res, rec.state, mover)
-            eb[other] = _result_eval(other_res, rec.state, other)
-            rec.result_by_seat = (rbs[0], rbs[1])
-            rec.eval_by_seat = (eb[0], eb[1])
+        annotate_dual_evals(traj, iters, np.random.default_rng(seed))
     return traj
+
+
+def annotate_dual_evals(traj: List[PlyRecord], iters: int, rng) -> int:
+    """Fill each turn-start ply's ``result_by_seat``/``eval_by_seat`` with BOTH seats' reads of that
+    position, REUSING any already present (e.g. stored live by the app during play) and only searching
+    the GAPS: a missing mover seat reuses the ply's own recorded ``result`` if it has one, else searches;
+    a missing opponent seat searches. Perspective via ``_result_eval``. Returns the number of fresh
+    searches performed (0 if everything was already computed live). Used by ``build_trajectory`` and by
+    the live app before opening its review, so both show the dual-eval graph + dual icicles."""
+    computed = 0
+    for start_i, _end, _owner in turns_of(traj):
+        rec = traj[start_i]
+        if rec.state is None:
+            continue
+        mover = rec.state.to_play                     # the seat that searched here (== owner except in setup)
+        rbs = list(rec.result_by_seat) if rec.result_by_seat is not None else [None, None]
+        for s in (0, 1):
+            if rbs[s] is not None:
+                continue                              # already computed (e.g. live during the game)
+            if s == mover and rec.result is not None:
+                rbs[s] = rec.result                   # reuse the mover's actual decision search
+            else:
+                rbs[s] = _search_from(rec.state, s, iters, rng)
+                computed += 1
+        rec.result_by_seat = (rbs[0], rbs[1])
+        rec.eval_by_seat = (_result_eval(rbs[0], rec.state, 0), _result_eval(rbs[1], rec.state, 1))
+    return computed
 
 
 _SETUP_KINDS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
@@ -262,6 +275,7 @@ def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, 
     """Draw ``seat``'s read of the CURRENT turn's position. Both panels show the same turn: the mover's
     real search on its side, the opponent's search of the same state on the other -- so P1's tree updates
     during P0's turns too. The actually-played line is highlighted in both. Returns icicle blocks."""
+    import pygame
     med, small = fonts["med"], fonts["small"]
     tx, ty = tree_rect[0], tree_rect[1]
     if turn is None:
@@ -287,17 +301,21 @@ def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, 
     last_tree[seat] = (res, path)
     zoom_note = "  [zoomed — Backspace out]" if zoom_stack else ""
     forced_note = "  · forced" if len(res.stats) == 1 else ""
-    header = (f"P{seat} — {_compact_action(rec0.move)}{forced_note}{zoom_note}  ◄ active" if is_mover
+    header = (f"P{seat} — {_compact_action(rec0.move)}{forced_note}{zoom_note}   ◄◄ ACTIVE" if is_mover
               else f"P{seat} — reads P{owner}'s turn{zoom_note}")
     _text(surface, med, header, (tx + 4, ty - 42), P_COLORS[seat])
     if rec0.eval_by_seat is not None:                         # this seat's eval of the current position
         _text(surface, small, f"P{seat} eval {rec0.eval_by_seat[seat]:+.2f} (their perspective)",
               (tx + 4, ty - 22), MUTE)
-    if mode == "icicle":
-        return draw_icicle(surface, fonts, res, tree_rect, played_path=path,
-                           zoom_root=(zoom_stack[-1] if zoom_stack else None))
-    return draw_outline(surface, fonts, res, tree_rect, expanded=ost["exp"],
-                        scroll=ost["scroll"], played_move=(path[-1] if path else None))
+    blocks = (draw_icicle(surface, fonts, res, tree_rect, played_path=path,
+                          zoom_root=(zoom_stack[-1] if zoom_stack else None)) if mode == "icicle"
+              else draw_outline(surface, fonts, res, tree_rect, expanded=ost["exp"],
+                                scroll=ost["scroll"], played_move=(path[-1] if path else None)))
+    if is_mover:                                              # box the active panel: a colored border just
+        box = pygame.Rect(*tree_rect).inflate(6, 6)          # OUTSIDE the icicle (so it doesn't clip the
+        pygame.draw.rect(surface, P_COLORS[seat], box, 3)    # top band bar), wrapped in a black outline
+        pygame.draw.rect(surface, (10, 10, 10), box.inflate(4, 4), 2)
+    return blocks
 
 
 def run_review(screen, fonts, traj: List[PlyRecord]) -> None:

@@ -166,9 +166,11 @@ def _draw_tokens(surface, font, tokens, x0: int, y: int, max_x: int, line_h: int
     return y + line_h
 
 
-def _draw_explain(surface, fonts, result, top: int, depth: int = 5):
+def _draw_explain(surface, fonts, result, top: int, depth: int = 5, own_eval=None, seat=None):
     """Render the top-2 principal-variation lines for a search ``result`` at ``top`` (chess-engine
-    style: [eval] then move labels colored by the player who moved). Header/toggle drawn by caller."""
+    style: [eval] then move labels colored by the player who moved). When ``own_eval``/``seat`` are given
+    (the panel's own seat and its own-perspective value), draw a prominent ``P{seat} sees +X.XX`` line
+    first -- correct even when that seat isn't the mover. Header/toggle drawn by caller."""
     small = fonts["small"]
     x = PANEL_X + 12
     max_x = WINDOW[0] - 12
@@ -176,11 +178,15 @@ def _draw_explain(surface, fonts, result, top: int, depth: int = 5):
     _text(surface, small, "P0", (x + 150, top), P_COLORS[0])
     _text(surface, small, "P1", (x + 178, top), P_COLORS[1])
 
+    y = top + 22
+    if own_eval is not None and seat is not None:
+        _text(surface, small, f"P{seat} sees {own_eval:+.2f}", (x, y), P_COLORS.get(seat, INK))
+        y += 20
     lines = result.principal_variations(top=2, depth=depth)
     if not lines:
-        _text(surface, small, "(no lines)", (x, top + 22), MUTE)
+        _text(surface, small, "(no lines)", (x, y), MUTE)
         return
-    y = top + 24
+    y += 2
     for line in lines:
         tokens = [(f"[{line[0].mean_q:+.2f}]", INK)]
         tokens += [(_compact_action(step.move), P_COLORS.get(step.player, INK)) for step in line]
@@ -188,7 +194,8 @@ def _draw_explain(surface, fonts, result, top: int, depth: int = 5):
         y += 4   # gap between lines
 
 
-def _draw_reasoning_section(surface, fonts, top, title, result, shown, placeholder):
+def _draw_reasoning_section(surface, fonts, top, title, result, shown, placeholder,
+                            own_eval=None, seat=None):
     """Header + [hide]/[show] toggle at ``top``; render the PV lines when ``shown``. Returns the toggle
     Rect. Shared by the bot-reasoning and human-hint panels."""
     small = fonts["small"]
@@ -200,7 +207,7 @@ def _draw_reasoning_section(surface, fonts, top, title, result, shown, placehold
     _text(surface, small, "[hide]" if shown else "[show]", (toggle.x + 7, toggle.y + 3))
     if shown:
         if result is not None:
-            _draw_explain(surface, fonts, result, top + 26)
+            _draw_explain(surface, fonts, result, top + 26, own_eval=own_eval, seat=seat)
         else:
             _text(surface, small, placeholder, (px, top + 26), MUTE)
     return toggle
@@ -256,7 +263,8 @@ def _draw_knowledge(surface, fonts, view, knowledge):
 def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                  hover: Optional[int] = None, status: str = "", log: Optional[List[str]] = None,
                  bot_result=None, show_reasoning: bool = True, seed=None,
-                 hint_result=None, show_hint: bool = False, knowledge=None) -> Frame:
+                 hint_result=None, show_hint: bool = False, knowledge=None,
+                 bot_eval=None, hint_eval=None) -> Frame:
     surface.fill(BG)
     big, med, small = fonts["big"], fonts["med"], fonts["small"]
     opp = 1 - view.observer
@@ -363,10 +371,12 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
         _text(surface, small, line, (px, LOG_TOP + 22 + i * 20), INK)
 
     # REASONING (bot) + HINT (you) -- two PV sections, each with its own show/hide toggle.
-    reasoning_toggle = _draw_reasoning_section(surface, fonts, REASON_TOP, "Bot reasoning (MCTS):",
-                                               bot_result, show_reasoning, "(no search yet)")
-    hint_toggle = _draw_reasoning_section(surface, fonts, HINT_TOP, "Hint (MCTS):",
-                                          hint_result, show_hint, "(toggle on your turn for a hint)")
+    reasoning_toggle = _draw_reasoning_section(surface, fonts, REASON_TOP, f"Bot P{opp} read (MCTS):",
+                                               bot_result, show_reasoning, "(no search yet)",
+                                               own_eval=bot_eval, seat=opp)
+    hint_toggle = _draw_reasoning_section(surface, fonts, HINT_TOP, f"Your P{view.observer} read (MCTS):",
+                                          hint_result, show_hint, "(toggle for your read of this position)",
+                                          own_eval=hint_eval, seat=view.observer)
     _draw_knowledge(surface, fonts, view, knowledge)
     return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review)
 

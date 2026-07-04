@@ -18,8 +18,8 @@ from imposterkings.state import GameState  # noqa: E402
 from imposterkings.ui.render import make_fonts  # noqa: E402
 from imposterkings.ui.render import WINDOW  # noqa: E402
 from imposterkings.ui.review import (  # noqa: E402
-    TL_TOP, PlyRecord, _draw_graph, _draw_strip, _headline_card, build_trajectory, played_path,
-    turn_for_seat, turns_of,
+    TL_TOP, PlyRecord, _draw_graph, _draw_strip, _headline_card, annotate_dual_evals, build_trajectory,
+    played_path, turn_for_seat, turns_of,
 )
 from imposterkings.ui.tree_view import (  # noqa: E402
     CARD_COLORS, NEUTRAL, Block, block_at, draw_icicle, draw_outline, draw_tooltip, layout_icicle,
@@ -57,6 +57,15 @@ def test_layout_icicle_partition_visits_and_path():
         assert 0.0 <= b.x and b.x + b.w <= 600.0 + 1e-6
         assert 0.0 <= b.y and b.y + b.h <= 400.0 + 1e-6
         assert b.visits >= 0 and 0.0 <= b.visit_pct <= 100.0 + 1e-6 and b.node is not None
+        assert b.band >= 0 and b.mover in (0, 1)            # turn-band index + mover for separators
+    assert any(b.band == 0 for b in blocks)                 # a first band exists
+    # all blocks in a band share one mover, and a band spans one contiguous y-range (globally aligned)
+    from collections import defaultdict
+    by_band = defaultdict(list)
+    for b in blocks:
+        by_band[b.band].append(b)
+    for band, bs in by_band.items():
+        assert len({b.mover for b in bs}) == 1              # single mover per band
     top = [b for b in blocks if b.y < 1e-6]                 # first band = root's own moves
     assert max(top, key=lambda b: b.w).move == res.best_move
     assert any(b.y > 1e-6 for b in blocks)                  # deeper bands sit below
@@ -148,3 +157,18 @@ def test_build_trajectory_cross_evals_both_seats_every_turn():
             assert abs(eb[rec.seat] - rec.result.root_value()) < 1e-9
     plain = build_trajectory(iters=20, seed=0, cross_eval=False)
     assert all(r.eval_by_seat is None and r.result_by_seat is None for r in plain)  # opt-out leaves unset
+
+
+def test_annotate_dual_evals_fills_a_bare_trajectory_and_reuses():
+    # The live app builds its trajectory without cross-evals, then annotates before opening the review.
+    traj = build_trajectory(iters=20, seed=0, cross_eval=False)
+    assert all(r.eval_by_seat is None for r in traj) and all(r.state is not None for r in traj)
+    n = annotate_dual_evals(traj, 20, np.random.default_rng(0))
+    assert isinstance(n, int) and n > 0                      # searched the bare trajectory's gaps
+    for s, e, owner in turns_of(traj):
+        rec = traj[s]
+        assert rec.eval_by_seat is not None and all(-1.0 <= v <= 1.0 for v in rec.eval_by_seat)
+        rbs = rec.result_by_seat
+        assert rbs is not None and rbs[0].info.observer == 0 and rbs[1].info.observer == 1
+    # a second pass reuses everything already present -> no recomputation
+    assert annotate_dual_evals(traj, 20, np.random.default_rng(0)) == 0

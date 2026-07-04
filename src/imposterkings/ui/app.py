@@ -18,7 +18,7 @@ from ..agents import MCTSAgent, RandomAgent
 from ..explain import format_action
 from ..state import GameState
 from .render import BTN_H, BTN_TOP, PANEL_X, WINDOW, make_fonts, render_frame
-from .review import PlyRecord, run_review
+from .review import PlyRecord, annotate_dual_evals, run_review, _result_eval, _search_from
 
 # Opponent's setup hide/discard are private -- never reveal the card identity in the log.
 _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
@@ -60,9 +60,11 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     bot_seat = 1 - human_seat
     log: deque = deque(maxlen=40)
     show_reasoning, show_hint = True, False
-    hint_agent = MCTSAgent(iterations=iters if hint_iters is None else hint_iters)
-    hint_rng = np.random.default_rng(1234567)     # dedicated so hints don't perturb the game rng
-    hint: dict = {"state": None, "result": None}  # cached hint search, keyed by state identity
+    analysis_iters = iters if hint_iters is None else hint_iters
+    analysis_rng = np.random.default_rng(1234567)   # dedicated so analysis never perturbs the game rng
+    # Per-state dual analysis: BOTH seats' read of the current position (keyed by state identity), so the
+    # two side panels are live every turn -- like ui.review. Each entry is a SearchResult (or None).
+    analysis: dict = {"state": None, 0: None, 1: None}
     knowledge_cache: dict = {"state": None, "val": None}   # [seat -> (has, lacks, level)], per state
     trajectory: list = []                          # per-ply PlyRecord(seat, move, view, result) for review
     game: dict = {}  # holds the resettable per-game state: state, rng, seed, bot
@@ -74,7 +76,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     bot=_make_bot(p1, iters))
         log.clear()
         trajectory.clear()
-        hint["state"], hint["result"] = None, None
+        analysis["state"], analysis[0], analysis[1] = None, None, None
         knowledge_cache["state"], knowledge_cache["val"] = None, None
         pygame.display.set_caption(f"ImposterKings  (seed {s})")
         print(f"ImposterKings  (deck seed {s} -- pass --seed {s} to replay this deal)")
@@ -82,10 +84,15 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     new_game(seed)
 
     def apply_logged(seat, move, result=None):
-        view_before = game["state"].information_set(human_seat)
-        log.append(_describe(seat, view_before, move, human_seat, game["state"]))
-        trajectory.append(PlyRecord(seat, move, game["state"].information_set(seat), result))
-        game["state"] = game["state"].apply(move)
+        st = game["state"]
+        log.append(_describe(seat, st.information_set(human_seat), move, human_seat, st))
+        rec = PlyRecord(seat, move, st.information_set(seat), result, state=st)
+        # Keep the live dual-analysis already computed for this position so the post-game review reuses it
+        # instead of recomputing (it only re-searches seats whose panel was off during play).
+        if analysis["state"] is st and (analysis[0] is not None or analysis[1] is not None):
+            rec.result_by_seat = (analysis[0], analysis[1])
+        trajectory.append(rec)
+        game["state"] = st.apply(move)
 
     running = True
     while running:
@@ -110,11 +117,18 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         else:
             status = "Your move - click an action"
 
-        # Compute the hint once per human decision, and only while it's toggled on.
-        if show_hint and human_turn and game["state"] is not hint["state"]:
-            hint_agent.select_move(view, hint_rng)
-            hint["state"], hint["result"] = game["state"], hint_agent.last_result
-        hint_result = hint["result"] if (show_hint and human_turn) else None
+        # Both seats' read of the CURRENT position, once per state; each gated (and lazily filled when its
+        # toggle flips on) by its panel toggle so cost is opt-in. bot seat -> reasoning, human -> hint.
+        if not state.is_terminal():
+            if game["state"] is not analysis["state"]:
+                analysis["state"], analysis[0], analysis[1] = game["state"], None, None
+            for s in (0, 1):
+                shown = show_reasoning if s == bot_seat else show_hint
+                if shown and analysis[s] is None:
+                    analysis[s] = _search_from(state, s, analysis_iters, analysis_rng)
+        bot_res, hint_res = analysis[bot_seat], analysis[human_seat]
+        bot_eval = _result_eval(bot_res, state, bot_seat) if bot_res is not None else None
+        hint_eval = _result_eval(hint_res, state, human_seat) if hint_res is not None else None
 
         # Hand-knowledge for both seats (recomputed once per state).
         if game["state"] is not knowledge_cache["state"]:
@@ -125,10 +139,11 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             knowledge_cache["state"], knowledge_cache["val"] = game["state"], kn
 
         frame = render_frame(screen, view, fonts, legal, hover=hover, status=status,
-                             log=list(log), bot_result=getattr(bot, "last_result", None),
+                             log=list(log), bot_result=bot_res,
                              show_reasoning=show_reasoning, seed=game["seed"],
-                             hint_result=hint_result, show_hint=show_hint,
-                             knowledge=knowledge_cache["val"])
+                             hint_result=hint_res, show_hint=show_hint,
+                             knowledge=knowledge_cache["val"],
+                             bot_eval=bot_eval, hint_eval=hint_eval)
         pygame.display.flip()
 
         review_requested = False
@@ -150,13 +165,19 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 elif human_turn:
                     for rect, move in frame.buttons:
                         if rect.collidepoint(pos):
-                            hres = hint["result"] if hint["state"] is game["state"] else None
+                            hres = analysis[human_seat] if analysis["state"] is game["state"] else None
                             apply_logged(human_seat, move, hres)
                             break
 
-        # Deferred so the review's own event loop doesn't run mid-iteration of this one.
+        # Deferred so the review's own event loop doesn't run mid-iteration of this one. Fill any per-turn
+        # evals NOT already computed live (e.g. a seat whose panel was off) so the review shows the full
+        # dual-eval graph + dual icicles; turns analyzed live during play are reused, not recomputed.
         if review_requested and trajectory:
-            run_review(screen, fonts, list(trajectory))
+            annotated = list(trajectory)
+            n = annotate_dual_evals(annotated, analysis_iters, np.random.default_rng(7))
+            if n:
+                print(f"computing {n} dual-eval searches for turns not analyzed live during play...")
+            run_review(screen, fonts, annotated)
 
         if (not game["state"].is_terminal()) and game["state"].to_play == bot_seat:
             pygame.time.delay(300)
@@ -178,7 +199,8 @@ def main(argv=None) -> None:
     parser.add_argument("--human-seat", type=int, default=0, choices=[0, 1])
     parser.add_argument("--start", type=int, default=None, choices=[0, 1])
     parser.add_argument("--hint-iters", type=int, default=None,
-                        help="MCTS iterations for the 'Your hint' panel (default: same as --iters)")
+                        help="MCTS iterations for the dual-eval side panels + review analysis "
+                             "(default: same as --iters)")
     args = parser.parse_args(argv)
     run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
         hint_iters=args.hint_iters)
