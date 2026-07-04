@@ -521,6 +521,8 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
 
 
 def main(argv=None) -> None:
+    import time
+
     import pygame
     from .. import budget as budget_mod
 
@@ -538,8 +540,10 @@ def main(argv=None) -> None:
     bud = None if args.p1 == "mcts" else budget_mod.make_budget(args.p1, k=args.k, l=args.l)
     cfg = f"iters={args.iters}" if bud is None else bud.label
     print(f"Generating MCTS-vs-MCTS game ({cfg}, seed={args.seed})...")
+    t0 = time.perf_counter()
     traj = build_trajectory(args.iters, args.seed, args.start, budget=bud)
-    print(f"  {len(traj)} decisions recorded. Opening review window...")
+    dt = time.perf_counter() - t0
+    print(f"  {len(traj)} decisions recorded in {dt:.1f}s. Opening review window...")
 
     pygame.init()
     screen = pygame.display.set_mode(WINDOW)
