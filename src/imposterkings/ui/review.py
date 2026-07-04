@@ -16,12 +16,12 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from .. import cards
-from ..actions import Action, ActionKind
+from ..actions import Action, ActionKind, StepKind
 from ..infoset import InformationSet
 from .render import (BTN, BTN_HOVER, CARD_COLORS, DIVIDER, GOLD, INK, MUTE, P_COLORS, PANEL,
                      WINDOW, _compact_action, _text, make_fonts)
 from . import assets
-from .tree_view import block_at, draw_icicle, draw_outline, draw_tooltip
+from .tree_view import block_at, draw_crown, draw_icicle, draw_outline, draw_tooltip
 
 HEADER_H = 76        # title + ply line + button row
 # Timeline band: one combined eval graph (both players' lines, shared x & y axes) then the card strip.
@@ -47,14 +47,20 @@ class PlyRecord:
     result: object            # Optional[SearchResult] (with .root); None for a forced/no-search move
     state: object = None      # the full pre-move GameState (for the board view)
     eval_by_seat: Optional[Tuple[float, float]] = None  # each seat's own-perspective eval at a turn start
+    result_by_seat: Optional[Tuple[object, object]] = None  # each seat's SearchResult of this turn's position
 
 
-def _position_eval(state, observer: int, iters: int, rng) -> float:
-    """Seat ``observer``'s own-perspective eval of ``state`` (+1 = good for observer). Runs a search from
-    the observer's information set; ``root_value()`` is always the *mover's* perspective, so it is negated
-    when the observer is not the one to move (the game is zero-sum at the leaves)."""
+def _search_from(state, observer: int, iters: int, rng):
+    """Run a search from seat ``observer``'s information set of ``state`` and return the SearchResult
+    (its ``info.observer`` is ``observer``, so the icicle draws it in that seat's perspective)."""
     from ..mcts import SearchConfig, search
-    rv = search(state.information_set(observer), SearchConfig(rng=rng, iterations=iters)).root_value()
+    return search(state.information_set(observer), SearchConfig(rng=rng, iterations=iters))
+
+
+def _result_eval(res, state, observer: int) -> float:
+    """A SearchResult's value from ``observer``'s perspective (+1 = good for observer). ``root_value()`` is
+    the *mover's* perspective, so it is negated when the observer is not to move (zero-sum leaves)."""
+    rv = res.root_value()
     return rv if state.to_play == observer else -rv
 
 
@@ -88,23 +94,39 @@ def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = Non
                 continue
             mover = rec.state.to_play                 # the seat that searched here (== owner except in setup)
             other = 1 - mover
-            mv = rec.result.root_value() if rec.result is not None else _position_eval(rec.state, mover, iters, xrng)
-            ov = _position_eval(rec.state, other, iters, xrng)
-            eb = [0.0, 0.0]
-            eb[mover], eb[other] = mv, ov
+            mover_res = rec.result if rec.result is not None else _search_from(rec.state, mover, iters, xrng)
+            other_res = _search_from(rec.state, other, iters, xrng)   # the opponent's read of this position
+            rbs, eb = [None, None], [0.0, 0.0]
+            rbs[mover], rbs[other] = mover_res, other_res
+            eb[mover] = _result_eval(mover_res, rec.state, mover)
+            eb[other] = _result_eval(other_res, rec.state, other)
+            rec.result_by_seat = (rbs[0], rbs[1])
             rec.eval_by_seat = (eb[0], eb[1])
     return traj
 
 
+_SETUP_KINDS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
+
+
+def _owner_key(rec: PlyRecord) -> int:
+    """Who owns this ply's turn. Normally ``turn_player`` (constant through a whole turn incl. the
+    opponent's reactions). During SETUP there is no real turn order -- ``turn_player`` stays on the
+    starting player while BOTH seats hide/discard -- so attribute setup plies to the actual mover."""
+    pending = getattr(rec.view, "pending", None)
+    if pending and pending[-1].kind in _SETUP_KINDS:
+        return rec.seat
+    return rec.view.turn_player
+
+
 def turns_of(traj: List[PlyRecord]) -> List[Tuple[int, int, int]]:
-    """Group plies into turns: maximal runs of the same ``turn_player`` (constant through a player's
-    whole turn, including the opponent's reactions). Returns ``[(start, end, owner), ...]``."""
+    """Group plies into turns: maximal runs with the same owner (``turn_player`` normally; the mover
+    during setup, which has no real turn order). Returns ``[(start, end, owner), ...]``."""
     out: List[Tuple[int, int, int]] = []
     i = 0
     while i < len(traj):
-        owner = traj[i].view.turn_player
+        owner = _owner_key(traj[i])
         j = i
-        while j + 1 < len(traj) and traj[j + 1].view.turn_player == owner:
+        while j + 1 < len(traj) and _owner_key(traj[j + 1]) == owner:
             j += 1
         out.append((i, j, owner))
         i = j + 1
@@ -223,60 +245,58 @@ def _draw_strip(surface, fonts, traj, turns, cursor):
                 surface.blit(assets.card_surface(card, (cw, ch)), rect)
             except Exception:                          # missing art -> solid card-colored tile
                 pygame.draw.rect(surface, CARD_COLORS.get(cards.card_name(card), MUTE), rect)
-        elif _turn_is_flip(traj, s, e):                # king flip -> white cell with the crown glyph
+        elif _turn_is_flip(traj, s, e):                # king flip -> white cell + upside-down crown
             pygame.draw.rect(surface, (245, 245, 245), rect)
-            try:
-                gs = int(min(cw, ch) * 0.8)
-                glyph = assets.image("Crown.jpg", (gs, gs))
-                surface.blit(glyph, (rect.centerx - gs // 2, rect.centery - gs // 2))
-            except Exception:
-                pass
-        else:                                          # setup hide/discard -> short text chip
-            pygame.draw.rect(surface, (40, 42, 50), rect)
-            old = surface.get_clip()
-            surface.set_clip(rect)
-            _text(surface, small, _compact_action(traj[s].move), (rect.x + 2, rect.y + 2), INK)
-            surface.set_clip(old)
-        pygame.draw.rect(surface, GOLD if is_cur else P_COLORS[owner], rect, 3 if is_cur else 2)
+            draw_crown(surface, rect, flipped=True)
+        else:                                          # first play (setup hide/discard) -> white + upright crown
+            pygame.draw.rect(surface, (245, 245, 245), rect)
+            draw_crown(surface, rect, flipped=False)
+        pygame.draw.rect(surface, P_COLORS[owner], rect, 2)   # always the player's color (blue P0 / orange P1)
+        if is_cur:                                            # selection: white ring (not gold, which reads as P1)
+            pygame.draw.rect(surface, INK, rect.inflate(6, 6), 2)
         hits.append((rect, s))
     return hits
 
 
-def _draw_panel(surface, fonts, traj, seat, tb, cursor, tree_rect, mode, ost, zoom_stack, last_tree, active):
-    """Draw one seat's panel for its latest owned turn: the turn-root tree with the played path
-    highlighted. Persists the previous tree (dimmed) on a forced/no-search turn. Returns icicle blocks."""
+def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, zoom_stack, last_tree):
+    """Draw ``seat``'s read of the CURRENT turn's position. Both panels show the same turn: the mover's
+    real search on its side, the opponent's search of the same state on the other -- so P1's tree updates
+    during P0's turns too. The actually-played line is highlighted in both. Returns icicle blocks."""
     med, small = fonts["med"], fonts["small"]
     tx, ty = tree_rect[0], tree_rect[1]
-    if tb is None:
-        _text(surface, med, f"P{seat}: (no turn yet)", (tx + 4, ty - 24), MUTE)
+    if turn is None:
+        _text(surface, med, f"P{seat}: (no turn yet)", (tx + 4, ty - 42), MUTE)
         return []
-    start, end = tb
+    start, end, owner = turn
     rec0 = traj[start]
+    is_mover = seat == owner
     path = played_path(traj, start, min(cursor, end))
-    tag = "  ◄ active" if active == seat else ""
-    if rec0.result is None:                                   # no search at all -> persist previous, dimmed
-        _text(surface, med, f"P{seat} — forced move: {_compact_action(traj[min(cursor, end)].move)}{tag}",
-              (tx + 4, ty - 24), MUTE)
+    # this seat's SearchResult of the current position (mover reuses its own; opponent uses the cross search)
+    res = (rec0.result_by_seat[seat] if rec0.result_by_seat is not None
+           else (rec0.result if is_mover else None))
+    if res is None:                                           # this seat has no search here -> persist dimmed
+        head = (f"P{seat} — forced move: {_compact_action(traj[min(cursor, end)].move)}" if is_mover
+                else f"P{seat} — (no read available)")
+        _text(surface, med, head, (tx + 4, ty - 42), MUTE)
         prev = last_tree[seat]
         if prev is not None and mode == "icicle":
             draw_icicle(surface, fonts, prev[0], tree_rect, played_path=prev[1], dim=True)
         else:
-            _text(surface, small, "(forced move — no search)", (tx + 4, ty + 6), MUTE)
+            _text(surface, small, "(no search)", (tx + 4, ty + 6), MUTE)
         return []
-    last_tree[seat] = (rec0.result, path)
+    last_tree[seat] = (res, path)
     zoom_note = "  [zoomed — Backspace out]" if zoom_stack else ""
-    # A single root action means the turn was forced; the search still yields a real position eval.
-    forced_note = f"  · forced (eval {rec0.result.root_value():+.2f})" if len(rec0.result.stats) == 1 else ""
-    _text(surface, med, f"P{seat} — {_compact_action(rec0.move)}{forced_note}{zoom_note}{tag}",
-          (tx + 4, ty - 24), P_COLORS[seat])
-    if rec0.eval_by_seat is not None:                          # the opponent's read of this same position
-        opp = 1 - seat
-        _text(surface, small, f"P{opp} reads this position {rec0.eval_by_seat[opp]:+.2f} (their perspective)",
-              (tx + 4, ty - 6), MUTE)
+    forced_note = "  · forced" if len(res.stats) == 1 else ""
+    header = (f"P{seat} — {_compact_action(rec0.move)}{forced_note}{zoom_note}  ◄ active" if is_mover
+              else f"P{seat} — reads P{owner}'s turn{zoom_note}")
+    _text(surface, med, header, (tx + 4, ty - 42), P_COLORS[seat])
+    if rec0.eval_by_seat is not None:                         # this seat's eval of the current position
+        _text(surface, small, f"P{seat} eval {rec0.eval_by_seat[seat]:+.2f} (their perspective)",
+              (tx + 4, ty - 22), MUTE)
     if mode == "icicle":
-        return draw_icicle(surface, fonts, rec0.result, tree_rect, played_path=path,
+        return draw_icicle(surface, fonts, res, tree_rect, played_path=path,
                            zoom_root=(zoom_stack[-1] if zoom_stack else None))
-    return draw_outline(surface, fonts, rec0.result, tree_rect, expanded=ost["exp"],
+    return draw_outline(surface, fonts, res, tree_rect, expanded=ost["exp"],
                         scroll=ost["scroll"], played_move=(path[-1] if path else None))
 
 
@@ -299,10 +319,12 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
         screen.fill(PANEL)
         mouse = pygame.mouse.get_pos()
         rec = traj[cursor]
-        active = rec.view.turn_player
+        pend = getattr(rec.view, "pending", None)
+        is_setup = bool(pend) and pend[-1].kind in _SETUP_KINDS
+        turn_label = "Setup" if is_setup else f"turn P{turns[_current_turn(turns, cursor)][2]}"
 
         _text(screen, med, "Post-game review  (MCTS vs MCTS)", (12, 6), INK)
-        _text(screen, small, f"Ply {cursor + 1}/{len(traj)}  —  turn P{active}  ·  P{rec.seat} played "
+        _text(screen, small, f"Ply {cursor + 1}/{len(traj)}  —  {turn_label}  ·  P{rec.seat} played "
                              f"{_compact_action(rec.move)}", (12, 32), GOLD)
         specs = [("prev", "◄ Prev", 12), ("next", "Next ►", 102), ("outline", "Outline", 210),
                  ("icicle", "Icicle", 300), ("zout", "⬆ Zoom out", 390)]
@@ -318,14 +340,15 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
         ptop = STRIP_TOP + STRIP_H + 10
         pygame.draw.line(screen, DIVIDER, (mid, ptop - 4), (mid, H))
 
-        top = ptop + 26
+        top = ptop + 44                         # room for the panel header + eval subtitle above the icicle
         lrect = (6, top, mid - 12, H - top - 6)
         rrect = (mid + 6, top, W - mid - 12, H - top - 6)
+        cur_turn = turns[_current_turn(turns, cursor)]        # both panels show the SAME (current) turn
         blocks = {
-            0: _draw_panel(screen, fonts, traj, 0, turn_for_seat(turns, 0, cursor), cursor, lrect, mode,
-                           ost[0], zoom[0], last_tree, active),
-            1: _draw_panel(screen, fonts, traj, 1, turn_for_seat(turns, 1, cursor), cursor, rrect, mode,
-                           ost[1], zoom[1], last_tree, active),
+            0: _draw_panel(screen, fonts, traj, 0, cur_turn, cursor, lrect, mode,
+                           ost[0], zoom[0], last_tree),
+            1: _draw_panel(screen, fonts, traj, 1, cur_turn, cursor, rrect, mode,
+                           ost[1], zoom[1], last_tree),
         }
         if mode == "icicle":                    # hover tooltip
             hseat = 0 if mouse[0] < mid else 1

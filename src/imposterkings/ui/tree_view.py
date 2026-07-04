@@ -15,7 +15,25 @@ import pygame
 
 from ..actions import Action, ActionKind
 from ..cards import CARD_DEFS, card_name
+from . import assets
 from .render import CARD_COLORS, DIVIDER, GOLD, INK, MUTE, NEUTRAL, _compact_action, _text
+
+WHITE = (245, 245, 245)     # flip-king / setup cells (crown on white)
+
+
+def draw_crown(surface, rect, *, flipped: bool = False) -> None:
+    """Blit the Crown glyph centered in ``rect``; ``flipped`` = vertically-inverted (a used/flipped king).
+    No-op if the box is too small to fit the glyph or the asset is missing."""
+    gs = int(min(rect.w, rect.h) * 0.82)
+    if gs < 10:
+        return
+    try:
+        img = assets.image("Crown.jpg", (gs, gs))
+        if flipped:
+            img = pygame.transform.flip(img, False, True)
+        surface.blit(img, (rect.centerx - gs // 2, rect.centery - gs // 2))
+    except Exception:
+        pass
 
 RGB = Tuple[int, int, int]
 
@@ -29,8 +47,9 @@ for _d in CARD_DEFS:
 
 
 def move_color(move: Optional[Action]) -> RGB:
-    """Color a move by the card it concerns: the played/hidden/given card, the GUESSED card's color,
-    or (for a Mystic mute) a representative card of that value. Neutral grey for abilities/reactions."""
+    """Color a move by the card it concerns: the played/hidden/given card, the GUESSED card's color, a
+    Mystic mute's representative card, or the revealed REACTION card (King's Hand / Assassin). Neutral
+    grey for the payload-free abilities/declines."""
     if move is None:
         return NEUTRAL
     if move.kind in _CARD_KINDS and move.card is not None:
@@ -39,6 +58,10 @@ def move_color(move: Optional[Action]) -> RGB:
         return CARD_COLORS.get(move.name, NEUTRAL)
     if move.kind == ActionKind.CHOOSE_NUMBER and move.number is not None:
         return _VALUE_COLOR.get(move.number, NEUTRAL)
+    if move.kind == ActionKind.REVEAL_KINGSHAND:
+        return CARD_COLORS.get("KingsHand", NEUTRAL)
+    if move.kind == ActionKind.REVEAL_ASSASSIN:
+        return CARD_COLORS.get("Assassin", NEUTRAL)
     return NEUTRAL
 
 
@@ -166,14 +189,18 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
     line_h = small.get_linesize()
     for b in blocks:
         r = pygame.Rect(int(b.x), int(b.y), max(1, int(b.w) - 1), max(1, int(b.h) - 1))
-        pygame.draw.rect(surface, b.color, r)
-        if b.w > _MIN_LABEL_W and b.h >= 11:
-            ink = _ink_for(b.color)
-            surface.blit(small.render(_truncate(small, b.label, int(b.w) - 6), True, ink),
-                         (int(b.x) + 3, int(b.y) + 1))
-            if b.h >= 2 * line_h:                      # room for a second line -> eval below the action
-                surface.blit(small.render(f"{b.persp_eval:+.2f}", True, ink),
-                             (int(b.x) + 3, int(b.y) + 1 + line_h))
+        if b.move is not None and b.move.kind == ActionKind.FLIP_KING:
+            pygame.draw.rect(surface, WHITE, r)        # king flip -> white box + upside-down crown glyph
+            draw_crown(surface, r, flipped=True)
+        else:
+            pygame.draw.rect(surface, b.color, r)
+            if b.w > _MIN_LABEL_W and b.h >= 11:
+                ink = _ink_for(b.color)
+                surface.blit(small.render(_truncate(small, b.label, int(b.w) - 6), True, ink),
+                             (int(b.x) + 3, int(b.y) + 1))
+                if b.h >= 2 * line_h:                  # room for a second line -> eval below the action
+                    surface.blit(small.render(f"{b.persp_eval:+.2f}", True, ink),
+                                 (int(b.x) + 3, int(b.y) + 1 + line_h))
         if b.on_path:
             pygame.draw.rect(surface, GOLD, r, 2)
     current = max((b for b in blocks if b.on_path), key=lambda b: b.y, default=None)

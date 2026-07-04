@@ -42,6 +42,10 @@ def test_move_color_card_guess_and_number():
     assert move_color(Action(ActionKind.GUESS_CARD, name="Queen")) == CARD_COLORS["Queen"]
     assert move_color(Action(ActionKind.CHOOSE_NUMBER, number=7)) in (CARD_COLORS["Warlord"],
                                                                       CARD_COLORS["Mystic"])
+    # revealed reactions keep their card colors; a bare decline stays neutral
+    assert move_color(Action(ActionKind.REVEAL_KINGSHAND)) == CARD_COLORS["KingsHand"]
+    assert move_color(Action(ActionKind.REVEAL_ASSASSIN)) == CARD_COLORS["Assassin"]
+    assert move_color(Action(ActionKind.DECLINE_REACTION)) == NEUTRAL
 
 
 def test_layout_icicle_partition_visits_and_path():
@@ -137,7 +141,10 @@ def test_build_trajectory_cross_evals_both_seats_every_turn():
         rec = traj[s]
         eb = rec.eval_by_seat                               # every turn start carries BOTH seats' reads
         assert eb is not None and len(eb) == 2 and all(-1.0 <= v <= 1.0 for v in eb)
+        rbs = rec.result_by_seat                            # ...and BOTH seats' retained search trees
+        assert rbs is not None and rbs[0] is not None and rbs[1] is not None
+        assert rbs[0].info.observer == 0 and rbs[1].info.observer == 1
         if rec.result is not None:                          # mover side reuses that seat's own search
             assert abs(eb[rec.seat] - rec.result.root_value()) < 1e-9
     plain = build_trajectory(iters=20, seed=0, cross_eval=False)
-    assert all(r.eval_by_seat is None for r in plain)       # opt-out leaves it unset
+    assert all(r.eval_by_seat is None and r.result_by_seat is None for r in plain)  # opt-out leaves unset
