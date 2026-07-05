@@ -66,6 +66,12 @@ def move_color(move: Optional[Action]) -> RGB:
     return NEUTRAL
 
 
+def _stack_target_label(card_id: int) -> str:
+    """Label a resolved stack-target move by the card it targets, e.g. ``target@Warlord`` -- the
+    ``target@`` prefix distinguishes targeting a stack card (Fool/Sentry/Soldier) from PLAYING it."""
+    return f"target@{card_name(card_id)}"
+
+
 def _ink_for(bg: RGB) -> RGB:
     """Readable text color for a filled block (dark ink on light fills, light on dark)."""
     lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
@@ -135,7 +141,8 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
                   top_k: int = 6, max_turns: int = 6, band_gap: float = 0.0,
                   on_path_ids: Set[int] = frozenset(),
                   graft_ids: Set[int] = frozenset(), renormalise: bool = False,
-                  include_root: bool = False) -> List[Block]:
+                  include_root: bool = False,
+                  stack_cards: Optional[Dict[int, int]] = None) -> List[Block]:
     """Ply-banded icicle layout for ``root``'s subtree within ``rect`` = (x, y, w, h).
 
     x: recursive visit partition (child width = parent width * child.n / parent.n, top-``top_k`` kids).
@@ -208,8 +215,12 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
         y = band_pixel_top[ti] + ld * row_h
         mq = node.w / node.n if node.n else 0.0
         persp = mq if node.player_just_moved == observer else -mq
-        blocks.append(Block(x, y, w, row_h, _compact_action(node.incoming_move), persp,
-                            move_color(node.incoming_move), id(node) in on_path_ids,
+        cid = stack_cards.get(id(node)) if stack_cards else None     # resolved stack target -> real card
+        if cid is not None:
+            label, color = _stack_target_label(cid), CARD_COLORS.get(card_name(cid), NEUTRAL)
+        else:
+            label, color = _compact_action(node.incoming_move), move_color(node.incoming_move)
+        blocks.append(Block(x, y, w, row_h, label, persp, color, id(node) in on_path_ids,
                             node.incoming_move, node, node.n, 100.0 * node.n / root_n,
                             ti, node.player_just_moved if node.player_just_moved is not None else 0))
     return blocks
@@ -231,7 +242,8 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
                 played_path=None, zoom_root=None, dim: bool = False,
                 top_k: int = 6, max_turns: int = 6,
                 dim_ids: Set[int] = frozenset(), graft_ids: Set[int] = frozenset(),
-                band_sims: Optional[int] = None, renormalise: bool = False) -> List[Block]:
+                band_sims: Optional[int] = None, renormalise: bool = False,
+                stack_cards: Optional[Dict[int, int]] = None) -> List[Block]:
     """Draw the ply-banded icicle for a SearchResult into ``rect``; returns the laid-out blocks.
 
     ``played_path`` (moves) highlights the played line (trail + the current, deepest box). ``zoom_root``
@@ -253,7 +265,8 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
     bh = bf.get_linesize()
     blocks = layout_icicle(layout_root, rect, result.info.observer,
                            top_k=top_k, max_turns=max_turns, band_gap=bh, on_path_ids=on_ids,
-                           graft_ids=graft_ids, renormalise=renormalise, include_root=zoomed)
+                           graft_ids=graft_ids, renormalise=renormalise, include_root=zoomed,
+                           stack_cards=stack_cards)
     line_h = small.get_linesize()
     for b in blocks:
         r = pygame.Rect(int(b.x), int(b.y), max(1, int(b.w) - 1), max(1, int(b.h) - 1))

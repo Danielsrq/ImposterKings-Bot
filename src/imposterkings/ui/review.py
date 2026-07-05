@@ -358,6 +358,47 @@ def _grafted_tree(traj, seat: int, start: int, end: int, cursor: int, res0, *, r
     return _GraftedResult(syn_root, res0.info), graft_ids, dim_ids, tip_sims
 
 
+def _stack_target_cards(root, base_state, *, top_k: int = 6, max_turns: int = 6) -> dict:
+    """Map icicle node ``id`` -> the real card its ``CHOOSE_STACK_TARGET`` move (Fool/Sentry/Soldier)
+    takes from the stack, for the whole SEARCH tree (not just the played line).
+
+    The stack is public, so we replay the search tree from the true turn-start state ``base_state``
+    (``traj[start].state``) through the engine, tracking the concrete ``GameState`` down each branch; a
+    stack-target node resolves against its parent state's stack. Only LEGAL moves are followed, so
+    determinization-only opponent branches (a reveal the opponent can't actually make) are skipped rather
+    than replayed against a false state. Bounded by the same ``top_k``/``max_turns`` the icicle draws.
+    Keyed by node id, so grafted clones (whose spine states match the true line) resolve too."""
+    out: dict = {}
+    if root is None or base_state is None:
+        return out
+    stack = [(root, base_state, 0)]                  # (node, concrete GameState, turn-band index)
+    while stack:
+        node, st, ti = stack.pop()
+        board = getattr(st, "stack", None)
+        legal = None
+        for ch in sorted(node.children.values(), key=lambda c: c.n, reverse=True)[:top_k]:
+            m = ch.incoming_move
+            if m is None:
+                continue
+            if (m.kind == ActionKind.CHOOSE_STACK_TARGET and board is not None
+                    and m.target is not None and 0 <= m.target < len(board)):
+                out[id(ch)] = board[m.target].card
+            ct = ti if ch.player_just_moved == node.player_just_moved else ti + 1
+            if ct >= max_turns:
+                continue
+            if legal is None:                        # resolve legality once per node (against the TRUE state)
+                try:
+                    legal = set(st.legal_moves())
+                except Exception:
+                    legal = set()
+            if m in legal:
+                try:
+                    stack.append((ch, st.apply(m), ct))
+                except Exception:
+                    pass
+    return out
+
+
 def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, zoom_stack, last_tree,
                 renorm=False):
     """Draw ``seat``'s read of the CURRENT turn's position. Both panels show the same turn: the mover's
@@ -399,13 +440,17 @@ def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, 
         zoom_root = zoom_stack[-1] if zoom_stack else None
         g = _grafted_tree(traj, seat, start, end, cursor, res,   # step into the turn -> authoritative sub-bands
                           renormalise=renorm)
+        draw_res = g[0] if g is not None else res
+        # @N -> real card: replay the search tree from the true turn-start state (stack is public)
+        stack_cards = _stack_target_cards(draw_res.root, getattr(traj[start], "state", None))
         if g is not None:
             gres, graft_ids, dim_ids, tip_sims = g
             blocks = draw_icicle(surface, fonts, gres, tree_rect, played_path=path, zoom_root=zoom_root,
                                  graft_ids=graft_ids, dim_ids=dim_ids, band_sims=tip_sims,
-                                 renormalise=renorm)
+                                 renormalise=renorm, stack_cards=stack_cards)
         else:
-            blocks = draw_icicle(surface, fonts, res, tree_rect, played_path=path, zoom_root=zoom_root)
+            blocks = draw_icicle(surface, fonts, res, tree_rect, played_path=path, zoom_root=zoom_root,
+                                 stack_cards=stack_cards)
     else:
         blocks = draw_outline(surface, fonts, res, tree_rect, expanded=ost["exp"],
                               scroll=ost["scroll"], played_move=(path[-1] if path else None))

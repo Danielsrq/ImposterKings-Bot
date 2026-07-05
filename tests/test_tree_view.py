@@ -13,17 +13,17 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 from imposterkings.actions import Action, ActionKind, StepKind  # noqa: E402
 from imposterkings.cards import card_name  # noqa: E402
-from imposterkings.mcts import SearchConfig, search  # noqa: E402
-from imposterkings.state import GameState  # noqa: E402
+from imposterkings.mcts import Node, SearchConfig, search  # noqa: E402
+from imposterkings.state import GameState, StackCard  # noqa: E402
 from imposterkings.ui.render import make_fonts  # noqa: E402
 from imposterkings.ui.render import WINDOW  # noqa: E402
 from imposterkings.ui.review import (  # noqa: E402
-    TL_TOP, PlyRecord, _draw_graph, _draw_strip, _grafted_tree, _headline_card, annotate_dual_evals,
-    build_trajectory, played_path, turn_for_seat, turns_of,
+    TL_TOP, PlyRecord, _draw_graph, _draw_strip, _grafted_tree, _headline_card, _stack_target_cards,
+    annotate_dual_evals, build_trajectory, played_path, turn_for_seat, turns_of,
 )
 from imposterkings.ui.tree_view import (  # noqa: E402
     CARD_COLORS, NEUTRAL, Block, block_at, draw_icicle, draw_outline, draw_tooltip, graft_node,
-    layout_icicle, move_color, path_node_ids,
+    layout_icicle, move_color, path_node_ids, _stack_target_label,
 )
 
 
@@ -344,3 +344,33 @@ def b_node_children(gres, node_id):
             return bool(n.children)
         stack.extend(n.children.values())
     return False
+
+
+def test_stack_target_cards_resolves_options_against_state_stack():
+    # A stack-target decision node: every option resolves against the parent state's (public) stack.
+    root = Node(None, None, 0)
+    ca = Node(root, Action(ActionKind.CHOOSE_STACK_TARGET, target=0), 0)
+    cb = Node(root, Action(ActionKind.CHOOSE_STACK_TARGET, target=1), 0)
+    root.children = {ca.incoming_move: ca, cb.incoming_move: cb}
+    st = types.SimpleNamespace(stack=(StackCard(card=5), StackCard(card=9)))    # stack ids at index 0,1
+    out = _stack_target_cards(root, st)                          # (leaves need no legal_moves/apply)
+    assert out == {id(ca): 5, id(cb): 9}                        # @0 -> card 5, @1 -> card 9 (one stack)
+    assert _stack_target_cards(root, None) == {}                # no base state -> no-op
+    assert _stack_target_cards(None, st) == {}                  # no tree -> no-op
+
+
+def test_draw_icicle_stack_cards_overrides_label_and_color():
+    pygame.display.init()
+    screen = pygame.display.set_mode((800, 600))
+    fonts = make_fonts()
+    res = _searched()
+    child = next(iter(res.root.children.values()))
+    cid = 5                                                     # pretend this node took card id 5
+    blocks = draw_icicle(screen, fonts, res, (0, 0, 800, 400), stack_cards={id(child): cid})
+    b = next(b for b in blocks if b.node is child)
+    assert b.label == _stack_target_label(cid)                 # e.g. "Soldier(5)", not "target@N"
+    assert b.color == CARD_COLORS.get(card_name(cid), NEUTRAL)  # coloured by the resolved card
+    # without the override the same node keeps its normal move label
+    plain = draw_icicle(screen, fonts, res, (0, 0, 800, 400))
+    assert next(x for x in plain if x.node is child).label != _stack_target_label(cid)
+    pygame.display.quit()
