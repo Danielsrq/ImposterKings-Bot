@@ -30,7 +30,10 @@ train/val split is **by game** (rows within a game are correlated).
 | `features.py` | no | `encode(view, action) -> float32[FEATURE_DIM=216]` — the shared featurizer (info-set based; bag-of-located-cards + globals + action). `feature_names()` for interpretability. |
 | `dataset.py`  | no | replay corpus → `.npz` (`X`, `y`=q, `w`=visit_share, `z`, `game_id`, `decision_id`, `is_chosen`) + `.meta.json`. |
 | `mlp.py`      | yes | `MLP(in_dim, hidden_dims, dropout)` — any shape (`[16]`, `[16,16]`, `[32,32,64]`, `[]`=linear); `Tanh` output bounds to `q`'s [-1,1]. |
-| `train.py`    | yes | game-split, weighted-MSE training w/ early stopping, the `--sweep`, and metrics; saves `mlp_<arch>.pt` + `sweep_results.csv` to `--out-dir` (default `models/`). |
+| `train.py`    | yes | game-split, weighted-MSE training w/ early stopping, the `--sweep`, and metrics; saves `mlp_<arch>.pt` (a checkpoint) + `sweep_results.csv` to `--out-dir` (default `models/`). |
+| `checkpoint.py` | yes | `save(path, model, meta)` / `load(path) -> (MLP, meta)` — one self-describing checkpoint format for train, agent, and UI. |
+| `agent.py`    | yes | `NNPolicy` — the reusable eval-move-picker (`evaluate`/`best_move`, `from_checkpoint`); `NNAgent` — a thin `Agent`-protocol wrapper (greedy over predicted `q`). Also seats a checkpoint as the `ui.app` bot via `--nn`. |
+| `benchmark.py` | yes | win-rate of a checkpoint vs parameterizable MCTS opponents (`fixed<N>` / `hybrid-k<k>-l<l>`), mirrored + paired seeds. |
 
 ## Metrics
 
@@ -44,6 +47,19 @@ Reference run (k20l3, 2000 games ≈ 240k rows): all archs beat the 0.26 baselin
 single-layer — consistent with the small, largely combinatorial state (the relational structure is what
 the future attention model is meant to capture; both share `features.py`).
 
+## Play & benchmark
+
+```bash
+# win-rate of a checkpoint vs MCTS opponents (sanity: ~parity vs k20, then N=500, k=30)
+python -m imposterkings.machine_learning.benchmark --model models/mlp_32.pt \
+    --opponent hybrid-k20-l3 fixed500 hybrid-k30-l3 --deals 100 --workers 10
+# play a human vs the NN bot live
+python -m imposterkings.ui.app --nn models/mlp_32.pt
+```
+
+Note: greedy-over-learned-`q` is typically weaker than the MCTS that generated the targets (~50% top-1
+agreement), so ~50-50 vs k20 is the optimistic ceiling; the benchmark quantifies the distillation gap.
+
 ## Deferred
-MLPAgent (greedy over predicted `q`) + win-rate benchmark vs MCTS; the attention model (token adapter of
-the same featurizer); target blends and belief features.
+The attention model (token adapter of the same `features.py`); target blends (`λ·z+(1−λ)·q`) and belief
+features; NN as a search prior / eval-head rather than a standalone greedy policy.

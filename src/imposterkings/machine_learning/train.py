@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from .checkpoint import save as save_checkpoint
 from .mlp import MLP
 
 
@@ -52,20 +53,22 @@ def ranking_metrics(pred, y, did, chosen) -> Dict[str, float]:
     groups: Dict[int, List[int]] = defaultdict(list)
     for i, d in enumerate(did):
         groups[int(d)].append(i)
-    n = top_q = top_ch = sp_n = 0
+    n = top_q = top_ch = rec2 = sp_n = 0
     sp_sum = 0.0
     for idxs in groups.values():
         idxs = np.asarray(idxs)
         p, yy, ch = pred[idxs], y[idxs], chosen[idxs]
         amp = int(np.argmax(p))
-        top_q += int(amp == int(np.argmax(yy)))
+        dbest = int(np.argmax(yy))
+        top_q += int(amp == dbest)
         top_ch += int(ch[amp] == 1)
+        rec2 += int(dbest in np.argsort(-p)[:2])     # true-best move is in the model's top-2 (trivial if n<=2)
         if len(idxs) > 1:
             rp, ry = np.argsort(np.argsort(p)), np.argsort(np.argsort(yy))
             if rp.std() > 0 and ry.std() > 0:
                 sp_sum += float(np.corrcoef(rp, ry)[0, 1]); sp_n += 1
         n += 1
-    return {"top1_bestq": top_q / n, "top1_chosen": top_ch / n,
+    return {"top1_bestq": top_q / n, "top1_chosen": top_ch / n, "recall2": rec2 / n,
             "spearman": sp_sum / sp_n if sp_n else float("nan"), "n_decisions": n}
 
 
@@ -104,10 +107,12 @@ def train_one(data: Dict[str, np.ndarray], tr, va, hidden: Sequence[int], hp: Di
 
     with torch.no_grad():
         pv = model(Xva).squeeze(-1).numpy()
-    yv = yva.numpy()
-    baseline = float(np.mean((yv - ytr.numpy().mean()) ** 2))       # constant-mean predictor
+        pt = model(Xtr).squeeze(-1).numpy()
+    yv, yt = yva.numpy(), ytr.numpy()
+    train_mse = float(np.mean((pt - yt) ** 2))                      # low train + high val => overfit
+    baseline = float(np.mean((yv - yt.mean()) ** 2))               # constant-mean predictor
     rank = ranking_metrics(pv, yv, data["decision_id"][vai.numpy()], data["is_chosen"][vai.numpy()])
-    return {"arch": hidden, "params": model.param_count(), "val_mse": best_val,
+    return {"arch": hidden, "params": model.param_count(), "train_mse": train_mse, "val_mse": best_val,
             "val_mae": float(np.mean(np.abs(pv - yv))), "baseline_mse": baseline,
             "epochs": epochs_run, "seconds": seconds, "model": model, **rank}
 
@@ -137,22 +142,22 @@ def main(argv=None) -> None:
           f"train {int(tr.sum())} / val {int(va.sum())} rows; target=q\n")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    hdr = f"  {'arch':>10} {'params':>7} {'ep':>3} {'secs':>5} {'val_mse':>8} {'baseMSE':>8} " \
-          f"{'val_mae':>8} {'top1_q':>7} {'top1_pl':>7} {'spear':>6}"
+    hdr = f"  {'arch':>10} {'params':>7} {'ep':>3} {'secs':>5} {'trn_mse':>8} {'val_mse':>8} " \
+          f"{'baseMSE':>8} {'gap':>6} {'top1_q':>7} {'rec@2':>6} {'spear':>6}"
     print(hdr)
     rows = []
     for arch in parse_archs(args.sweep):
         r = train_one(data, tr, va, arch, hp)
         print(f"  {_arch_str(arch):>10} {r['params']:>7} {r['epochs']:>3} {r['seconds']:>5.1f} "
-              f"{r['val_mse']:>8.4f} {r['baseline_mse']:>8.4f} {r['val_mae']:>8.4f} "
-              f"{r['top1_bestq']*100:>6.1f}% {r['top1_chosen']*100:>6.1f}% {r['spearman']:>6.3f}")
-        torch.save({"arch": arch, "feature_dim": int(data["X"].shape[1]), "target": "q",
-                    "state_dict": r.pop("model").state_dict(),
-                    "metrics": {k: r[k] for k in ("val_mse", "val_mae", "top1_bestq", "top1_chosen", "spearman")}},
-                   os.path.join(args.out_dir, f"mlp_{_arch_str(arch)}.pt"))
+              f"{r['train_mse']:>8.4f} {r['val_mse']:>8.4f} {r['baseline_mse']:>8.4f} "
+              f"{r['val_mse']-r['train_mse']:>6.4f} {r['top1_bestq']*100:>6.1f}% "
+              f"{r['recall2']*100:>5.1f}% {r['spearman']:>6.3f}")
+        _METRICS = ("train_mse", "val_mse", "val_mae", "top1_bestq", "top1_chosen", "recall2", "spearman")
+        save_checkpoint(os.path.join(args.out_dir, f"mlp_{_arch_str(arch)}.pt"), r.pop("model"),
+                        meta={"target": "q", "npz": args.npz, "metrics": {k: r[k] for k in _METRICS}})
         rows.append({"arch": _arch_str(arch), **{k: r[k] for k in
-                     ("params", "epochs", "seconds", "val_mse", "baseline_mse", "val_mae",
-                      "top1_bestq", "top1_chosen", "spearman")}})
+                     ("params", "epochs", "seconds", "train_mse", "val_mse", "baseline_mse", "val_mae",
+                      "top1_bestq", "top1_chosen", "recall2", "spearman")}})
 
     csv_path = os.path.join(args.out_dir, "sweep_results.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:

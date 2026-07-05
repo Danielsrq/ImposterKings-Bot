@@ -35,7 +35,9 @@ def _engine_budget(engine: dict):
     return budget_mod.fixed(engine["N"])   # "mcts": fixed N (l/k unused)
 
 
-def _make_bot(random_bot: bool, engine: dict):
+def _make_bot(random_bot: bool, engine: dict, nn_agent=None):
+    if nn_agent is not None:                          # a loaded NN checkpoint takes the bot seat
+        return nn_agent
     return RandomAgent() if random_bot else MCTSAgent(budget=_engine_budget(engine))
 
 
@@ -61,8 +63,14 @@ def _describe(seat: int, view, move, human_seat: int, state) -> str:
 
 
 def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, start=None,
-        k: int = 100, l: int = 3, setup: bool = False) -> None:
+        k: int = 100, l: int = 3, setup: bool = False, nn: str = None) -> None:
     import pygame  # local import so the engine/tests never require pygame
+
+    nn_agent = None
+    if nn:                                          # lazy import so torch stays optional for normal play
+        from ..machine_learning.agent import NNAgent
+        nn_agent = NNAgent.from_checkpoint(nn)
+        print(f"NN bot loaded from {nn}")
 
     pygame.init()
     screen = pygame.display.set_mode(WINDOW)
@@ -90,14 +98,14 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         """Rebuild the budget + bot from ``engine`` and re-analyze the current position (live retune)."""
         nonlocal engine_budget
         engine_budget = _engine_budget(engine)
-        game["bot"] = _make_bot(random_bot, engine)
+        game["bot"] = _make_bot(random_bot, engine, nn_agent)
         analysis["state"], analysis[0], analysis[1] = None, None, None
 
     def new_game(new_seed=None, initial_state=None):
         s = int(np.random.default_rng().integers(0, 2**31)) if new_seed is None else new_seed
         rng = np.random.default_rng(s)
         st0 = initial_state if initial_state is not None else GameState.deal(rng, starting_player=start)
-        game.update(seed=s, rng=rng, state=st0, bot=_make_bot(random_bot, engine))
+        game.update(seed=s, rng=rng, state=st0, bot=_make_bot(random_bot, engine, nn_agent))
         log.clear()
         trajectory.clear()
         analysis["state"], analysis[0], analysis[1] = None, None, None
@@ -296,9 +304,11 @@ def main(argv=None) -> None:
     parser.add_argument("--start", type=int, default=None, choices=[0, 1])
     parser.add_argument("--setup", action="store_true",
                         help="open the scenario-setup screen first (also the in-game 'Scenario' button / S)")
+    parser.add_argument("--nn", default=None,
+                        help="seat a trained NN checkpoint as the bot (e.g. models/mlp_32.pt)")
     args = parser.parse_args(argv)
     run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
-        k=args.k, l=args.l, setup=args.setup)
+        k=args.k, l=args.l, setup=args.setup, nn=args.nn)
 
 
 if __name__ == "__main__":
