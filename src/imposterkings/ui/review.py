@@ -72,11 +72,13 @@ def budget_iters(state, observer: int, bud) -> int:
 
 
 def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = None,
-                     cross_eval: bool = True, budget=None) -> List[PlyRecord]:
+                     cross_eval: bool = True, budget=None, initial_state=None) -> List[PlyRecord]:
     """Play one MCTS-vs-MCTS game and record (seat, move, pre-move view, SearchResult, state) per ply.
 
     ``budget`` (a :mod:`imposterkings.budget` policy) makes both self-play agents AND the dual-eval use
     that per-decision budget (e.g. the hybrid schedule); ``None`` falls back to fixed ``iters``.
+    ``initial_state`` (e.g. from ``scenario.build``) plays from a constructed position instead of a deal --
+    the review/icicle can then be exercised on a specific opening.
 
     With ``cross_eval`` (default), also fill each turn-start ply's ``eval_by_seat`` with BOTH players'
     own-perspective evals of that position -- the mover's from its own search, the opponent's from one
@@ -95,10 +97,42 @@ def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = Non
     def _agent():
         return (MCTSAgent(budget=budget, evaluate_forced=True) if budget is not None
                 else MCTSAgent(iterations=iters, evaluate_forced=True))
-    play_game([_agent(), _agent()], rng, on_decision=collect, starting_player=start)
+    play_game([_agent(), _agent()], rng, on_decision=collect, starting_player=start,
+              initial_state=initial_state)
 
     if cross_eval:
         annotate_dual_evals(traj, budget if budget is not None else iters, np.random.default_rng(seed))
+    return traj
+
+
+def scripted_trajectory(state, moves, *, iters: int = 120, seed: int = 0, budget=None,
+                        search: bool = True, cross_eval: bool = True) -> List[PlyRecord]:
+    """Drive a FIXED sequence of ``moves`` (Actions) from ``state`` and record a review-ready trajectory.
+
+    Unlike ``build_trajectory`` (bot-chosen moves), the line is scripted -- for reproducing an exact rules
+    interaction (e.g. an Oathbound->Inquisitor->King's-Hand counter) and inspecting it in the review. When
+    ``search`` (default), each ply is first searched from the mover's seat so ``PlyRecord.result`` (and
+    thus the icicle/graft) is populated, THEN the scripted move is applied regardless of what the search
+    preferred. ``cross_eval`` fills the dual-eval/result_by_seat as usual. Raises if a scripted move is
+    illegal at its ply."""
+    traj: List[PlyRecord] = []
+    rng = np.random.default_rng(seed)
+    st = state
+    for i, mv in enumerate(moves):
+        if st.is_terminal():
+            break
+        seat = st.to_play
+        legal = st.legal_moves()
+        if mv not in legal:
+            raise ValueError(f"scripted move {i} ({mv}) is illegal; legal = {legal}")
+        result = None
+        if search and len(legal) > 1:                 # skip a search on forced single-move plies
+            its = iters if budget is None else budget_iters(st, seat, budget)
+            result = _search_from(st, seat, its, rng)
+        traj.append(PlyRecord(seat, mv, st.information_set(seat), result, state=st))
+        st = st.apply(mv)
+    if cross_eval:
+        annotate_dual_evals(traj, budget if budget is not None else iters, rng)
     return traj
 
 
@@ -531,13 +565,71 @@ def _draw_board_popup(surface, fonts, state, anchor) -> None:
                 cx += cw + g
 
 
+def render_review_frame(screen, fonts, traj, turns, *, cursor, mode="icicle", renorm=False,
+                        ost=None, zoom=None, last_tree=None, mouse=(-1, -1)):
+    """Draw ONE review frame (nav bar + eval graph + card strip + both icicle panels + hover popup) and
+    return its hit-test data ``{"btns","strip_hits","blocks","mid","ptop"}``. Factored out of
+    ``run_review`` so the live loop and headless capture (``ui.headless.review_png``) share one renderer.
+    ``ost``/``zoom``/``last_tree`` default to fresh per-panel state (fine for a single headless frame)."""
+    import pygame
+    med, small = fonts["med"], fonts["small"]
+    W, H = WINDOW
+    mid = W // 2
+    ost = ost if ost is not None else {0: {"exp": set(), "scroll": 0}, 1: {"exp": set(), "scroll": 0}}
+    zoom = zoom if zoom is not None else {0: [], 1: []}
+    last_tree = last_tree if last_tree is not None else {0: None, 1: None}
+
+    screen.fill(PANEL)
+    rec = traj[cursor]
+    pend = getattr(rec.view, "pending", None)
+    is_setup = bool(pend) and pend[-1].kind in _SETUP_KINDS
+    turn_label = "Setup" if is_setup else f"turn P{turns[_current_turn(turns, cursor)][2]}"
+
+    _text(screen, med, "Post-game review  (MCTS vs MCTS)", (12, 6), INK)
+    _text(screen, small, f"Ply {cursor + 1}/{len(traj)}  —  {turn_label}  ·  P{rec.seat} played "
+                         f"{_compact_action(rec.move)}", (12, 32), GOLD)
+    specs = [("prev", "◄ Prev", 12), ("next", "Next ►", 102), ("outline", "Outline", 210),
+             ("icicle", "Icicle", 300), ("zout", "⬆ Zoom out", 390), ("renorm", "Renorm", 496)]
+    btns = {}
+    for key, label, bx in specs:
+        r = pygame.Rect(bx, 50, 96 if key in ("zout", "renorm") else 84, 22)
+        active = (key == "renorm" and renorm) or (key != "renorm" and key == mode)
+        btns[key] = _button(screen, small, label, r, active=active, hover=r.collidepoint(mouse))
+    _text(screen, small, "◄/► step · I/O view · R renorm · click card/graph=jump · click box=zoom · "
+                         "Backspace=out · Esc quit", (604, 54), MUTE)
+
+    _draw_graph(screen, fonts, traj, turns, cursor, TL_TOP)
+    strip_hits = _draw_strip(screen, fonts, traj, turns, cursor)
+    ptop = STRIP_TOP + STRIP_H + 10
+    pygame.draw.line(screen, DIVIDER, (mid, ptop - 4), (mid, H))
+
+    top = ptop + 44                         # room for the panel header + eval subtitle above the icicle
+    lrect = (6, top, mid - 12, H - top - 6)
+    rrect = (mid + 6, top, W - mid - 12, H - top - 6)
+    cur_turn = turns[_current_turn(turns, cursor)]        # both panels show the SAME (current) turn
+    blocks = {
+        0: _draw_panel(screen, fonts, traj, 0, cur_turn, cursor, lrect, mode,
+                       ost[0], zoom[0], last_tree, renorm),
+        1: _draw_panel(screen, fonts, traj, 1, cur_turn, cursor, rrect, mode,
+                       ost[1], zoom[1], last_tree, renorm),
+    }
+    hover_turn = next((s for r, s in strip_hits if r.collidepoint(mouse)), None)
+    if hover_turn is not None:               # hovering a strip card -> the true-board popup for its turn
+        _draw_board_popup(screen, fonts, traj[hover_turn].state, mouse)
+    elif mode == "icicle":                   # else the icicle hover tooltip
+        hseat = 0 if mouse[0] < mid else 1
+        hb = block_at(blocks[hseat], mouse)
+        if hb is not None:
+            draw_tooltip(screen, fonts, hb, mouse)
+    return {"btns": btns, "strip_hits": strip_hits, "blocks": blocks, "mid": mid, "ptop": ptop}
+
+
 def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
     import pygame
     if not traj:
         return
     clock = pygame.time.Clock()
     W, H = WINDOW
-    med, small = fonts["med"], fonts["small"]
     cursor, mode = 0, "icicle"
     renorm = False                              # graft sub-bands: contain (False) vs full-width renormalise
     ost = {0: {"exp": set(), "scroll": 0}, 1: {"exp": set(), "scroll": 0}}
@@ -548,49 +640,10 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
 
     running = True
     while running:
-        screen.fill(PANEL)
         mouse = pygame.mouse.get_pos()
-        rec = traj[cursor]
-        pend = getattr(rec.view, "pending", None)
-        is_setup = bool(pend) and pend[-1].kind in _SETUP_KINDS
-        turn_label = "Setup" if is_setup else f"turn P{turns[_current_turn(turns, cursor)][2]}"
-
-        _text(screen, med, "Post-game review  (MCTS vs MCTS)", (12, 6), INK)
-        _text(screen, small, f"Ply {cursor + 1}/{len(traj)}  —  {turn_label}  ·  P{rec.seat} played "
-                             f"{_compact_action(rec.move)}", (12, 32), GOLD)
-        specs = [("prev", "◄ Prev", 12), ("next", "Next ►", 102), ("outline", "Outline", 210),
-                 ("icicle", "Icicle", 300), ("zout", "⬆ Zoom out", 390), ("renorm", "Renorm", 496)]
-        btns = {}
-        for key, label, bx in specs:
-            r = pygame.Rect(bx, 50, 96 if key in ("zout", "renorm") else 84, 22)
-            active = (key == "renorm" and renorm) or (key != "renorm" and key == mode)
-            btns[key] = _button(screen, small, label, r, active=active, hover=r.collidepoint(mouse))
-        _text(screen, small, "◄/► step · I/O view · R renorm · click card/graph=jump · click box=zoom · "
-                             "Backspace=out · Esc quit", (604, 54), MUTE)
-
-        _draw_graph(screen, fonts, traj, turns, cursor, TL_TOP)
-        strip_hits = _draw_strip(screen, fonts, traj, turns, cursor)
-        ptop = STRIP_TOP + STRIP_H + 10
-        pygame.draw.line(screen, DIVIDER, (mid, ptop - 4), (mid, H))
-
-        top = ptop + 44                         # room for the panel header + eval subtitle above the icicle
-        lrect = (6, top, mid - 12, H - top - 6)
-        rrect = (mid + 6, top, W - mid - 12, H - top - 6)
-        cur_turn = turns[_current_turn(turns, cursor)]        # both panels show the SAME (current) turn
-        blocks = {
-            0: _draw_panel(screen, fonts, traj, 0, cur_turn, cursor, lrect, mode,
-                           ost[0], zoom[0], last_tree, renorm),
-            1: _draw_panel(screen, fonts, traj, 1, cur_turn, cursor, rrect, mode,
-                           ost[1], zoom[1], last_tree, renorm),
-        }
-        hover_turn = next((s for r, s in strip_hits if r.collidepoint(mouse)), None)
-        if hover_turn is not None:               # hovering a strip card -> the true-board popup for its turn
-            _draw_board_popup(screen, fonts, traj[hover_turn].state, mouse)
-        elif mode == "icicle":                   # else the icicle hover tooltip
-            hseat = 0 if mouse[0] < mid else 1
-            hb = block_at(blocks[hseat], mouse)
-            if hb is not None:
-                draw_tooltip(screen, fonts, hb, mouse)
+        hit = render_review_frame(screen, fonts, traj, turns, cursor=cursor, mode=mode, renorm=renorm,
+                                  ost=ost, zoom=zoom, last_tree=last_tree, mouse=mouse)
+        btns, strip_hits, blocks, ptop = hit["btns"], hit["strip_hits"], hit["blocks"], hit["ptop"]
         pygame.display.flip()
 
         for e in pygame.event.get():
