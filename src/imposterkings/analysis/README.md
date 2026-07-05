@@ -5,13 +5,16 @@ Search / budget scaling studies and their reporting, kept separate from the core
 engine never imports back down. Nothing in here is needed to play the game — it's for measuring the
 bot, sizing the future NN dataset, and understanding how much of a game is decided by the deal.
 
-Three modules:
+Modules:
 
 | module | what it does |
 |---|---|
-| `budget_scaling` | Sweep a **hybrid MCTS@k,l** challenger vs fixed references; win-rate, seed split/sweep, opening evals, compute. **(current phase)** |
+| `budget_scaling` | Sweep a **hybrid MCTS@k,l** challenger vs fixed references; win-rate, seed split/sweep, opening evals, compute. |
 | `search_scaling` | Sweep an **integer-N** challenger (MCTS@N) vs one fixed-N baseline; win-rate + starting-eval calibration. |
 | `eval_slice`     | Reshape `search_scaling`'s raw `eval_scaling.csv` into readable per-seed / per-game / cross-N sweep tables. |
+| `merge_sweeps`   | De-duped, non-clobbering merge of multiple `budget_scaling` run dirs into `merged_*.csv`. |
+| `datagen`        | **Self-play → replayable JSONL corpus** (the NN dataset); see [DATASET.md](DATASET.md). |
+| `replay_tools`   | Slice a dataset shard into per-game replay files, or bundle replay files back into a shard. |
 
 All three are runnable modules and write CSVs (+ PNGs) to an `--out-dir`. Runs are deterministic:
 paired per-deal seeds and mirrored seating, so results are reproducible and low-variance.

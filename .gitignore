@@ -16,6 +16,7 @@ dist/
 
 # Generated data / models (future NN pipeline)
 data/
+datasets/
 models/
 results/
 *.npz

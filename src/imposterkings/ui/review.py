@@ -712,6 +712,7 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
 
 
 def main(argv=None) -> None:
+    import os
     import time
 
     import pygame
@@ -726,19 +727,43 @@ def main(argv=None) -> None:
                    help="effective legal-moves for a sub-decision card at selection (hybrid/branching)")
     p.add_argument("--seed", type=int, default=0, help="deck/deal seed")
     p.add_argument("--start", type=int, default=None, choices=[0, 1], help="force the starting player")
+    p.add_argument("--replay", default=None, help="load a self-play GameRecord JSONL and review it")
+    p.add_argument("--game", type=int, default=0, help="which game in a multi-game --replay file")
+    p.add_argument("--fast", action="store_true",
+                   help="replay without re-searching (board + stored evals; skips the deep icicle)")
     args = p.parse_args(argv)
 
-    bud = None if args.p1 == "mcts" else budget_mod.make_budget(args.p1, k=args.k, l=args.l)
-    cfg = f"iters={args.iters}" if bud is None else bud.label
-    print(f"Generating MCTS-vs-MCTS game ({cfg}, seed={args.seed})...")
     t0 = time.perf_counter()
-    traj = build_trajectory(args.iters, args.seed, args.start, budget=bud)
+    if args.replay:
+        from .. import record
+        from ..state import GameState
+        recs = record.read_jsonl(args.replay)
+        if not recs:
+            p.error(f"{args.replay} has no games")
+        rec = recs[args.game]
+        g = rec.get("gen") or {}
+        bud = (budget_mod.make_budget(g["mode"], k=g["k"], l=g.get("l") or 3)
+               if g.get("mode") in ("hybrid", "branching") else None)
+        its = g["k"] if g.get("mode") == "fixed" else args.iters
+        init = GameState.deal(np.random.default_rng(rec["deal_seed"]))
+        moves = [record.dict_to_action(d["chosen"]) for d in rec["decisions"]]
+        print(f"Replaying {args.replay} game {args.game} "
+              f"({g.get('spec', '?')}, {len(moves)} plies, {'fast' if args.fast else 're-search'})...")
+        traj = scripted_trajectory(init, moves, iters=its, budget=bud, seed=rec["deal_seed"],
+                                   search=not args.fast)
+        cap = f"replay {os.path.basename(args.replay)} #{args.game}"
+    else:
+        bud = None if args.p1 == "mcts" else budget_mod.make_budget(args.p1, k=args.k, l=args.l)
+        cfg = f"iters={args.iters}" if bud is None else bud.label
+        print(f"Generating MCTS-vs-MCTS game ({cfg}, seed={args.seed})...")
+        traj = build_trajectory(args.iters, args.seed, args.start, budget=bud)
+        cap = f"seed {args.seed}, {cfg}"
     dt = time.perf_counter() - t0
-    print(f"  {len(traj)} decisions recorded in {dt:.1f}s. Opening review window...")
+    print(f"  {len(traj)} decisions in {dt:.1f}s. Opening review window...")
 
     pygame.init()
     screen = pygame.display.set_mode(WINDOW)
-    pygame.display.set_caption(f"ImposterKings review  (seed {args.seed}, {cfg})")
+    pygame.display.set_caption(f"ImposterKings review  ({cap})")
     run_review(screen, make_fonts(), traj)
     pygame.quit()
 

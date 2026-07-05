@@ -12,7 +12,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from .actions import Action
+from .actions import Action, ActionKind
 from .explain import format_action
 from .infoset import InformationSet
 from .state import GameState
@@ -25,6 +25,12 @@ def action_to_dict(a: Action) -> dict:
         if v is not None:
             d[k] = v
     return d
+
+
+def dict_to_action(d: dict) -> Action:
+    """Inverse of :func:`action_to_dict` -- rebuild an Action from its JSON dict (round-trips exactly)."""
+    return Action(kind=ActionKind[d["kind"]], card=d.get("card"), target=d.get("target"),
+                  number=d.get("number"), name=d.get("name"))
 
 
 @dataclass
@@ -63,6 +69,12 @@ class DecisionRecord:
 
 @dataclass
 class GameRecord:
+    # replayable header: (deal_seed, ordered decisions[].chosen) fully reconstructs the game, since
+    # GameState.deal(default_rng(deal_seed)) + apply(actions) is deterministic (state.apply has no rng).
+    schema_version: int = 1
+    gen: Optional[dict] = None          # generator meta: spec label, mode/k/l, temp_plies, base_seed
+    deal_seed: Optional[int] = None
+    starting_player: Optional[int] = None
     decisions: List[DecisionRecord] = field(default_factory=list)
     winner: Optional[int] = None
     rewards: Optional[List[float]] = None
@@ -90,3 +102,9 @@ def write_jsonl(path: str, records: List[GameRecord]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(asdict(r)) + "\n")
+
+
+def read_jsonl(path: str) -> List[dict]:
+    """Load game records back as plain dicts (one JSON object per line)."""
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
