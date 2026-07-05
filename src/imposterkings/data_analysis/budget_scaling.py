@@ -1,7 +1,7 @@
 """Budget-scaling study: sweep a hybrid MCTS@k,l challenger against TWO fixed reference bots.
 
-    python -m imposterkings.analysis.budget_scaling        # k=10..50 vs {fixed500, hybrid-k50}, 50 deals
-    python -m imposterkings.analysis.budget_scaling --deals 50 --workers 5
+    python -m imposterkings.data_analysis.budget_scaling        # k=10..50 vs {fixed500, hybrid-k50}, 50 deals
+    python -m imposterkings.data_analysis.budget_scaling --deals 50 --workers 5
 
 Where ``search_scaling`` sweeps an integer-N challenger against one fixed-N baseline, this sweeps a
 per-decision **budget** challenger -- ``hybrid(k, l)`` for ``k in {10,20,30,40,50}`` (see
@@ -51,11 +51,16 @@ Spec = Tuple  # ("fixed", n) | ("hybrid", k, l) | ("branching", k, l)
 
 # --- spec -> agent / label / root-budget ----------------------------------------------
 
+def _lo_hi(spec: Spec):
+    return (spec[3] if len(spec) > 3 else 64, spec[4] if len(spec) > 4 else 4096)
+
+
 def _budget_of(spec: Spec):
+    lo, hi = _lo_hi(spec)
     if spec[0] == "hybrid":
-        return hybrid(spec[1], spec[2])
+        return hybrid(spec[1], spec[2], lo, hi)
     if spec[0] == "branching":
-        return branching(spec[1], spec[2])
+        return branching(spec[1], spec[2], lo, hi)
     return None
 
 
@@ -119,8 +124,10 @@ def _one_deal(challenger: Spec, baseline: Spec, seed: int, deal: int,
         ch_iters.append(stats[cs]["iters"])
         bl_iters.append(stats[1 - cs]["iters"])
     outcome = "split" if cwins == 1 else ("sweep_challenger" if cwins == 2 else "sweep_baseline")
+    lo, hi = _lo_hi(challenger)
     return {
         "challenger": spec_label(challenger), "baseline": spec_label(baseline), "k": challenger[1],
+        "lo": lo, "hi": hi,
         "seed": seed, "deal": deal, "challenger_wins": cwins, "outcome": outcome,
         "split": int(cwins == 1), "pair_score": cwins / 2.0,
         "plies": _mean(g_plies), "decisions": _mean(g_dec),
@@ -143,9 +150,10 @@ def _aggregate_matchup(challenger: Spec, baseline: Spec, deal_rows: List[Dict],
     arr = np.array([r["pair_score"] for r in deal_rows], dtype=float)
     n = len(deal_rows)
     ci95 = float(1.96 * arr.std(ddof=1) / math.sqrt(n)) if n > 1 else 0.0
+    lo, hi = _lo_hi(challenger)
     return {
         "challenger": spec_label(challenger), "baseline": spec_label(baseline),
-        "k": challenger[1], "l": challenger[2], "deals": n, "games": 2 * n,
+        "k": challenger[1], "l": challenger[2], "lo": lo, "hi": hi, "deals": n, "games": 2 * n,
         "wins": int(round(arr.sum() * 2)), "winrate": float(arr.mean()), "ci95": ci95,
         "splits": sum(r["split"] for r in deal_rows),
         "plies": _mean([r["plies"] for r in deal_rows]),
@@ -182,11 +190,12 @@ def _chunks(deals: int, size: int) -> List[List[int]]:
 
 
 def run_study(k_values: List[int], l: int, baselines: List[Spec], deals: int, base_seed: int,
-              workers: int, independent_rng: bool, collect_eval: bool, chunk: int = 10) -> Dict:
+              workers: int, independent_rng: bool, collect_eval: bool, chunk: int = 10,
+              lo: int = 64, hi: int = 4096) -> Dict:
     from joblib import Parallel, delayed
     from tqdm import tqdm
 
-    challengers = [("hybrid", k, l) for k in k_values]
+    challengers = [("hybrid", k, l, lo, hi) for k in k_values]
     matchups = [(c, b) for b in baselines for c in challengers]
     deal_chunks = _chunks(deals, chunk)
 
@@ -257,11 +266,11 @@ def _write_csv(path: str, cols: List[str], rows: List[Dict]) -> None:
             fh.write(",".join(str(r[c]) for c in cols) + "\n")
 
 
-_WIN_COLS = ["challenger", "baseline", "k", "l", "deals", "games", "wins", "winrate", "ci95",
+_WIN_COLS = ["challenger", "baseline", "k", "l", "lo", "hi", "deals", "games", "wins", "winrate", "ci95",
              "splits", "plies", "decisions", "branching", "iters_challenger", "iters_baseline",
              "seconds"]
-_DEAL_COLS = ["challenger", "baseline", "k", "seed", "deal", "challenger_wins", "outcome", "split",
-              "plies", "decisions", "branching", "iters_challenger", "iters_baseline"]
+_DEAL_COLS = ["challenger", "baseline", "k", "lo", "hi", "seed", "deal", "challenger_wins", "outcome",
+              "split", "plies", "decisions", "branching", "iters_challenger", "iters_baseline"]
 _EVAL_COLS = ["spec", "k", "deal", "seed", "start_seat", "iters", "root", "q1", "q2"]
 
 
@@ -390,6 +399,8 @@ def main(argv=None) -> None:
     p.add_argument("--workers", type=int, default=5)
     p.add_argument("--chunk", type=int, default=10,
                    help="deals per parallel job (default 10 = 20 mirrored games/job)")
+    p.add_argument("--hi", type=int, default=4096, help="per-decision iteration clamp ceiling")
+    p.add_argument("--lo", type=int, default=64, help="per-decision iteration clamp floor")
     p.add_argument("--out-dir", default=os.path.join("results", "budget_scaling"))
     p.add_argument("--no-plot", action="store_true")
     p.add_argument("--no-eval", action="store_true")
@@ -398,12 +409,12 @@ def main(argv=None) -> None:
     args = p.parse_args(argv)
 
     all_baselines = {"fixed": ("fixed", args.fixed_baseline),
-                     "hybrid": ("hybrid", args.hybrid_baseline, args.l)}
+                     "hybrid": ("hybrid", args.hybrid_baseline, args.l, args.lo, args.hi)}
     keys = ["fixed", "hybrid"] if args.baselines == "both" else [args.baselines]
     baselines: List[Spec] = [all_baselines[k] for k in keys]
     n_match = len(args.k) * len(baselines)
     n_jobs = n_match * len(_chunks(args.deals, args.chunk))
-    print(f"budget sweep  challenger=hybrid-k{args.k}-l{args.l}\n"
+    print(f"budget sweep  challenger=hybrid-k{args.k}-l{args.l}  clamp=[{args.lo},{args.hi}]\n"
           f"  baselines={[spec_label(b) for b in baselines]} | {args.deals} deals x2 mirrored = "
           f"{args.deals*2} games/matchup | {n_match} matchups = {n_match*args.deals*2} games | "
           f"chunk={args.chunk} -> {n_jobs} jobs | eval={'off' if args.no_eval else 'on'} | "
@@ -411,7 +422,7 @@ def main(argv=None) -> None:
 
     study = run_study(args.k, args.l, baselines, args.deals, args.base_seed, args.workers,
                       independent_rng=not args.shared_rng, collect_eval=not args.no_eval,
-                      chunk=args.chunk)
+                      chunk=args.chunk, lo=args.lo, hi=args.hi)
     print(f"\n{format_table(study['rows'])}")
     print_seed_analysis(study)
     print_timing(study)

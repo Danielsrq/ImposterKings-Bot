@@ -1,8 +1,8 @@
 """Convert between a multi-game dataset shard and single-game replay files (same `GameRecord` format).
 
-    python -m imposterkings.analysis.replay_tools split datasets/selfplay_k20l3/games_00000.jsonl \
+    python -m imposterkings.data_analysis.replay_tools split datasets/selfplay_k20l3/games_00000.jsonl \
         --out-dir replays                       # dataset  -> one game_<seed>.jsonl per game
-    python -m imposterkings.analysis.replay_tools bundle replays/game_*.jsonl --out corpus.jsonl
+    python -m imposterkings.data_analysis.replay_tools bundle replays/game_*.jsonl --out corpus.jsonl
                                                 # replay files -> one dataset shard
 
 A "replay file" and a "dataset shard" are the same thing: a JSONL of `record.GameRecord` lines. So

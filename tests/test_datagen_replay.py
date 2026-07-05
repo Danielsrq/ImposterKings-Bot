@@ -7,7 +7,7 @@ import numpy as np
 
 from imposterkings import record
 from imposterkings.actions import Action
-from imposterkings.analysis import datagen
+from imposterkings.data_analysis import datagen
 from imposterkings.state import GameState
 
 _SPEC = ("hybrid", 3, 3)   # tiny budget -> fast

@@ -257,18 +257,15 @@ pandas/pyarrow are installed.
 
 ## 10. Implementation roadmap (follow-up task — not built here)
 
-- **`features.py`** (core, numpy-only): the shared featurizer of §5 — `featurize`, the MLP and token
-  adapters, `FEATURE_SPEC` dim constants, `card_category(id)`, and index→label helpers for interpretability.
-  Placed at package root so `analysis/` and a future `nn/` both import it (engine never imports it back).
-- **`record.py`** (extend): add the replay header (`schema_version`, `engine_hash`, `gen`, `deal_seed`,
-  `starting_player`) to `GameRecord`, and add `dict_to_action` (inverse of `action_to_dict`).
-- **`analysis/datagen.py`** (new, runnable): chunked-parallel self-play collector reusing
-  `budget_scaling.make_agent`/`spec_label`/`_cost_hook` + `play_game`'s `on_decision`; the
-  temperature-exploration agent wrapper; writes JSONL shards to a non-clobbering `--out-dir`. CLI:
-  `--games --spec --temp-plies --temp --workers --chunk --base-seed --shard-size --out-dir`.
-- **`analysis/build_tables.py`** (new, runnable): replays logs → the three CSV tables + the training
-  `.npz`, modeled on `merge_sweeps.py` / `eval_slice.py` (read raw, derive, write prefixed outputs, never
-  clobber the source).
+- **`machine_learning/features.py`** (numpy-only): the shared featurizer of §5 — `encode`, the MLP and
+  token adapters, `FEATURE_DIM` constants, `card_category(id)`, and index→label helpers for interpretability.
+  Lives in `machine_learning/` (the model-input encoding); imports the engine, never the reverse.
+- **`record.py`** (extend, DONE): the replay header (`schema_version`, `gen`, `deal_seed`,
+  `starting_player`) on `GameRecord`, and `dict_to_action` (inverse of `action_to_dict`).
+- **`data_analysis/datagen.py`** (DONE): chunked-parallel self-play collector reusing
+  `budget_scaling.make_agent`/`spec_label` + `play_game`'s `on_decision`; writes JSONL shards.
+- **`data_analysis/build_tables.py`** (DONE): replays logs → the three exploration CSV tables. The training
+  `.npz` build lives in **`machine_learning/dataset.py`** (replay → featurize → tensors).
 - **`ui/review.py`** (extend): the `--replay` path (load `GameRecord` → `scripted_trajectory`) + the
   `--fast` stats-only adapter.
 

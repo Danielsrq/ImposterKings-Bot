@@ -1,4 +1,4 @@
-# `imposterkings.analysis` — data-science layer
+# `imposterkings.data_analysis` — data-science layer
 
 Search / budget scaling studies and their reporting, kept separate from the core game engine
 (state, rules, MCTS). Modules here import **up** into the engine (`from ..state import ...`); the
@@ -28,10 +28,10 @@ featurizer, exploration query cookbook, `ui.review --replay`, and generation pol
 
 ```bash
 # defaults == the standard study: k=10..50 (l=3) vs {fixed500, hybrid-k50}, 50 deals x2 = 100 games/matchup
-python -m imposterkings.analysis.budget_scaling --workers 10
+python -m imposterkings.data_analysis.budget_scaling --workers 10
 
 # larger, e.g. 100 deals (200 games/matchup):
-python -m imposterkings.analysis.budget_scaling --deals 100 --workers 10
+python -m imposterkings.data_analysis.budget_scaling --deals 100 --workers 10
 ```
 
 The challenger is `hybrid(k, l)` swept over `--k`; it plays **two** reference opponents at once:
@@ -117,8 +117,8 @@ Independent play-RNG (default) is required or the equal-strength mirror splits t
 ## `search_scaling` — MCTS@N vs a fixed-N baseline
 
 ```bash
-python -m imposterkings.analysis.search_scaling                    # N = 25..500 step 25, 50 deals each
-python -m imposterkings.analysis.search_scaling --deals 100 --workers 8 --knowledge
+python -m imposterkings.data_analysis.search_scaling                    # N = 25..500 step 25, 50 deals each
+python -m imposterkings.data_analysis.search_scaling --deals 100 --workers 8 --knowledge
 ```
 
 Sweeps integer `N` (`--min/--max/--step`, default 25..500 step 25) against `--baseline` (default 500),
@@ -131,9 +131,9 @@ binary/perfect knowledge of the opponent's hand. Outputs: `search_scaling.csv` (
 ## `eval_slice` — reshape the raw eval CSV
 
 ```bash
-python -m imposterkings.analysis.eval_slice --n 200                 # per-seed table at N=200
-python -m imposterkings.analysis.eval_slice --n 200 --per-game      # 2 rows/seed (one per mirrored game)
-python -m imposterkings.analysis.eval_slice --sweeps                # who swept each deal, across all N
+python -m imposterkings.data_analysis.eval_slice --n 200                 # per-seed table at N=200
+python -m imposterkings.data_analysis.eval_slice --n 200 --per-game      # 2 rows/seed (one per mirrored game)
+python -m imposterkings.data_analysis.eval_slice --sweeps                # who swept each deal, across all N
 ```
 
 Reads `eval_scaling.csv` (`--in`), emits a readable slice (`--out`). `--per-game` splits each mirrored

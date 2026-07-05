@@ -1,6 +1,6 @@
 """Build exploration tables from a self-play JSONL corpus and print the DATASET.md query cookbook.
 
-    python -m imposterkings.analysis.build_tables --data datasets/selfplay_k20l3 --report
+    python -m imposterkings.data_analysis.build_tables --data datasets/selfplay_k20l3 --report
 
 Replays every game (deterministic: deal_seed + action log) and emits three CSVs to ``--out-dir``:
   * ``card_locations.csv`` -- one row per (game, card) at the **post-setup** position (after both players

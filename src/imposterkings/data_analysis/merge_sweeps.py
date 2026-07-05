@@ -1,6 +1,6 @@
 """Merge budget_scaling run directories into combined CSVs, de-duped, without clobbering the source.
 
-    python -m imposterkings.analysis.merge_sweeps results/budget_scaling results/budget_scaling/ext_k70k100 \
+    python -m imposterkings.data_analysis.merge_sweeps results/budget_scaling results/budget_scaling/ext_k70k100 \
         --out-dir results/budget_scaling --prefix merged
 
 Reads the three base tables (``winrate.csv``, ``deal_outcomes.csv``, ``evals.csv``) from each input
@@ -16,12 +16,16 @@ import csv
 import os
 from typing import Callable, Dict, List
 
-# (base filename, sort key, dedup key) for each table.
+# Legacy runs (pre-clamp-flag) lack these columns; backfill them so a mixed merge is honest.
+_DEFAULTS = {"hi": "4096", "lo": "64"}
+
+# (base filename, sort key, dedup key) for each table. ``hi`` is part of the dedup key so a raised-clamp
+# rerun of the same k does not silently collide with the capped one.
 _TABLES = {
-    "winrate.csv": (lambda r: (r["baseline"], float(r["k"])),
-                    lambda r: (r["challenger"], r["baseline"])),
-    "deal_outcomes.csv": (lambda r: (r["baseline"], float(r["k"]), int(r["seed"])),
-                          lambda r: (r["challenger"], r["baseline"], r["seed"])),
+    "winrate.csv": (lambda r: (r["baseline"], float(r["k"]), int(r.get("hi", 4096))),
+                    lambda r: (r["challenger"], r["baseline"], r.get("hi", "4096"))),
+    "deal_outcomes.csv": (lambda r: (r["baseline"], float(r["k"]), int(r["seed"]), int(r.get("hi", 4096))),
+                          lambda r: (r["challenger"], r["baseline"], r["seed"], r.get("hi", "4096"))),
     "evals.csv": (lambda r: (r["spec"], int(r["seed"])),
                   lambda r: (r["spec"], r["seed"])),
 }
@@ -35,13 +39,16 @@ def _read(path: str):
 
 def merge_table(inputs: List[str], base: str, sort_key: Callable, dedup_key: Callable):
     """Return (header, deduped+sorted rows, n_dupes) across every input dir that has ``base``."""
-    header, seen, rows, dupes = None, {}, [], 0
+    header: List[str] = []
+    seen, rows, dupes = {}, [], 0
     for d in inputs:
         p = os.path.join(d, base)
         if not os.path.exists(p):
             continue
         cols, part = _read(p)
-        header = header or cols
+        for c in cols:                                  # union of columns, in first-seen order
+            if c not in header:
+                header.append(c)
         for r in part:
             key = dedup_key(r)
             if key in seen:
@@ -57,7 +64,8 @@ def _write(path: str, header: List[str], rows: List[Dict]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=header)
         w.writeheader()
-        w.writerows(rows)
+        for r in rows:                                  # backfill columns absent in legacy inputs
+            w.writerow({c: r.get(c, _DEFAULTS.get(c, "")) for c in header})
 
 
 def main(argv=None) -> None:

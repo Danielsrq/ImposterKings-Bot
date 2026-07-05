@@ -1,7 +1,7 @@
 """Self-play dataset generation: play MCTS-vs-MCTS games and log replayable `GameRecord`s to JSONL.
 
-    python -m imposterkings.analysis.datagen --games 2000 --k 20 --l 3 --workers 10
-    python -m imposterkings.analysis.datagen --games 100 --k 20 --temp-plies 6   # explore openings
+    python -m imposterkings.data_analysis.datagen --games 2000 --k 20 --l 3 --workers 10
+    python -m imposterkings.data_analysis.datagen --games 100 --k 20 --temp-plies 6   # explore openings
 
 Each game is one JSONL line (see `record.GameRecord`): a replayable header (`deal_seed` + gen meta) plus a
 `DecisionRecord` per ply carrying the MCTS candidate stats (visits / mean_q / visit_share → the policy and

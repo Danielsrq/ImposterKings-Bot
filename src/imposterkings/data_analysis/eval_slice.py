@@ -1,8 +1,8 @@
 """Slice/reshape the raw per-deal eval data (eval_scaling.csv) for readable analysis.
 
-    python -m imposterkings.analysis.eval_slice --n 200        # per-seed table for N=200
-    python -m imposterkings.analysis.eval_slice --n 200 --per-game  # 2 rows/seed (one per mirrored game)
-    python -m imposterkings.analysis.eval_slice --sweeps       # who swept each deal, across all N
+    python -m imposterkings.data_analysis.eval_slice --n 200        # per-seed table for N=200
+    python -m imposterkings.data_analysis.eval_slice --n 200 --per-game  # 2 rows/seed (one per mirrored game)
+    python -m imposterkings.data_analysis.eval_slice --sweeps       # who swept each deal, across all N
 
 Each seed is a mirrored pair (2 games: challenger in each seat). Encoding both games in one row is
 confusing, so ``--per-game`` emits one row per game with that game's starter, its own eval/prediction,
