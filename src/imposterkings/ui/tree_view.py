@@ -15,6 +15,7 @@ import pygame
 
 from ..actions import Action, ActionKind
 from ..cards import CARD_DEFS, card_name
+from ..mcts import Node
 from . import assets
 from .render import CARD_COLORS, DIVIDER, GOLD, INK, MUTE, NEUTRAL, P_COLORS, _compact_action, _text
 
@@ -71,6 +72,24 @@ def _ink_for(bg: RGB) -> RGB:
     return (20, 20, 20) if lum > 140 else (240, 240, 240)
 
 
+def _dim_color(c: RGB) -> RGB:
+    """Desaturate a block color ~60% toward grey -- marks a superseded (unchosen) grafted branch."""
+    return tuple(int(round(c[i] * 0.4 + MUTE[i] * 0.6)) for i in range(3))
+
+
+def graft_node(orig: "Node", children: Dict[Action, "Node"]) -> "Node":
+    """A shallow clone of ``orig`` (same stats/move/mover) but with a different ``children`` dict.
+
+    Used to splice one search's sub-band under another tree's chosen node without mutating either:
+    the clone keeps ``orig.n`` (so its own width within its parent band is unchanged), while its
+    grafted children -- from a different search whose visits needn't sum to ``orig.n`` -- are laid out
+    self-normalized when the clone's id is passed in ``layout_icicle``'s ``graft_ids``."""
+    n = Node(orig.parent, orig.incoming_move, orig.player_just_moved)
+    n.n, n.w, n.avail = orig.n, orig.w, orig.avail
+    n.children = children
+    return n
+
+
 def _truncate(font, s: str, max_w: int) -> str:
     if max_w <= 0:
         return ""
@@ -114,12 +133,18 @@ def path_node_ids(root, played_path) -> Set[int]:
 
 def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, *,
                   top_k: int = 6, max_turns: int = 6, band_gap: float = 0.0,
-                  on_path_ids: Set[int] = frozenset()) -> List[Block]:
+                  on_path_ids: Set[int] = frozenset(),
+                  graft_ids: Set[int] = frozenset()) -> List[Block]:
     """Ply-banded icicle layout for ``root``'s subtree within ``rect`` = (x, y, w, h).
 
     x: recursive visit partition (child width = parent width * child.n / parent.n, top-``top_k`` kids).
     y: turn bands -- ``turn_index`` increments each time the mover changes; each band's height is the
     deepest micro-turn within it, so shorter branches pad blank until the next player's band.
+
+    ``graft_ids``: nodes whose children come from a *different* search (their visits needn't sum to
+    ``node.n``). Such a node's children are normalized by their own visit-sum so the band fills the
+    parent cell exactly (no overflow); every other node keeps the usual ``node.n`` normalization,
+    including the blank remainder left by pruned/untried children.
     """
     x0, y0, W, H = rect
     raw: List[list] = []                  # [node, x, w, turn_index, local_depth]
@@ -128,11 +153,12 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
     def walk(node, x, w, turn_index, local_depth):
         band_maxlocal[turn_index] = max(band_maxlocal.get(turn_index, 0), local_depth)
         raw.append([node, x, w, turn_index, local_depth])
-        total = node.n
+        kids = sorted(node.children.values(), key=lambda c: c.n, reverse=True)[:top_k]
+        total = sum(c.n for c in kids) if id(node) in graft_ids else node.n
         if not total:
             return
         cx = x
-        for c in sorted(node.children.values(), key=lambda c: c.n, reverse=True)[:top_k]:
+        for c in kids:
             cw = w * (c.n / total)
             if c.player_just_moved == node.player_just_moved:
                 ct, cl = turn_index, local_depth + 1
@@ -191,12 +217,18 @@ def _band_font():
 
 def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
                 played_path=None, zoom_root=None, dim: bool = False,
-                top_k: int = 6, max_turns: int = 6) -> List[Block]:
+                top_k: int = 6, max_turns: int = 6,
+                dim_ids: Set[int] = frozenset(), graft_ids: Set[int] = frozenset(),
+                band_sims: Optional[int] = None) -> List[Block]:
     """Draw the ply-banded icicle for a SearchResult into ``rect``; returns the laid-out blocks.
 
     ``played_path`` (moves) highlights the played line (trail + the current, deepest box). ``zoom_root``
     lays out that node's subtree full-panel instead of the whole tree. ``dim`` fades a persisted/stale
-    tree (a forced move that had no search)."""
+    tree (a forced move that had no search).
+
+    Graft support (review sub-band replacement): ``graft_ids`` nodes have their children self-normalized
+    (see ``layout_icicle``); ``dim_ids`` nodes render greyed (a superseded/unchosen parent branch);
+    ``band_sims`` overrides the root-band's ``{n} sims`` label with the current step's true budget."""
     x0, y0, W, H = rect
     small = fonts["small"]
     if result is None or getattr(result, "root", None) is None or not result.root.children:
@@ -207,16 +239,18 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
     bf = _band_font()
     bh = bf.get_linesize()
     blocks = layout_icicle(layout_root, rect, result.info.observer,
-                           top_k=top_k, max_turns=max_turns, band_gap=bh, on_path_ids=on_ids)
+                           top_k=top_k, max_turns=max_turns, band_gap=bh, on_path_ids=on_ids,
+                           graft_ids=graft_ids)
     line_h = small.get_linesize()
     for b in blocks:
         r = pygame.Rect(int(b.x), int(b.y), max(1, int(b.w) - 1), max(1, int(b.h) - 1))
+        dimmed = id(b.node) in dim_ids
         if b.move is not None and b.move.kind == ActionKind.FLIP_KING:
             pygame.draw.rect(surface, WHITE, r)        # king flip -> white box + upside-down crown glyph
             draw_crown(surface, r, flipped=True)
         else:
-            pygame.draw.rect(surface, b.color, r)
-            if b.w > _MIN_LABEL_W and b.h >= 11:
+            pygame.draw.rect(surface, _dim_color(b.color) if dimmed else b.color, r)
+            if not dimmed and b.w > _MIN_LABEL_W and b.h >= 11:
                 ink = _ink_for(b.color)
                 surface.blit(small.render(_truncate(small, b.label, int(b.w) - 6), True, ink),
                              (int(b.x) + 3, int(b.y) + 1))
@@ -242,8 +276,12 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
         pygame.draw.rect(surface, P_COLORS.get(mover, MUTE), (int(x0), strip_y, int(W), bh))
         pygame.draw.line(surface, (10, 10, 10), (int(x0), strip_y), (int(x0 + W), strip_y))
         pygame.draw.line(surface, (10, 10, 10), (int(x0), strip_y + bh), (int(x0 + W), strip_y + bh))
-        # root band (card selection) also shows the total search visits funding this decision
-        tag = f"P{mover}  {layout_root.n} sims" if band == root_band else f"P{mover}"
+        # root band (card selection) also shows the visits funding this decision -- band_sims (the
+        # current step's grafted budget) when supplied, else the laid-out root's own visits.
+        if band == root_band:
+            tag = f"P{mover}  {band_sims if band_sims is not None else layout_root.n} sims"
+        else:
+            tag = f"P{mover}"
         surface.blit(bf.render(tag, True, (20, 20, 20)), (int(x0) + 3, strip_y))
     if dim:
         fade = pygame.Surface((int(W), int(H)), pygame.SRCALPHA)

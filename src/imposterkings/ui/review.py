@@ -21,7 +21,7 @@ from ..infoset import InformationSet
 from .render import (BTN, BTN_HOVER, CARD_COLORS, DIVIDER, GOLD, INK, MUTE, P_COLORS, PANEL, RED,
                      WINDOW, _compact_action, _cross, _text, _tick, make_fonts)
 from . import assets
-from .tree_view import block_at, draw_crown, draw_icicle, draw_outline, draw_tooltip
+from .tree_view import block_at, draw_crown, draw_icicle, draw_outline, draw_tooltip, graft_node
 
 HEADER_H = 76        # title + ply line + button row
 # Timeline band: one combined eval graph (both players' lines, shared x & y axes) then the card strip.
@@ -283,6 +283,71 @@ def _draw_strip(surface, fonts, traj, turns, cursor):
     return hits
 
 
+class _GraftedResult:
+    """A minimal SearchResult stand-in (``.root`` + ``.info``) wrapping a synthetic, grafted tree so it
+    can be handed straight to ``draw_icicle`` without touching the real cached search results."""
+    __slots__ = ("root", "info")
+
+    def __init__(self, root, info):
+        self.root = root
+        self.info = info
+
+
+def _collect_subtree_ids(node, out: set) -> None:
+    """Add ``id`` of ``node`` and all its descendants to ``out`` (for dimming a superseded branch)."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        out.add(id(n))
+        stack.extend(n.children.values())
+
+
+def _grafted_tree(traj, seat: int, start: int, end: int, cursor: int, res0):
+    """Once the cursor steps INTO a turn, replace each stepped-past sub-band with that ply's OWN
+    authoritative search (full budget), keeping the turn-root band fixed and greying the unchosen
+    parent branches. Returns ``(grafted_result, graft_ids, dim_ids, tip_sims)`` or ``None`` when there
+    is nothing to graft (cursor at the turn root, or every deeper ply was forced / the other seat's).
+
+    Only this ``seat``'s own per-ply searches are grafted into this ``seat``'s panel, so the whole
+    picture stays in one perspective (no value-sign/knowledge seam across bands)."""
+    upto = min(cursor, end)
+    steps_in = upto - start
+    if steps_in <= 0 or res0 is None or getattr(res0, "root", None) is None:
+        return None
+    moves = played_path(traj, start, upto)                # moves[0] = turn-root choice, then one per step
+    graft_ids: set = set()
+    dim_ids: set = set()
+    tip_sims = res0.root.n
+    syn_root = graft_node(res0.root, dict(res0.root.children))   # copy the dict so splices don't mutate res0
+    cur_syn, cur_orig = syn_root, res0.root
+    for i in range(steps_in):
+        orig_child = next((c for c in cur_orig.children.values() if c.incoming_move == moves[i]), None)
+        if orig_child is None:
+            break
+        nxt = start + i + 1                               # the ply whose own search feeds the next band
+        gsrc = None
+        if nxt < len(traj) and traj[nxt].seat == seat:
+            gr = traj[nxt].result
+            if gr is not None and getattr(gr, "root", None) is not None and gr.root.children:
+                gsrc = gr
+        if gsrc is not None:                              # graft this ply's real search under the chosen node
+            syn_child = graft_node(orig_child, dict(gsrc.root.children))
+            graft_ids.add(id(syn_child))
+            tip_sims = gsrc.root.n
+            for c in cur_orig.children.values():          # grey the now-superseded unchosen siblings
+                if c is not orig_child:
+                    _collect_subtree_ids(c, dim_ids)
+            next_orig = gsrc.root                          # next chosen move lives in the grafted band
+        else:                                             # forced / other seat: keep the original subtree
+            syn_child = graft_node(orig_child, dict(orig_child.children))
+            next_orig = orig_child
+        cur_syn.children[moves[i]] = syn_child
+        cur_syn, cur_orig = syn_child, next_orig
+    if not graft_ids:
+        return None                                       # nothing actually replaced -> draw res0 as today
+    return _GraftedResult(syn_root, res0.info), graft_ids, dim_ids, tip_sims
+
+
 def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, zoom_stack, last_tree):
     """Draw ``seat``'s read of the CURRENT turn's position. Both panels show the same turn: the mover's
     real search on its side, the opponent's search of the same state on the other -- so P1's tree updates
@@ -319,10 +384,18 @@ def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, 
     if rec0.eval_by_seat is not None:                         # this seat's eval of the current position
         _text(surface, small, f"P{seat} eval {rec0.eval_by_seat[seat]:+.2f} (their perspective)",
               (tx + 4, ty - 22), MUTE)
-    blocks = (draw_icicle(surface, fonts, res, tree_rect, played_path=path,
-                          zoom_root=(zoom_stack[-1] if zoom_stack else None)) if mode == "icicle"
-              else draw_outline(surface, fonts, res, tree_rect, expanded=ost["exp"],
-                                scroll=ost["scroll"], played_move=(path[-1] if path else None)))
+    if mode == "icicle":
+        zoom_root = zoom_stack[-1] if zoom_stack else None
+        g = _grafted_tree(traj, seat, start, end, cursor, res)   # step into the turn -> authoritative sub-bands
+        if g is not None:
+            gres, graft_ids, dim_ids, tip_sims = g
+            blocks = draw_icicle(surface, fonts, gres, tree_rect, played_path=path, zoom_root=zoom_root,
+                                 graft_ids=graft_ids, dim_ids=dim_ids, band_sims=tip_sims)
+        else:
+            blocks = draw_icicle(surface, fonts, res, tree_rect, played_path=path, zoom_root=zoom_root)
+    else:
+        blocks = draw_outline(surface, fonts, res, tree_rect, expanded=ost["exp"],
+                              scroll=ost["scroll"], played_move=(path[-1] if path else None))
     if is_mover:                                              # box the active panel: a colored border just
         box = pygame.Rect(*tree_rect).inflate(6, 6)          # OUTSIDE the icicle (so it doesn't clip the
         pygame.draw.rect(surface, P_COLORS[seat], box, 3)    # top band bar), wrapped in a black outline

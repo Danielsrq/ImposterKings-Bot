@@ -18,12 +18,12 @@ from imposterkings.state import GameState  # noqa: E402
 from imposterkings.ui.render import make_fonts  # noqa: E402
 from imposterkings.ui.render import WINDOW  # noqa: E402
 from imposterkings.ui.review import (  # noqa: E402
-    TL_TOP, PlyRecord, _draw_graph, _draw_strip, _headline_card, annotate_dual_evals, build_trajectory,
-    played_path, turn_for_seat, turns_of,
+    TL_TOP, PlyRecord, _draw_graph, _draw_strip, _grafted_tree, _headline_card, annotate_dual_evals,
+    build_trajectory, played_path, turn_for_seat, turns_of,
 )
 from imposterkings.ui.tree_view import (  # noqa: E402
-    CARD_COLORS, NEUTRAL, Block, block_at, draw_icicle, draw_outline, draw_tooltip, layout_icicle,
-    move_color, path_node_ids,
+    CARD_COLORS, NEUTRAL, Block, block_at, draw_icicle, draw_outline, draw_tooltip, graft_node,
+    layout_icicle, move_color, path_node_ids,
 )
 
 
@@ -202,3 +202,73 @@ def test_board_popup_renders_headless():
     _draw_board_popup(screen, fonts, traj[s].state, (60, 60))  # true-board popup renders without error
     _draw_board_popup(screen, fonts, None, (60, 60))           # None state -> no-op
     pygame.display.quit()
+
+
+def _res0_for(traj, turn):
+    s, e, owner = turn
+    rec0 = traj[s]
+    return (rec0.result_by_seat[owner] if rec0.result_by_seat is not None else rec0.result)
+
+
+def _graftable_turn(traj):
+    """A turn (>=2 plies) whose owner also made the next ply and retained a search there (graftable)."""
+    for s, e, owner in turns_of(traj):
+        if e > s and traj[s + 1].seat == owner and traj[s + 1].result is not None:
+            r0 = _res0_for(traj, (s, e, owner))
+            if r0 is not None and getattr(r0, "root", None) is not None and r0.root.children:
+                return (s, e, owner)
+    return None
+
+
+def test_grafted_tree_is_noop_at_turn_root():
+    traj = build_trajectory(iters=30, seed=0)
+    turn = _graftable_turn(traj)
+    assert turn is not None
+    s, e, owner = turn
+    res0 = _res0_for(traj, turn)
+    assert _grafted_tree(traj, owner, s, e, s, res0) is None      # cursor at the turn root -> no graft
+
+
+def test_grafted_tree_replaces_subband_without_overflow_or_mutation():
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    traj = build_trajectory(iters=30, seed=0)
+    turn = _graftable_turn(traj)
+    assert turn is not None
+    s, e, owner = turn
+    res0 = _res0_for(traj, turn)
+    orig_child_keys = set(res0.root.children)                    # snapshot to prove res0 is untouched
+
+    g = _grafted_tree(traj, owner, s, e, s + 1, res0)            # step one ply into the turn
+    assert g is not None
+    gres, graft_ids, dim_ids, tip_sims = g
+    assert graft_ids and dim_ids                                 # a band was replaced + siblings greyed
+    assert set(res0.root.children) == orig_child_keys           # the real cached tree was NOT mutated
+
+    path = played_path(traj, s, s + 1)
+    blocks = draw_icicle(screen, fonts, gres, (6, 120, 600, 400), played_path=path,
+                         graft_ids=graft_ids, dim_ids=dim_ids, band_sims=tip_sims)
+    assert blocks
+    gblocks = [b for b in blocks if id(b.node) in graft_ids]
+    assert gblocks
+    for gb in gblocks:                                          # containment: children fill the cell exactly
+        kids = [b for b in blocks if b.node in gb.node.children.values()]
+        assert abs(sum(b.w for b in kids) - gb.w) < 1.0
+        # a grafted band may legitimately total MORE visits than its parent cell (its own full budget)
+        assert sum(k.visits for k in kids) >= gb.visits
+    assert block_at(blocks, (blocks[0].x + 1, blocks[0].y + 1)) is not None  # hit-test still works
+    pygame.display.quit()
+
+
+def test_graft_node_shallow_clone_keeps_stats_swaps_children():
+    traj = build_trajectory(iters=30, seed=0)
+    turn = _graftable_turn(traj)
+    s, e, owner = turn
+    res0 = _res0_for(traj, turn)
+    orig = next(iter(res0.root.children.values()))
+    clone = graft_node(orig, {})
+    assert clone is not orig and clone.children == {}           # new node, swapped (empty) children
+    assert (clone.n, clone.w, clone.incoming_move, clone.player_just_moved) == \
+           (orig.n, orig.w, orig.incoming_move, orig.player_just_moved)
+    assert orig.children                                        # original's children left intact
