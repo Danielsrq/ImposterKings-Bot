@@ -63,6 +63,7 @@ class Frame(NamedTuple):
     hint_toggle: Optional["pygame.Rect"]
     review: Optional["pygame.Rect"]        # "Review game" button, shown only at game over
     settings: "pygame.Rect"                # opens the engine-settings modal
+    scenario: "pygame.Rect"                # opens the scenario-setup screen
 
 # Friendly labels for the decision header (the raw StepKind names are long/cryptic).
 DECISION_LABELS = {
@@ -282,11 +283,14 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     new_game = pygame.Rect(ROW_MAX_X - 120, 12, 120, 30)
     pygame.draw.rect(surface, BTN, new_game, border_radius=4)
     _text(surface, small, "New Game", (new_game.x + 16, new_game.y + 7))
+    scenario = pygame.Rect(new_game.x - 12 - 100, 12, 100, 30)      # build a custom position (S key)
+    pygame.draw.rect(surface, BTN, scenario, border_radius=4)
+    _text(surface, small, "Scenario", (scenario.x + 14, scenario.y + 7))
     # "Review game" appears only at game over (no pending decision -> terminal).
     review = None
-    left_anchor = new_game.x
+    left_anchor = scenario.x
     if not view.pending:
-        review = pygame.Rect(new_game.x - 12 - 128, 12, 128, 30)
+        review = pygame.Rect(scenario.x - 12 - 128, 12, 128, 30)
         pygame.draw.rect(surface, BTN_HOVER, review, border_radius=4)
         _text(surface, small, "Review game", (review.x + 14, review.y + 7))
         left_anchor = review.x
@@ -383,7 +387,7 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     settings = pygame.Rect(WINDOW[0] - 12 - 84, 12, 84, 24)   # engine-settings button (panel top-right)
     pygame.draw.rect(surface, BTN, settings, border_radius=4)
     _text(surface, small, "Settings", (settings.x + 10, settings.y + 4))
-    return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review, settings)
+    return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review, settings, scenario)
 
 
 # The three engine (bot + analysis) modes, in pill order: (mode key, label).

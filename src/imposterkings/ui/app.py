@@ -20,6 +20,7 @@ from ..explain import format_action
 from ..state import GameState
 from .render import BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_settings_overlay, make_fonts, render_frame
 from .review import PlyRecord, annotate_dual_evals, budget_iters, run_review, _result_eval, _search_from
+from .scenario_setup import run_setup
 
 # Opponent's setup hide/discard are private -- never reveal the card identity in the log.
 _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
@@ -60,7 +61,7 @@ def _describe(seat: int, view, move, human_seat: int, state) -> str:
 
 
 def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, start=None,
-        k: int = 100, l: int = 3) -> None:
+        k: int = 100, l: int = 3, setup: bool = False) -> None:
     import pygame  # local import so the engine/tests never require pygame
 
     pygame.init()
@@ -68,6 +69,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     clock = pygame.time.Clock()
     fonts = make_fonts()
     bot_seat = 1 - human_seat
+    hotseat = False                                 # scenario Hotseat: the human drives BOTH sides
     log: deque = deque(maxlen=40)
     show_reasoning, show_hint = True, False
     # One engine config drives BOTH the bot and the dual-eval analysis (so the panels' sims match the bot).
@@ -91,23 +93,35 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         game["bot"] = _make_bot(random_bot, engine)
         analysis["state"], analysis[0], analysis[1] = None, None, None
 
-    def new_game(new_seed=None):
+    def new_game(new_seed=None, initial_state=None):
         s = int(np.random.default_rng().integers(0, 2**31)) if new_seed is None else new_seed
         rng = np.random.default_rng(s)
-        game.update(seed=s, rng=rng, state=GameState.deal(rng, starting_player=start),
-                    bot=_make_bot(random_bot, engine))
+        st0 = initial_state if initial_state is not None else GameState.deal(rng, starting_player=start)
+        game.update(seed=s, rng=rng, state=st0, bot=_make_bot(random_bot, engine))
         log.clear()
         trajectory.clear()
         analysis["state"], analysis[0], analysis[1] = None, None, None
         knowledge_cache["state"], knowledge_cache["val"] = None, None
-        pygame.display.set_caption(f"ImposterKings  (seed {s})")
-        print(f"ImposterKings  (deck seed {s} -- pass --seed {s} to replay this deal)")
+        cap = "scenario" if initial_state is not None else f"seed {s}"
+        pygame.display.set_caption(f"ImposterKings  ({cap})")
+        if initial_state is None:
+            print(f"ImposterKings  (deck seed {s} -- pass --seed {s} to replay this deal)")
+
+    def open_setup():
+        nonlocal human_seat, bot_seat, hotseat
+        cfg = run_setup(screen, fonts, human_seat=human_seat)
+        if cfg is not None:
+            human_seat, bot_seat, hotseat = cfg["human_seat"], 1 - cfg["human_seat"], cfg["hotseat"]
+            new_game(initial_state=cfg["state"])
 
     new_game(seed)
+    if setup:
+        open_setup()
 
-    def apply_logged(seat, move, result=None):
+    def apply_logged(seat, move, result=None, perspective=None):
         st = game["state"]
-        log.append(_describe(seat, st.information_set(human_seat), move, human_seat, st))
+        persp = human_seat if perspective is None else perspective
+        log.append(_describe(seat, st.information_set(persp), move, persp, st))
         rec = PlyRecord(seat, move, st.information_set(seat), result, state=st)
         # Keep the live dual-analysis already computed for this position so the post-game review reuses it
         # instead of recomputing (it only re-searches seats whose panel was off during play).
@@ -119,8 +133,11 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     running = True
     while running:
         state, bot = game["state"], game["bot"]
-        view = state.information_set(human_seat)
-        human_turn = (not state.is_terminal()) and state.to_play == human_seat
+        # Hotseat: the human drives BOTH sides, so the view + turn follow whoever is to move.
+        act = state.to_play
+        view_seat = act if hotseat else human_seat
+        view = state.information_set(view_seat)
+        human_turn = (not state.is_terminal()) and (hotseat or act == human_seat)
         legal = view.legal_moves() if human_turn else []
 
         # Auto-resolve ONLY a choiceless reaction window (a King's-Hand/Assassin prompt when you hold
@@ -128,7 +145,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         # last card, is left for you to click.
         if (not settings_open) and human_turn and len(legal) == 1 \
                 and legal[0].kind == ActionKind.DECLINE_REACTION:
-            apply_logged(human_seat, legal[0])
+            apply_logged(act, legal[0], perspective=view_seat)
             clock.tick(60)
             continue
 
@@ -137,6 +154,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             status = f"GAME OVER - Player {state.winner} wins"
         elif not human_turn:
             status = f"{bot.name} (seat {bot_seat}) is thinking..."
+        elif hotseat:
+            status = f"Hotseat - P{act} to move (click an action)"
         else:
             status = "Your move - click an action"
 
@@ -194,6 +213,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     settings_open = False
                 else:
                     running = False
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_s and not settings_open:
+                open_setup()                            # S -> build a custom position
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if dragging is not None:            # end of a slider drag -> apply the new value
                     dragging = None
@@ -215,6 +236,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                                 break
                 elif frame.settings.collidepoint(pos):
                     settings_open = True
+                elif frame.scenario.collidepoint(pos):          # build a custom position
+                    open_setup()
                 elif frame.new_game.collidepoint(pos):          # clickable any time
                     new_game()
                 elif frame.review and frame.review.collidepoint(pos):
@@ -226,8 +249,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 elif human_turn:
                     for rect, move in frame.buttons:
                         if rect.collidepoint(pos):
-                            hres = analysis[human_seat] if analysis["state"] is game["state"] else None
-                            apply_logged(human_seat, move, hres)
+                            hres = analysis[view_seat] if analysis["state"] is game["state"] else None
+                            apply_logged(act, move, hres, perspective=view_seat)
                             break
         if dragging is not None:                    # live-drag the active slider while the button is held
             if pygame.mouse.get_pressed()[0] and controls is not None:
@@ -246,7 +269,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                       f"analyzed live during play...")
             run_review(screen, fonts, annotated)
 
-        if (not settings_open) and (not game["state"].is_terminal()) and game["state"].to_play == bot_seat:
+        if (not settings_open) and (not hotseat) and (not game["state"].is_terminal()) \
+                and game["state"].to_play == bot_seat:
             pygame.time.delay(300)
             bview = game["state"].information_set(bot_seat)
             mv = game["bot"].select_move(bview, game["rng"])
@@ -270,9 +294,11 @@ def main(argv=None) -> None:
                         help="fix the deck/deal (default: random each launch)")
     parser.add_argument("--human-seat", type=int, default=0, choices=[0, 1])
     parser.add_argument("--start", type=int, default=None, choices=[0, 1])
+    parser.add_argument("--setup", action="store_true",
+                        help="open the scenario-setup screen first (also the in-game 'Scenario' button / S)")
     args = parser.parse_args(argv)
     run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
-        k=args.k, l=args.l)
+        k=args.k, l=args.l, setup=args.setup)
 
 
 if __name__ == "__main__":
