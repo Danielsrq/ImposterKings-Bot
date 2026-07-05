@@ -214,10 +214,15 @@ class GameState:
 
     # --- turn boundaries ---------------------------------------------------------------
 
-    def _begin_turn(self, player: int) -> "GameState":
-        """Start ``player``'s turn: forced antechamber ascension, else the win check + MAIN."""
+    def _begin_turn(self, player: int, *, ascend: bool = True) -> "GameState":
+        """Start ``player``'s turn: forced antechamber ascension, else the win check + MAIN.
+
+        ``ascend=False`` skips the forced-ascension branch -- used to RESUME the active player's turn
+        (e.g. after King's Hand negates their play) rather than start a fresh one: they replay a normal
+        MAIN move (must beat the reverted leading) without re-triggering ascension, and still lose if they
+        have no legal play and no king to flip."""
         from . import abilities
-        if self.antechambers[player]:
+        if ascend and self.antechambers[player]:
             # Ascension IS this turn's play, but surface it as a real (forced, single-move) decision so
             # it is recorded as its own turn/ply -- resolve() runs the actual ascend when it's answered.
             return self.with_(turn_player=player,

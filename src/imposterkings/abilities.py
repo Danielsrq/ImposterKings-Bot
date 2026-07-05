@@ -337,11 +337,16 @@ def resolve(state: GameState, action: Action) -> GameState:
         if action.kind == ActionKind.REVEAL_KINGSHAND:
             reactor = step.actor
             i = _stack_index_of(state, step.source)
-            return state.advance(
+            # A card counters a card: both are expended and the interaction is undone. The countered
+            # card leaves the stack (leading reverts to what's beneath), both go to discard, and the turn
+            # RETURNS to the active player, who must play again (must beat the reverted leading). The
+            # active player is still ``turn_player`` -- the reaction only moved ``pending[-1].actor``.
+            st = state.with_(
                 stack=_without_index(state.stack, i),
                 discard=state.discard + (step.source, KINGSHAND_ID),
                 hands=_set_index(state.hands, reactor, _without(state.hands[reactor], KINGSHAND_ID)),
             )
+            return st._begin_turn(st.turn_player, ascend=False)
         # Declined: apply the declared ability. Guesses carry their name; the flattened Mystic/Fool carry
         # their parameter (number / stack index); Sentry/Princess fall through to their own sub-decisions.
         if step.guess is not None:
