@@ -1,7 +1,7 @@
 """Search-scaling study: MCTS@N vs a fixed MCTS@baseline, with starting-position evals + calibration.
 
-    python -m imposterkings.search_scaling                          # 25..500 step 25, 50 deals each
-    python -m imposterkings.search_scaling --deals 100 --workers 8
+    python -m imposterkings.analysis.search_scaling                 # 25..500 step 25, 50 deals each
+    python -m imposterkings.analysis.search_scaling --deals 100 --workers 8
 
 For each N and each deal we collect three things:
   1. **Win-rate** of MCTS@N vs MCTS@baseline (mirrored seating, paired seeds).
@@ -28,10 +28,10 @@ from typing import Dict, List
 
 import numpy as np
 
-from .agents import MCTSAgent
-from .arena import play_game
-from .mcts import SearchConfig, search
-from .state import GameState
+from ..agents import MCTSAgent
+from ..arena import play_game
+from ..mcts import SearchConfig, search
+from ..state import GameState
 
 
 def _summarize(result):

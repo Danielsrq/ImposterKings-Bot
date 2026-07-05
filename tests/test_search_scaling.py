@@ -5,7 +5,7 @@ import pytest
 
 pytest.importorskip("joblib")
 
-from imposterkings.search_scaling import (  # noqa: E402
+from imposterkings.analysis.search_scaling import (  # noqa: E402
     _EVAL_COLS, _KNOW_COLS, flatten_evals, run_sweep, save_calibration_plot, save_csv, save_eval_csv,
     save_eval_plot, save_plot,
 )

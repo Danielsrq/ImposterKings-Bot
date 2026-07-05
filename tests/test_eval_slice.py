@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import csv
 
-from imposterkings.eval_slice import (
+from imposterkings.analysis.eval_slice import (
     OUT_COLS, PG_COLS, per_game_rows, slice_rows, sweep_summary, write_csv,
 )
-from imposterkings.search_scaling import _EVAL_COLS
+from imposterkings.analysis.search_scaling import _EVAL_COLS
 
 
 def _rec(n, seed, *, nsw, bsw, agree=1, correct_n=1, correct_b=1):
