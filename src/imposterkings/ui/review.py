@@ -731,6 +731,10 @@ def main(argv=None) -> None:
     p.add_argument("--game", type=int, default=0, help="which game in a multi-game --replay file")
     p.add_argument("--fast", action="store_true",
                    help="replay without re-searching (board + stored evals; skips the deep icicle)")
+    p.add_argument("--review-k", type=int, default=50,
+                   help="re-search the replay at hybrid-k STRENGTH (default 50 -- a stronger read than the "
+                        "recorded budget; 0 = use the recorded generation budget)")
+    p.add_argument("--review-l", type=int, default=None, help="l for --review-k (default: recorded / 3)")
     args = p.parse_args(argv)
 
     t0 = time.perf_counter()
@@ -742,16 +746,22 @@ def main(argv=None) -> None:
             p.error(f"{args.replay} has no games")
         rec = recs[args.game]
         g = rec.get("gen") or {}
-        bud = (budget_mod.make_budget(g["mode"], k=g["k"], l=g.get("l") or 3)
-               if g.get("mode") in ("hybrid", "branching") else None)
-        its = g["k"] if g.get("mode") == "fixed" else args.iters
+        if args.review_k:                                 # nonzero (default 50) -> hybrid-k re-eval
+            lval = args.review_l if args.review_l is not None else (g.get("l") or 3)
+            bud, its = budget_mod.make_budget("hybrid", k=args.review_k, l=lval), args.iters
+            strength = f"hybrid-k{args.review_k}-l{lval} re-eval"
+        else:                                             # --review-k 0 -> faithful recorded budget
+            bud = (budget_mod.make_budget(g["mode"], k=g["k"], l=g.get("l") or 3)
+                   if g.get("mode") in ("hybrid", "branching") else None)
+            its = g["k"] if g.get("mode") == "fixed" else args.iters
+            strength = g.get("spec", "?")
         init = GameState.deal(np.random.default_rng(rec["deal_seed"]))
         moves = [record.dict_to_action(d["chosen"]) for d in rec["decisions"]]
-        print(f"Replaying {args.replay} game {args.game} "
-              f"({g.get('spec', '?')}, {len(moves)} plies, {'fast' if args.fast else 're-search'})...")
+        mode_s = "fast" if args.fast else f"re-search @ {strength}"
+        print(f"Replaying {args.replay} game {args.game} ({g.get('spec', '?')}, {len(moves)} plies, {mode_s})...")
         traj = scripted_trajectory(init, moves, iters=its, budget=bud, seed=rec["deal_seed"],
                                    search=not args.fast)
-        cap = f"replay {os.path.basename(args.replay)} #{args.game}"
+        cap = f"replay {os.path.basename(args.replay)} #{args.game}  [{strength}]"
     else:
         bud = None if args.p1 == "mcts" else budget_mod.make_budget(args.p1, k=args.k, l=args.l)
         cfg = f"iters={args.iters}" if bud is None else bud.label
