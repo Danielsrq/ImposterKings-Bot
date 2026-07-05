@@ -20,7 +20,17 @@ python -m imposterkings.cli --p0 mcts  --p1 random --iters 1000 --explain   # sh
 
 # PyGame window (click action buttons; opponent is a bot)
 python -m imposterkings.ui.app --p1 mcts --iters 800
+
+# Bot with a per-decision budget instead of fixed iterations:
+#   hybrid    = clamp(k * eff_legal(l) * (1 + opp_cards), 64, 4096)   (branch + hand scaling)
+#   branching = clamp(k * eff_legal(l), 64, 4096)
+# k scales the budget; l = how many effective moves a sub-decision card (guess/select) counts as.
+python -m imposterkings.ui.app --p1 hybrid --k 50 --l 3
+python -m imposterkings.ui.review --p1 hybrid --k 50 --l 3 --seed 0   # post-game review of a bot-vs-bot game
 ```
+
+The engine config (fixed iters vs branch vs branch+hand-scaling, and N/k/l) is also editable live via the
+in-app **⚙ Settings** modal, and drives both the bot and the analysis/hint panels.
 
 ## Scenario builder & headless testing
 
@@ -64,13 +74,6 @@ traj = review.build_trajectory(iters=200, seed=0, initial_state=st)
 `scenario.build` also accepts `hidden=`, `kings=`, `discard=`, and an explicit `pending=` to start
 mid-ability; `sb.cid("Oathbound", 1)` picks the 2nd instance of a duplicate.
 
-## Test
-
-```bash
-.venv\Scripts\python -m pytest -q              # fast suite
-.venv\Scripts\python -m pytest -q -m slow      # MCTS-strength arena
-```
-
 ## Architecture (`src/imposterkings/`)
 
 The engine is pure and copy-on-write; agents only ever see an `InformationSet`, never the omniscient
@@ -91,3 +94,23 @@ the MCTS (ported near-verbatim from bigtwo) needs no special-casing.
 
 The neural-net dataset/training pipeline (goal 3) is deferred; the seams exist
 (`record.play_and_record`, `SearchResult.policy_target`).
+
+## Roadmap / TODO
+
+1. **GodMode agent** — MCTS over the *fully-determined* game (an all-knowing observer). With perfect
+   information there are no information sets and no determinization, so it is plain MCTS on the concrete
+   `GameState`. A strong upper-bound baseline and a debugging oracle.
+2. **Complexity analysis (redo)** — re-run the branching-factor / game-length / decision-count analysis;
+   it predates a batch of engine bug-fixes (King's-Hand turn order, guess windows, …) so the old numbers
+   are stale. Informs the budgets/dataset sizing below.
+3. **NN datasets** — generate + analyze self-play datasets. A quick warm-start set from basic **MCTS@500**
+   (or **MCTS@k=10**); sizing and the sampling budget informed by (2).
+4. **Train NN models** — start with an **MLP** value/policy head (with room for richer architectures);
+   this is the warm start for DQN self-play.
+5. **NN-in-the-loop**
+   - **5a** — use the trained NN as the **eval head for MCTS** (AlphaZero-style leaf evaluation, replacing
+     random rollouts).
+   - **5b** — **DQN self-play** to improve the model; benchmark by win-rate vs **MCTS@k=100** (or 50) —
+     thresholds calibrated against (2).
+   - **5c** — an **explainable Attention+MLP** model: inspect the attention to see *which cards* drive each
+     decision.
