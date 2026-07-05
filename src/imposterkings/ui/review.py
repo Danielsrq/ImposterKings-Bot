@@ -302,14 +302,18 @@ def _collect_subtree_ids(node, out: set) -> None:
         stack.extend(n.children.values())
 
 
-def _grafted_tree(traj, seat: int, start: int, end: int, cursor: int, res0):
+def _grafted_tree(traj, seat: int, start: int, end: int, cursor: int, res0, *, renormalise: bool = False):
     """Once the cursor steps INTO a turn, replace each stepped-past sub-band with that ply's OWN
     authoritative search (full budget), keeping the turn-root band fixed and greying the unchosen
     parent branches. Returns ``(grafted_result, graft_ids, dim_ids, tip_sims)`` or ``None`` when there
     is nothing to graft (cursor at the turn root, or every deeper ply was forced / the other seat's).
 
     Only this ``seat``'s own per-ply searches are grafted into this ``seat``'s panel, so the whole
-    picture stays in one perspective (no value-sign/knowledge seam across bands)."""
+    picture stays in one perspective (no value-sign/knowledge seam across bands).
+
+    ``renormalise``: instead of greying the unchosen siblings' whole subtrees (contain mode), replace
+    each unchosen sibling with a CHILDLESS greyed clone -- its subtree is dropped so the grafted band can
+    be laid full-width (the caller passes ``renormalise=True`` to ``draw_icicle`` too)."""
     upto = min(cursor, end)
     steps_in = upto - start
     if steps_in <= 0 or res0 is None or getattr(res0, "root", None) is None:
@@ -335,7 +339,13 @@ def _grafted_tree(traj, seat: int, start: int, end: int, cursor: int, res0):
             graft_ids.add(id(syn_child))
             tip_sims = gsrc.root.n
             for c in cur_orig.children.values():          # grey the now-superseded unchosen siblings
-                if c is not orig_child:
+                if c is orig_child:
+                    continue
+                if renormalise:                           # drop the subtree -> full width for the graft band
+                    clone = graft_node(c, {})
+                    cur_syn.children[c.incoming_move] = clone
+                    dim_ids.add(id(clone))
+                else:                                     # contain mode: keep the subtree, just grey it
                     _collect_subtree_ids(c, dim_ids)
             next_orig = gsrc.root                          # next chosen move lives in the grafted band
         else:                                             # forced / other seat: keep the original subtree
@@ -348,7 +358,8 @@ def _grafted_tree(traj, seat: int, start: int, end: int, cursor: int, res0):
     return _GraftedResult(syn_root, res0.info), graft_ids, dim_ids, tip_sims
 
 
-def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, zoom_stack, last_tree):
+def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, zoom_stack, last_tree,
+                renorm=False):
     """Draw ``seat``'s read of the CURRENT turn's position. Both panels show the same turn: the mover's
     real search on its side, the opponent's search of the same state on the other -- so P1's tree updates
     during P0's turns too. The actually-played line is highlighted in both. Returns icicle blocks."""
@@ -386,11 +397,13 @@ def _draw_panel(surface, fonts, traj, seat, turn, cursor, tree_rect, mode, ost, 
               (tx + 4, ty - 22), MUTE)
     if mode == "icicle":
         zoom_root = zoom_stack[-1] if zoom_stack else None
-        g = _grafted_tree(traj, seat, start, end, cursor, res)   # step into the turn -> authoritative sub-bands
+        g = _grafted_tree(traj, seat, start, end, cursor, res,   # step into the turn -> authoritative sub-bands
+                          renormalise=renorm)
         if g is not None:
             gres, graft_ids, dim_ids, tip_sims = g
             blocks = draw_icicle(surface, fonts, gres, tree_rect, played_path=path, zoom_root=zoom_root,
-                                 graft_ids=graft_ids, dim_ids=dim_ids, band_sims=tip_sims)
+                                 graft_ids=graft_ids, dim_ids=dim_ids, band_sims=tip_sims,
+                                 renormalise=renorm)
         else:
             blocks = draw_icicle(surface, fonts, res, tree_rect, played_path=path, zoom_root=zoom_root)
     else:
@@ -481,6 +494,7 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
     W, H = WINDOW
     med, small = fonts["med"], fonts["small"]
     cursor, mode = 0, "icicle"
+    renorm = False                              # graft sub-bands: contain (False) vs full-width renormalise
     ost = {0: {"exp": set(), "scroll": 0}, 1: {"exp": set(), "scroll": 0}}
     zoom = {0: [], 1: []}                       # per-panel node zoom stacks
     last_tree = {0: None, 1: None}              # last non-None (result, played_path) per seat
@@ -500,13 +514,14 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
         _text(screen, small, f"Ply {cursor + 1}/{len(traj)}  —  {turn_label}  ·  P{rec.seat} played "
                              f"{_compact_action(rec.move)}", (12, 32), GOLD)
         specs = [("prev", "◄ Prev", 12), ("next", "Next ►", 102), ("outline", "Outline", 210),
-                 ("icicle", "Icicle", 300), ("zout", "⬆ Zoom out", 390)]
+                 ("icicle", "Icicle", 300), ("zout", "⬆ Zoom out", 390), ("renorm", "Renorm", 496)]
         btns = {}
         for key, label, bx in specs:
-            r = pygame.Rect(bx, 50, 84 if key != "zout" else 96, 22)
-            btns[key] = _button(screen, small, label, r, active=(key == mode), hover=r.collidepoint(mouse))
-        _text(screen, small, "◄/► step · I/O view · click card/graph=jump · click box=zoom · "
-                             "Backspace=out · Esc quit", (500, 54), MUTE)
+            r = pygame.Rect(bx, 50, 96 if key in ("zout", "renorm") else 84, 22)
+            active = (key == "renorm" and renorm) or (key != "renorm" and key == mode)
+            btns[key] = _button(screen, small, label, r, active=active, hover=r.collidepoint(mouse))
+        _text(screen, small, "◄/► step · I/O view · R renorm · click card/graph=jump · click box=zoom · "
+                             "Backspace=out · Esc quit", (604, 54), MUTE)
 
         _draw_graph(screen, fonts, traj, turns, cursor, TL_TOP)
         strip_hits = _draw_strip(screen, fonts, traj, turns, cursor)
@@ -519,9 +534,9 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
         cur_turn = turns[_current_turn(turns, cursor)]        # both panels show the SAME (current) turn
         blocks = {
             0: _draw_panel(screen, fonts, traj, 0, cur_turn, cursor, lrect, mode,
-                           ost[0], zoom[0], last_tree),
+                           ost[0], zoom[0], last_tree, renorm),
             1: _draw_panel(screen, fonts, traj, 1, cur_turn, cursor, rrect, mode,
-                           ost[1], zoom[1], last_tree),
+                           ost[1], zoom[1], last_tree, renorm),
         }
         hover_turn = next((s for r, s in strip_hits if r.collidepoint(mouse)), None)
         if hover_turn is not None:               # hovering a strip card -> the true-board popup for its turn
@@ -547,6 +562,8 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
                     mode = "outline"
                 elif e.key == pygame.K_i:
                     mode = "icicle"
+                elif e.key == pygame.K_r:
+                    renorm = not renorm
                 elif e.key == pygame.K_BACKSPACE:
                     for z in zoom.values():
                         if z:
@@ -568,6 +585,8 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
                     mode = "outline"
                 elif btns["icicle"].collidepoint(pos):
                     mode = "icicle"
+                elif btns["renorm"].collidepoint(pos):
+                    renorm = not renorm
                 elif btns["zout"].collidepoint(pos):
                     for z in zoom.values():
                         if z:

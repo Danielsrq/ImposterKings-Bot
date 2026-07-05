@@ -134,7 +134,7 @@ def path_node_ids(root, played_path) -> Set[int]:
 def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, *,
                   top_k: int = 6, max_turns: int = 6, band_gap: float = 0.0,
                   on_path_ids: Set[int] = frozenset(),
-                  graft_ids: Set[int] = frozenset()) -> List[Block]:
+                  graft_ids: Set[int] = frozenset(), renormalise: bool = False) -> List[Block]:
     """Ply-banded icicle layout for ``root``'s subtree within ``rect`` = (x, y, w, h).
 
     x: recursive visit partition (child width = parent width * child.n / parent.n, top-``top_k`` kids).
@@ -145,6 +145,10 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
     ``node.n``). Such a node's children are normalized by their own visit-sum so the band fills the
     parent cell exactly (no overflow); every other node keeps the usual ``node.n`` normalization,
     including the blank remainder left by pruned/untried children.
+
+    ``renormalise``: lay a graft node's children across the FULL width ``(x0, W)`` instead of within the
+    parent cell -- the grafted band then shows the conditional distribution at full resolution (and can be
+    wider than its parent). Callers must have dropped the unchosen siblings' subtrees so nothing collides.
     """
     x0, y0, W, H = rect
     raw: List[list] = []                  # [node, x, w, turn_index, local_depth]
@@ -154,12 +158,13 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
         band_maxlocal[turn_index] = max(band_maxlocal.get(turn_index, 0), local_depth)
         raw.append([node, x, w, turn_index, local_depth])
         kids = sorted(node.children.values(), key=lambda c: c.n, reverse=True)[:top_k]
-        total = sum(c.n for c in kids) if id(node) in graft_ids else node.n
+        grafted = id(node) in graft_ids
+        total = sum(c.n for c in kids) if grafted else node.n
         if not total:
             return
-        cx = x
+        cx, span = (x0, W) if (grafted and renormalise) else (x, w)   # renormalise: full-width band
         for c in kids:
-            cw = w * (c.n / total)
+            cw = span * (c.n / total)
             if c.player_just_moved == node.player_just_moved:
                 ct, cl = turn_index, local_depth + 1
             else:
@@ -219,7 +224,7 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
                 played_path=None, zoom_root=None, dim: bool = False,
                 top_k: int = 6, max_turns: int = 6,
                 dim_ids: Set[int] = frozenset(), graft_ids: Set[int] = frozenset(),
-                band_sims: Optional[int] = None) -> List[Block]:
+                band_sims: Optional[int] = None, renormalise: bool = False) -> List[Block]:
     """Draw the ply-banded icicle for a SearchResult into ``rect``; returns the laid-out blocks.
 
     ``played_path`` (moves) highlights the played line (trail + the current, deepest box). ``zoom_root``
@@ -240,7 +245,7 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
     bh = bf.get_linesize()
     blocks = layout_icicle(layout_root, rect, result.info.observer,
                            top_k=top_k, max_turns=max_turns, band_gap=bh, on_path_ids=on_ids,
-                           graft_ids=graft_ids)
+                           graft_ids=graft_ids, renormalise=renormalise)
     line_h = small.get_linesize()
     for b in blocks:
         r = pygame.Rect(int(b.x), int(b.y), max(1, int(b.w) - 1), max(1, int(b.h) - 1))

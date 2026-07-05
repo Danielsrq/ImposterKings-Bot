@@ -272,3 +272,53 @@ def test_graft_node_shallow_clone_keeps_stats_swaps_children():
     assert (clone.n, clone.w, clone.incoming_move, clone.player_just_moved) == \
            (orig.n, orig.w, orig.incoming_move, orig.player_just_moved)
     assert orig.children                                        # original's children left intact
+
+
+def _graft_band_sum(blocks, graft_ids):
+    """(chosen-cell width, sum of the grafted band's child widths) for the first graft node."""
+    gb = next(b for b in blocks if id(b.node) in graft_ids)
+    kids = [b for b in blocks if b.node in gb.node.children.values()]
+    return gb.w, sum(b.w for b in kids)
+
+
+def test_renormalise_makes_graft_band_full_width_with_childless_dims():
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    traj = build_trajectory(iters=30, seed=0)
+    turn = _graftable_turn(traj)
+    assert turn is not None
+    s, e, owner = turn
+    res0 = _res0_for(traj, turn)
+    rect = (6, 120, 600, 400)                                   # panel width W = 600
+    path = played_path(traj, s, s + 1)
+
+    # contain (default): the grafted band fits within the chosen parent cell
+    gc = _grafted_tree(traj, owner, s, e, s + 1, res0, renormalise=False)
+    bc = draw_icicle(screen, fonts, gc[0], rect, played_path=path,
+                     graft_ids=gc[1], dim_ids=gc[2], band_sims=gc[3], renormalise=False)
+    cell_c, sum_c = _graft_band_sum(bc, gc[1])
+    assert abs(sum_c - cell_c) < 1.0                            # band contained in the parent cell
+
+    # renormalise: the grafted band spans the full panel width and exceeds its parent cell
+    gr = _grafted_tree(traj, owner, s, e, s + 1, res0, renormalise=True)
+    gres, graft_ids, dim_ids, tip = gr
+    assert dim_ids and all(not b_node_children(gres, i) for i in dim_ids)  # dropped subtrees -> childless
+    br = draw_icicle(screen, fonts, gres, rect, played_path=path,
+                     graft_ids=graft_ids, dim_ids=dim_ids, band_sims=tip, renormalise=True)
+    cell_r, sum_r = _graft_band_sum(br, graft_ids)
+    assert abs(sum_r - 600) < 1.0                               # band renormalised to the full width
+    assert sum_r > cell_r + 1.0                                 # child band wider than its parent cell
+    assert block_at(br, (br[0].x + 1, br[0].y + 1)) is not None
+    pygame.display.quit()
+
+
+def b_node_children(gres, node_id):
+    """True if the node with ``node_id`` in the grafted tree has any children (helper for the dim test)."""
+    stack = [gres.root]
+    while stack:
+        n = stack.pop()
+        if id(n) == node_id:
+            return bool(n.children)
+        stack.extend(n.children.values())
+    return False
