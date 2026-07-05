@@ -601,7 +601,8 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
                 elif mode == "icicle":                                # click a box -> zoom in
                     zseat = 0 if pos[0] < mid else 1
                     hb = block_at(blocks[zseat], pos)
-                    if hb is not None and hb.node.children:
+                    if hb is not None and hb.node.children and (
+                            not zoom[zseat] or hb.node is not zoom[zseat][-1]):  # not the visible root band
                         zoom[zseat].append(hb.node)
                 elif mode == "outline":                               # click a row -> expand/collapse
                     for seat_, hitmap in blocks.items():

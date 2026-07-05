@@ -134,7 +134,8 @@ def path_node_ids(root, played_path) -> Set[int]:
 def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, *,
                   top_k: int = 6, max_turns: int = 6, band_gap: float = 0.0,
                   on_path_ids: Set[int] = frozenset(),
-                  graft_ids: Set[int] = frozenset(), renormalise: bool = False) -> List[Block]:
+                  graft_ids: Set[int] = frozenset(), renormalise: bool = False,
+                  include_root: bool = False) -> List[Block]:
     """Ply-banded icicle layout for ``root``'s subtree within ``rect`` = (x, y, w, h).
 
     x: recursive visit partition (child width = parent width * child.n / parent.n, top-``top_k`` kids).
@@ -149,6 +150,9 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
     ``renormalise``: lay a graft node's children across the FULL width ``(x0, W)`` instead of within the
     parent cell -- the grafted band then shows the conditional distribution at full resolution (and can be
     wider than its parent). Callers must have dropped the unchosen siblings' subtrees so nothing collides.
+
+    ``include_root``: emit ``root`` itself as a full-width band at the top (its subtree hangs below),
+    instead of the default children-only layout -- used when zoomed so the clicked node stays visible.
     """
     x0, y0, W, H = rect
     raw: List[list] = []                  # [node, x, w, turn_index, local_depth]
@@ -174,10 +178,13 @@ def layout_icicle(root, rect: Tuple[float, float, float, float], observer: int, 
             cx += cw
 
     root_n = root.n or 1
-    cx = x0
-    for c in sorted(root.children.values(), key=lambda c: c.n, reverse=True)[:top_k]:
-        walk(c, cx, W * (c.n / root_n), 0, 0)
-        cx += W * (c.n / root_n)
+    if include_root:                          # emit the (zoomed) root as a full-width band + its subtree
+        walk(root, x0, W, 0, 0)
+    else:
+        cx = x0
+        for c in sorted(root.children.values(), key=lambda c: c.n, reverse=True)[:top_k]:
+            walk(c, cx, W * (c.n / root_n), 0, 0)
+            cx += W * (c.n / root_n)
 
     bands_present: List[int] = []
     acc = 0
@@ -240,12 +247,13 @@ def draw_icicle(surface, fonts, result, rect: Tuple[int, int, int, int], *,
         _text(surface, small, "(no search tree)", (x0 + 6, y0 + 6), MUTE)
         return []
     on_ids = path_node_ids(result.root, played_path)
-    layout_root = zoom_root if (zoom_root is not None and zoom_root.children) else result.root
+    zoomed = zoom_root is not None and bool(zoom_root.children)
+    layout_root = zoom_root if zoomed else result.root
     bf = _band_font()
     bh = bf.get_linesize()
     blocks = layout_icicle(layout_root, rect, result.info.observer,
                            top_k=top_k, max_turns=max_turns, band_gap=bh, on_path_ids=on_ids,
-                           graft_ids=graft_ids, renormalise=renormalise)
+                           graft_ids=graft_ids, renormalise=renormalise, include_root=zoomed)
     line_h = small.get_linesize()
     for b in blocks:
         r = pygame.Rect(int(b.x), int(b.y), max(1, int(b.w) - 1), max(1, int(b.h) - 1))

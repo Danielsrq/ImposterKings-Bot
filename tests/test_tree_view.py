@@ -112,6 +112,28 @@ def test_draw_hittest_tooltip_and_zoom_headless():
     pygame.display.quit()
 
 
+def test_zoom_keeps_clicked_node_as_full_width_root_band():
+    pygame.display.init()
+    screen = pygame.display.set_mode((800, 600))
+    fonts = make_fonts()
+    res = _searched()
+    rect = (10, 50, 600, 400)
+    child = max((c for c in res.root.children.values() if c.children), key=lambda c: c.n)
+
+    plain = draw_icicle(screen, fonts, res, rect)               # not zoomed -> root itself never emitted
+    assert plain and all(b.node is not res.root for b in plain)
+
+    zoomed = draw_icicle(screen, fonts, res, rect, zoom_root=child)
+    root_blocks = [b for b in zoomed if b.node is child]
+    assert len(root_blocks) == 1                                # the clicked node stays visible
+    rb = root_blocks[0]
+    assert abs(rb.x - 10) < 1e-6 and abs(rb.w - 600) < 1.0      # full-width band
+    assert abs(rb.y - min(b.y for b in zoomed)) < 1e-6          # sitting at the top
+    kids = [b for b in zoomed if b.node in child.children.values()]
+    assert kids and all(k.y > rb.y for k in kids)               # its children hang below it
+    pygame.display.quit()
+
+
 def test_headline_card_of_a_turn():
     play = Action(ActionKind.PLAY_CARD, card=3)
 
