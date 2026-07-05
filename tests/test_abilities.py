@@ -125,13 +125,33 @@ def test_judge_guess_is_mandatory_no_decline():
 
 
 def test_judge_correct_guess_queues_to_own_antechamber():
-    st = mainstate(hand0=(cid("Judge"), cid("Fool")), hand1=(cid("Warlord"),), stack=(sc("Elder"),))
+    st = mainstate(hand0=(cid("Judge"), cid("Queen")), hand1=(cid("Warlord"),), stack=(sc("Elder"),))
     st = run(st, _play(cid("Judge")), _guess("Warlord"), DECLINE_REACTION)
     assert st.phase == StepKind.ABILITY_HAND_CARD
     assert STOP in st.legal_moves()  # may decline to queue
-    st = run(st, _hand(cid("Fool")))
-    assert st.antechambers[0] == (cid("Fool"),)
-    assert cid("Fool") not in st.hands[0]
+    st = run(st, _hand(cid("Queen")))
+    assert st.antechambers[0] == (cid("Queen"),)
+    assert cid("Queen") not in st.hands[0]
+
+
+def test_judge_cannot_schedule_base_value_1_fool():
+    # The Judge may only queue a card with BASE value >= 2, so the Fool (value 1) is never offered --
+    # not even the Judge+Fool "force my own Fool to ascend next turn" combo.
+    st = mainstate(hand0=(cid("Judge"), cid("Fool"), cid("Queen")), hand1=(cid("Warlord"),),
+                   stack=(sc("Elder"),))
+    st = run(st, _play(cid("Judge")), _guess("Warlord"), DECLINE_REACTION)
+    offered = {cards.card_name(m.card) for m in st.legal_moves() if m.card is not None}
+    assert "Fool" not in offered and "Queen" in offered
+    assert STOP in st.legal_moves()
+    # base value is immutable: muting value 1 (Fool plays as 3) does NOT make it schedulable
+    stm = mainstate(hand0=(cid("Judge"), cid("Fool"), cid("Queen")), hand1=(cid("Warlord"),),
+                    stack=(sc("Elder"),), muted={1})
+    stm = run(stm, _play(cid("Judge")), _guess("Warlord"), DECLINE_REACTION)
+    assert "Fool" not in {cards.card_name(m.card) for m in stm.legal_moves() if m.card is not None}
+    # with only a Fool to schedule, the player must decline (STOP only)
+    sto = mainstate(hand0=(cid("Judge"), cid("Fool")), hand1=(cid("Warlord"),), stack=(sc("Elder"),))
+    sto = run(sto, _play(cid("Judge")), _guess("Warlord"), DECLINE_REACTION)
+    assert sto.legal_moves() == [STOP]
 
 
 def test_inquisitor_forces_opponent_card_into_opponent_antechamber():

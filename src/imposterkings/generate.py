@@ -94,10 +94,13 @@ def legal_moves(state: GameState) -> List[Action]:
                 for n in range(rules.MYSTIC_MIN, rules.MYSTIC_MAX + 1)]
 
     if k == StepKind.ABILITY_HAND_CARD:
-        moves = [Action(ActionKind.CHOOSE_HAND_CARD, card=c) for c in _dedupe_by_name(state.hands[actor])]
+        cand = _dedupe_by_name(state.hands[actor])
         if cards.card_ability(step.source) == Ability.JUDGE:
-            moves.append(STOP)  # may decline to queue a card
-        return moves
+            # Judge may schedule only a card with BASE value >= 2 (immutable, so muting is irrelevant) --
+            # the Fool cannot be queued. May also decline (STOP).
+            cand = [c for c in cand if cards.card_value(c) >= 2]
+            return [Action(ActionKind.CHOOSE_HAND_CARD, card=c) for c in cand] + [STOP]
+        return [Action(ActionKind.CHOOSE_HAND_CARD, card=c) for c in cand]
 
     if k == StepKind.ABILITY_SWAP_RESPOND:
         return [Action(ActionKind.CHOOSE_HAND_CARD, card=c) for c in _dedupe_by_name(state.hands[actor])]
