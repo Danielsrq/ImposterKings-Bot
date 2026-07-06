@@ -19,6 +19,7 @@ data/
 datasets/
 models/
 results/
+runs/
 *.npz
 *.pt
 
