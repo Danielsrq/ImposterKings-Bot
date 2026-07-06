@@ -60,6 +60,23 @@ python -m imposterkings.ui.app --nn models/mlp_32.pt
 Note: greedy-over-learned-`q` is typically weaker than the MCTS that generated the targets (~50% top-1
 agreement), so ~50-50 vs k20 is the optimistic ceiling; the benchmark quantifies the distillation gap.
 
+## AlphaZero-style self-play loop
+
+Wire the net into ISMCTS as a **value + policy head** (PUCT selection, `V=max_a Q`, `P=softmax Q`, no
+rollout) and bootstrap: NN-MCTS self-play → better `mean_q` targets → retrain → repeat.
+
+| module | what |
+|---|---|
+| `evaluator.py` | `build_evaluator(ckpt)` → `state -> ([per-seat value], {move: prior})` (numpy inference; the `mcts.SearchConfig.evaluator` hook). |
+| `loop.py` | iterates: NN-MCTS self-play (`datagen --value-checkpoint`) → `dataset` → `train` → head-to-head vs a fixed rollout-MCTS reference. |
+
+```bash
+python -m imposterkings.machine_learning.loop --iterations 3 --games 2000 --mode fixed --k 600 \
+    --arch 256 --temp-plies 6 --init-checkpoint models/mlp_32.pt --out-dir runs/az1 --workers 10
+```
+The net is used iff attached (`SearchConfig.evaluator`); the default rollout MCTS is untouched. NN-MCTS is
+fast (a numpy leaf eval, no rollout), so `--k` sims can be lower than pure MCTS.
+
 ## Deferred
-The attention model (token adapter of the same `features.py`); target blends (`λ·z+(1−λ)·q`) and belief
-features; NN as a search prior / eval-head rather than a standalone greedy policy.
+Two-head net (value→`z`, policy→`π`); the attention model (token adapter of the same `features.py`);
+Dirichlet root noise + `c_puct`/FPU tuning; batched leaf evaluation.

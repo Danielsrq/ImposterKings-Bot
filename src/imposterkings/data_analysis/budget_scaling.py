@@ -64,10 +64,10 @@ def _budget_of(spec: Spec):
     return None
 
 
-def make_agent(spec: Spec, *, evaluate_forced: bool = False) -> MCTSAgent:
+def make_agent(spec: Spec, *, evaluate_forced: bool = False, evaluator=None) -> MCTSAgent:
     if spec[0] == "fixed":
-        return MCTSAgent(iterations=spec[1], evaluate_forced=evaluate_forced)
-    return MCTSAgent(budget=_budget_of(spec), evaluate_forced=evaluate_forced)
+        return MCTSAgent(iterations=spec[1], evaluate_forced=evaluate_forced, evaluator=evaluator)
+    return MCTSAgent(budget=_budget_of(spec), evaluate_forced=evaluate_forced, evaluator=evaluator)
 
 
 def spec_label(spec: Spec) -> str:

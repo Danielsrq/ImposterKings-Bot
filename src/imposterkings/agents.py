@@ -47,13 +47,16 @@ class MCTSAgent:
     name = "mcts"        # class default; per-instance name (set below) reflects the budget mode
 
     def __init__(self, iterations: int = 1000, c: float = DEFAULT_C, use_knowledge: bool = True,
-                 evaluate_forced: bool = False, budget: Optional[Callable] = None) -> None:
+                 evaluate_forced: bool = False, budget: Optional[Callable] = None,
+                 evaluator: Optional[Callable] = None) -> None:
         self.iterations = iterations
         self.c = c
         self.use_knowledge = use_knowledge     # False = ignore guess-leaked facts (A/B benchmarking)
         self.evaluate_forced = evaluate_forced
         self.budget = budget                   # None -> fixed self.iterations
-        self.name = "mcts" if budget is None else f"mcts-{getattr(budget, 'label', 'budget')}"
+        self.evaluator = evaluator             # NN value/policy head -> PUCT search (None = classic rollout)
+        self.name = ("nn-mcts" if evaluator is not None else
+                     "mcts" if budget is None else f"mcts-{getattr(budget, 'label', 'budget')}")
         self.last_result: Optional[SearchResult] = None
 
     def select_move(self, view: InformationSet, rng: np.random.Generator) -> Action:
@@ -62,7 +65,8 @@ class MCTSAgent:
             self.last_result = None
             return moves[0]
         iters = self.budget(view, moves) if self.budget is not None else self.iterations
-        config = SearchConfig(rng=rng, iterations=iters, c=self.c, use_knowledge=self.use_knowledge)
+        config = SearchConfig(rng=rng, iterations=iters, c=self.c, use_knowledge=self.use_knowledge,
+                              evaluator=self.evaluator)
         self.last_result = search(view, config)
         # The move is still forced when there is only one; return it explicitly (best_move agrees).
         return moves[0] if len(moves) == 1 else self.last_result.best_move

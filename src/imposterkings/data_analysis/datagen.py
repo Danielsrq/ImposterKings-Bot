@@ -60,19 +60,24 @@ class _TemperatureAgent:
         return move
 
 
-def _gen_meta(spec: Spec, temp_plies: int, base_seed: int) -> Dict:
+def _gen_meta(spec: Spec, temp_plies: int, base_seed: int, value_ckpt=None) -> Dict:
     return {"spec": spec_label(spec), "mode": spec[0], "k": spec[1],
             "l": spec[2] if len(spec) > 2 else None,
-            "temp_plies": temp_plies, "self_play": True, "base_seed": base_seed}
+            "temp_plies": temp_plies, "self_play": True, "base_seed": base_seed,
+            "value_ckpt": value_ckpt}
 
 
-def collect_game(spec: Spec, seed: int, temp_plies: int, base_seed: int) -> GameRecord:
-    """Play one self-play game from deal ``seed``; return a replayable, target-carrying GameRecord."""
+def collect_game(spec: Spec, seed: int, temp_plies: int, base_seed: int,
+                 evaluator=None, value_ckpt=None) -> GameRecord:
+    """Play one self-play game from deal ``seed``; return a replayable, target-carrying GameRecord.
+
+    ``evaluator`` (from a checkpoint) turns the self-play agents into NN-MCTS (PUCT); ``value_ckpt`` is
+    its path, recorded in the gen meta for provenance."""
     def mk():
-        a = make_agent(spec)
+        a = make_agent(spec, evaluator=evaluator)
         return _TemperatureAgent(a, temp_plies) if temp_plies > 0 else a
 
-    rec = GameRecord(gen=_gen_meta(spec, temp_plies, base_seed), deal_seed=seed)
+    rec = GameRecord(gen=_gen_meta(spec, temp_plies, base_seed, value_ckpt), deal_seed=seed)
 
     def collect(seat, view, move, agent, state):
         rec.decisions.append(DecisionRecord.build(seat, view, move, agent))
@@ -87,22 +92,27 @@ def collect_game(spec: Spec, seed: int, temp_plies: int, base_seed: int) -> Game
 
 
 def _chunk_task(spec: Spec, seeds: List[int], out_dir: str, shard_idx: int,
-                temp_plies: int, base_seed: int) -> Dict:
+                temp_plies: int, base_seed: int, value_ckpt=None) -> Dict:
     t0 = time.perf_counter()
-    recs = [collect_game(spec, s, temp_plies, base_seed) for s in seeds]
+    ev = None
+    if value_ckpt:                                    # NN-MCTS self-play: build the evaluator once/worker
+        from ..machine_learning.evaluator import build_evaluator
+        ev = build_evaluator(value_ckpt)
+    recs = [collect_game(spec, s, temp_plies, base_seed, evaluator=ev, value_ckpt=value_ckpt)
+            for s in seeds]
     path = os.path.join(out_dir, f"games_{shard_idx:05d}.jsonl")
     write_jsonl(path, recs)
     return {"count": len(recs), "seconds": time.perf_counter() - t0, "path": path}
 
 
 def run(spec: Spec, games: int, workers: int, chunk: int, base_seed: int,
-        temp_plies: int, out_dir: str) -> List[Dict]:
+        temp_plies: int, out_dir: str, value_ckpt=None) -> List[Dict]:
     from joblib import Parallel, delayed
     from tqdm import tqdm
 
     seeds = [base_seed + i for i in range(games)]
     chunks = [seeds[i:i + chunk] for i in range(0, games, chunk)]
-    jobs = [delayed(_chunk_task)(spec, ch, out_dir, idx, temp_plies, base_seed)
+    jobs = [delayed(_chunk_task)(spec, ch, out_dir, idx, temp_plies, base_seed, value_ckpt)
             for idx, ch in enumerate(chunks)]
     return list(tqdm(Parallel(n_jobs=workers, return_as="generator")(jobs),
                      total=len(chunks), desc="shards", unit="shard"))
@@ -121,6 +131,8 @@ def main(argv=None) -> None:
                    help="sample the played move for the first N decisions/agent (0 = greedy self-play)")
     p.add_argument("--out-dir", default=os.path.join("datasets", "selfplay_k20l3"))
     p.add_argument("--force", action="store_true", help="write into a non-empty --out-dir")
+    p.add_argument("--value-checkpoint", default=None,
+                   help="NN checkpoint -> NN-MCTS (PUCT) self-play instead of rollout MCTS")
     args = p.parse_args(argv)
 
     spec: Spec = ("fixed", args.k) if args.mode == "fixed" else (args.mode, args.k, args.l)
@@ -129,13 +141,14 @@ def main(argv=None) -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     n_shards = (args.games + args.chunk - 1) // args.chunk
-    print(f"datagen  spec={spec_label(spec)}  games={args.games}  temp_plies={args.temp_plies}  "
-          f"chunk={args.chunk} -> {n_shards} shards  workers={args.workers}  base_seed={args.base_seed}\n"
-          f"  -> {args.out_dir}")
+    engine = f"NN-MCTS(PUCT) <- {args.value_checkpoint}" if args.value_checkpoint else "rollout MCTS"
+    print(f"datagen  spec={spec_label(spec)}  engine={engine}  games={args.games}  "
+          f"temp_plies={args.temp_plies}  chunk={args.chunk} -> {n_shards} shards  "
+          f"workers={args.workers}  base_seed={args.base_seed}\n  -> {args.out_dir}")
 
     t0 = time.perf_counter()
     results = run(spec, args.games, args.workers, args.chunk, args.base_seed,
-                  args.temp_plies, args.out_dir)
+                  args.temp_plies, args.out_dir, value_ckpt=args.value_checkpoint)
     wall = time.perf_counter() - t0
 
     games = sum(r["count"] for r in results)

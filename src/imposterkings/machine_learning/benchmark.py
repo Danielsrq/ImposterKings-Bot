@@ -39,22 +39,27 @@ def parse_opponent(s: str) -> Spec:
     return ("nn", s) if s.endswith(".pt") else parse_spec(s)
 
 
-def _make_opp(spec: Spec):
+def _make_agent(spec: Spec, evaluator=None):
     if spec[0] == "nn":
         from .agent import NNAgent
         return NNAgent.from_checkpoint(spec[1])
     if spec[0] == "fixed":
-        return MCTSAgent(iterations=spec[1])
-    return MCTSAgent(budget=make_budget(spec[0], k=spec[1], l=spec[2]))
+        return MCTSAgent(iterations=spec[1], evaluator=evaluator)
+    return MCTSAgent(budget=make_budget(spec[0], k=spec[1], l=spec[2]), evaluator=evaluator)
 
 
-def _chunk(ckpt: str, label: str, spec: Spec, seeds: List[int], independent_rng: bool) -> Dict:
+def _chunk(ckpt: str, label: str, spec: Spec, seeds: List[int], independent_rng: bool,
+           nn_mcts: str = None) -> Dict:
     import torch
     torch.set_num_threads(1)                               # avoid thread oversubscription across workers
-    from .agent import NNAgent
     t0 = time.perf_counter()
-    nn = NNAgent.from_checkpoint(ckpt)                     # challenger, loaded once per worker task
-    opp = _make_opp(spec)                                  # opponent (MCTS or NN); stateless -> reuse
+    if nn_mcts is not None:                               # challenger is the net AS AN MCTS eval/policy head
+        from .evaluator import build_evaluator
+        nn = _make_agent(parse_spec(nn_mcts), evaluator=build_evaluator(ckpt))
+    else:                                                 # challenger is the greedy net (no search)
+        from .agent import NNAgent
+        nn = NNAgent.from_checkpoint(ckpt)
+    opp = _make_agent(spec)                               # opponent (MCTS or NN); stateless -> reuse
     rows = []
     for seed in seeds:
         nn_wins = 0
@@ -71,13 +76,13 @@ def _chunk(ckpt: str, label: str, spec: Spec, seeds: List[int], independent_rng:
 
 
 def run(ckpt: str, opponents: List[Tuple[str, Spec]], deals: int, workers: int, chunk: int,
-        base_seed: int, independent_rng: bool) -> List[Dict]:
+        base_seed: int, independent_rng: bool, nn_mcts: str = None) -> List[Dict]:
     from joblib import Parallel, delayed
     from tqdm import tqdm
 
     seeds = [base_seed + i for i in range(deals)]
     chunks = [seeds[i:i + chunk] for i in range(0, deals, chunk)]
-    jobs = [delayed(_chunk)(ckpt, label, spec, ch, independent_rng)
+    jobs = [delayed(_chunk)(ckpt, label, spec, ch, independent_rng, nn_mcts)
             for label, spec in opponents for ch in chunks]
     results = list(tqdm(Parallel(n_jobs=workers, return_as="generator")(jobs),
                         total=len(jobs), desc="chunks", unit="chunk"))
@@ -108,16 +113,20 @@ def main(argv=None) -> None:
     p.add_argument("--chunk", type=int, default=10)
     p.add_argument("--base-seed", type=int, default=0)
     p.add_argument("--shared-rng", action="store_true")
+    p.add_argument("--nn-mcts", default=None,
+                   help="use the net AS AN MCTS eval/policy head at this budget (e.g. fixed500, hybrid-k20-l3) "
+                        "instead of greedy play")
     p.add_argument("--out", default=None, help="optional CSV of the per-opponent results")
     args = p.parse_args(argv)
 
     opponents = [(f"nn:{os.path.basename(s)}" if s.endswith(".pt") else s, parse_opponent(s))
                  for s in args.opponent]
-    print(f"benchmark {args.model}  vs {[o[0] for o in opponents]}  | {args.deals} deals x2 mirrored = "
-          f"{args.deals*2} games/opponent | workers={args.workers}")
+    challenger = f"NN-MCTS({args.nn_mcts})" if args.nn_mcts else "greedy-NN"
+    print(f"benchmark {challenger} <- {args.model}  vs {[o[0] for o in opponents]}  | {args.deals} deals "
+          f"x2 mirrored = {args.deals*2} games/opponent | workers={args.workers}")
     t0 = time.perf_counter()
     rows = run(args.model, opponents, args.deals, args.workers, args.chunk, args.base_seed,
-               not args.shared_rng)
+               not args.shared_rng, nn_mcts=args.nn_mcts)
     wall = time.perf_counter() - t0
 
     print(f"\n  {'opponent':>16} {'win%':>6} {'ci95':>5} {'wins':>10} {'split%':>6} {'s/game':>7} {'secs':>7}")

@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -30,7 +30,7 @@ DEFAULT_C = math.sqrt(2)
 
 class Node:
     """A node in the ISMCTS tree. Holds statistics only; game state is carried separately."""
-    __slots__ = ("parent", "incoming_move", "player_just_moved", "children", "n", "w", "avail")
+    __slots__ = ("parent", "incoming_move", "player_just_moved", "children", "n", "w", "avail", "priors")
 
     def __init__(self, parent: Optional["Node"], incoming_move: Optional[Action],
                  player_just_moved: Optional[int]) -> None:
@@ -41,6 +41,7 @@ class Node:
         self.n = 0
         self.w = 0.0
         self.avail = 0
+        self.priors: Optional[Dict[Action, float]] = None  # NN policy over this node's moves (PUCT only)
 
     def ucb(self, c: float) -> float:
         return self.w / self.n + c * math.sqrt(math.log(self.avail) / self.n)
@@ -53,6 +54,10 @@ class SearchConfig:
     c: float = DEFAULT_C
     scaled: bool = True
     use_knowledge: bool = True     # honor guess-leaked opponent-hand facts when determinizing
+    # AlphaZero mode: when an evaluator is attached, selection is PUCT (policy prior) and a non-terminal
+    # leaf is valued by the net (no rollout). evaluator(state) -> (per-seat value vector, {move: prior}).
+    evaluator: Optional["Callable"] = None
+    c_puct: float = 1.5
 
 
 @dataclass
@@ -152,6 +157,49 @@ def _select(node: Node, state, config: SearchConfig
     return node, state, visited
 
 
+def _select_puct(root: Node, state, config: SearchConfig):
+    """Descend via PUCT (using stored NN priors) until an unexpanded/terminal leaf. No rollout.
+
+    Returns (leaf, leaf_state). Re-checks legality each step (ISMCTS determinization). A node whose
+    ``priors`` is None is an unevaluated leaf (the root on the first simulation); a selected move with no
+    child yet is expanded and returned as the new leaf (the caller evaluates it and sets its priors)."""
+    node = root
+    while True:
+        if state.is_terminal():
+            return node, state
+        legal = state.legal_moves()
+        if not legal or node.priors is None:        # stuck (mover loses) or unevaluated leaf
+            return node, state
+        sqrt_n = math.sqrt(max(node.n, 1))
+        default_p = 1.0 / len(legal)                # fallback for a determinization-exposed unseen move
+        best_move, best_score = None, -math.inf
+        for m in legal:
+            child = node.children.get(m)
+            p = node.priors.get(m, default_p)
+            q = child.w / child.n if (child and child.n) else 0.0   # FPU 0 for unvisited
+            n = child.n if child else 0
+            score = q + config.c_puct * p * sqrt_n / (1 + n)
+            if score > best_score:
+                best_score, best_move = score, m
+        child = node.children.get(best_move)
+        if child is None:                           # expand -> the new node is the leaf
+            child = _expand(node, best_move, state.to_play)
+            return child, state.apply(best_move)
+        node = child
+        state = state.apply(best_move)
+
+
+def _leaf_value(leaf: Node, state, config: SearchConfig) -> List[float]:
+    """Value the leaf with the net (setting its priors), or exact result at terminal/stuck leaves."""
+    if state.is_terminal():
+        return state.result(scaled=config.scaled)
+    if not state.legal_moves():                     # no move -> player to move loses
+        return state.with_(winner=1 - state.to_play).result(scaled=config.scaled)
+    value, priors = config.evaluator(state)
+    leaf.priors = priors
+    return value
+
+
 def _rollout(state, config: SearchConfig) -> List[float]:
     """Uniform-random playout to a terminal state; return the per-seat reward vector."""
     while not state.is_terminal():
@@ -183,11 +231,15 @@ def search(info: InformationSet, config: SearchConfig) -> SearchResult:
     start = time.perf_counter()
     root = Node(parent=None, incoming_move=None, player_just_moved=None)
 
+    use_nn = config.evaluator is not None
     for _ in range(config.iterations):
         state = info.determinize(config.rng, use_knowledge=config.use_knowledge)  # fresh root determinization
-        leaf, leaf_state, visited = _select(root, state, config)
-        reward = _rollout(leaf_state, config)
-        _backpropagate(leaf, reward, visited)
+        if use_nn:                                   # AlphaZero: PUCT + net value, no rollout
+            leaf, leaf_state = _select_puct(root, state, config)
+            _backpropagate(leaf, _leaf_value(leaf, leaf_state, config), [])
+        else:                                        # classic: UCB + random rollout
+            leaf, leaf_state, visited = _select(root, state, config)
+            _backpropagate(leaf, _rollout(leaf_state, config), visited)
 
     total_visits = sum(child.n for child in root.children.values())
     stats = [
