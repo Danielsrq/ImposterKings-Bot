@@ -50,11 +50,14 @@ class PlyRecord:
     result_by_seat: Optional[Tuple[object, object]] = None  # each seat's SearchResult of this turn's position
 
 
-def _search_from(state, observer: int, iters: int, rng):
+def _search_from(state, observer: int, iters: int, rng, evaluator=None):
     """Run a search from seat ``observer``'s information set of ``state`` and return the SearchResult
-    (its ``info.observer`` is ``observer``, so the icicle draws it in that seat's perspective)."""
+    (its ``info.observer`` is ``observer``, so the icicle draws it in that seat's perspective). When
+    ``evaluator`` is set the search runs the NN-MCTS (PUCT) path -- same SearchResult shape, so the
+    PV/icicle/tree views are unchanged."""
     from ..mcts import SearchConfig, search
-    return search(state.information_set(observer), SearchConfig(rng=rng, iterations=iters))
+    return search(state.information_set(observer),
+                  SearchConfig(rng=rng, iterations=iters, evaluator=evaluator))
 
 
 def _result_eval(res, state, observer: int) -> float:
@@ -72,7 +75,8 @@ def budget_iters(state, observer: int, bud) -> int:
 
 
 def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = None,
-                     cross_eval: bool = True, budget=None, initial_state=None) -> List[PlyRecord]:
+                     cross_eval: bool = True, budget=None, initial_state=None,
+                     evaluator=None) -> List[PlyRecord]:
     """Play one MCTS-vs-MCTS game and record (seat, move, pre-move view, SearchResult, state) per ply.
 
     ``budget`` (a :mod:`imposterkings.budget` policy) makes both self-play agents AND the dual-eval use
@@ -95,18 +99,19 @@ def build_trajectory(iters: int, seed: Optional[int], start: Optional[int] = Non
     # evaluate_forced: search even on forced turns (ascensions, sole reactions) so every turn -- not just
     # ones with a real choice -- carries an eval. A position's value is well-defined even when forced.
     def _agent():
-        return (MCTSAgent(budget=budget, evaluate_forced=True) if budget is not None
-                else MCTSAgent(iterations=iters, evaluate_forced=True))
+        return (MCTSAgent(budget=budget, evaluate_forced=True, evaluator=evaluator) if budget is not None
+                else MCTSAgent(iterations=iters, evaluate_forced=True, evaluator=evaluator))
     play_game([_agent(), _agent()], rng, on_decision=collect, starting_player=start,
               initial_state=initial_state)
 
     if cross_eval:
-        annotate_dual_evals(traj, budget if budget is not None else iters, np.random.default_rng(seed))
+        annotate_dual_evals(traj, budget if budget is not None else iters, np.random.default_rng(seed),
+                            evaluator=evaluator)
     return traj
 
 
 def scripted_trajectory(state, moves, *, iters: int = 120, seed: int = 0, budget=None,
-                        search: bool = True, cross_eval: bool = True) -> List[PlyRecord]:
+                        search: bool = True, cross_eval: bool = True, evaluator=None) -> List[PlyRecord]:
     """Drive a FIXED sequence of ``moves`` (Actions) from ``state`` and record a review-ready trajectory.
 
     Unlike ``build_trajectory`` (bot-chosen moves), the line is scripted -- for reproducing an exact rules
@@ -128,15 +133,15 @@ def scripted_trajectory(state, moves, *, iters: int = 120, seed: int = 0, budget
         result = None
         if search and len(legal) > 1:                 # skip a search on forced single-move plies
             its = iters if budget is None else budget_iters(st, seat, budget)
-            result = _search_from(st, seat, its, rng)
+            result = _search_from(st, seat, its, rng, evaluator=evaluator)
         traj.append(PlyRecord(seat, mv, st.information_set(seat), result, state=st))
         st = st.apply(mv)
     if cross_eval:
-        annotate_dual_evals(traj, budget if budget is not None else iters, rng)
+        annotate_dual_evals(traj, budget if budget is not None else iters, rng, evaluator=evaluator)
     return traj
 
 
-def annotate_dual_evals(traj: List[PlyRecord], iters, rng) -> int:
+def annotate_dual_evals(traj: List[PlyRecord], iters, rng, evaluator=None) -> int:
     """Fill each turn-start ply's ``result_by_seat``/``eval_by_seat`` with BOTH seats' reads of that
     position, REUSING any already present (e.g. stored live by the app during play) and only searching
     the GAPS: a missing mover seat reuses the ply's own recorded ``result`` if it has one, else searches;
@@ -157,7 +162,7 @@ def annotate_dual_evals(traj: List[PlyRecord], iters, rng) -> int:
                 rbs[s] = rec.result                   # reuse the mover's actual decision search
             else:
                 its = iters if isinstance(iters, int) else budget_iters(rec.state, s, iters)
-                rbs[s] = _search_from(rec.state, s, its, rng)
+                rbs[s] = _search_from(rec.state, s, its, rng, evaluator=evaluator)
                 computed += 1
         rec.result_by_seat = (rbs[0], rbs[1])
         rec.eval_by_seat = (_result_eval(rbs[0], rec.state, 0), _result_eval(rbs[1], rec.state, 1))
@@ -735,7 +740,16 @@ def main(argv=None) -> None:
                    help="re-search the replay at hybrid-k STRENGTH (default 50 -- a stronger read than the "
                         "recorded budget; 0 = use the recorded generation budget)")
     p.add_argument("--review-l", type=int, default=None, help="l for --review-k (default: recorded / 3)")
+    p.add_argument("--nn", nargs="?", const="models/mlp_32.pt", default=None,
+                   help="review with the net as an NN-MCTS eval/policy head (bare --nn uses "
+                        "models/mlp_32.pt); the budget comes from --p1/--k/--iters (e.g. --p1 hybrid --k 20)")
     args = p.parse_args(argv)
+
+    ev = None
+    if args.nn:                                            # lazy: torch only needed when reviewing with a net
+        from ..machine_learning.evaluator import build_evaluator
+        ev = build_evaluator(args.nn)
+        print(f"NN-MCTS review head loaded from {args.nn}")
 
     t0 = time.perf_counter()
     if args.replay:
@@ -757,17 +771,19 @@ def main(argv=None) -> None:
             strength = g.get("spec", "?")
         init = GameState.deal(np.random.default_rng(rec["deal_seed"]))
         moves = [record.dict_to_action(d["chosen"]) for d in rec["decisions"]]
-        mode_s = "fast" if args.fast else f"re-search @ {strength}"
+        nn_s = "" if ev is None else " + NN"
+        mode_s = "fast" if args.fast else f"re-search @ {strength}{nn_s}"
         print(f"Replaying {args.replay} game {args.game} ({g.get('spec', '?')}, {len(moves)} plies, {mode_s})...")
         traj = scripted_trajectory(init, moves, iters=its, budget=bud, seed=rec["deal_seed"],
-                                   search=not args.fast)
-        cap = f"replay {os.path.basename(args.replay)} #{args.game}  [{strength}]"
+                                   search=not args.fast, evaluator=ev)
+        cap = f"replay {os.path.basename(args.replay)} #{args.game}  [{strength}{nn_s}]"
     else:
         bud = None if args.p1 == "mcts" else budget_mod.make_budget(args.p1, k=args.k, l=args.l)
         cfg = f"iters={args.iters}" if bud is None else bud.label
-        print(f"Generating MCTS-vs-MCTS game ({cfg}, seed={args.seed})...")
-        traj = build_trajectory(args.iters, args.seed, args.start, budget=bud)
-        cap = f"seed {args.seed}, {cfg}"
+        kind = "NN-MCTS" if ev is not None else "MCTS"
+        print(f"Generating {kind}-vs-{kind} game ({cfg}, seed={args.seed})...")
+        traj = build_trajectory(args.iters, args.seed, args.start, budget=bud, evaluator=ev)
+        cap = f"seed {args.seed}, {cfg}{'' if ev is None else ' + NN'}"
     dt = time.perf_counter() - t0
     print(f"  {len(traj)} decisions in {dt:.1f}s. Opening review window...")
 

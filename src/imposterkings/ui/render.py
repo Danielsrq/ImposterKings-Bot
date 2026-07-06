@@ -390,19 +390,20 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review, settings, scenario)
 
 
-# The three engine (bot + analysis) modes, in pill order: (mode key, label).
-ENGINE_PILLS = [("mcts", "Fixed iters"), ("branching", "Branch"), ("hybrid", "Branch + hand scaling")]
+# The engine (bot + analysis) modes, in pill order: (mode key, label). ``nn`` = NN-MCTS (hybrid-only).
+ENGINE_PILLS = [("mcts", "Fixed N"), ("branching", "Branch"), ("hybrid", "Hybrid"), ("nn", "NN+MCTS")]
 
 
 _SLIDER_RANGES = {"N": (25, 1024), "k": (10, 100), "l": (1, 8)}
 
 
-def draw_settings_overlay(surface, fonts, engine, mouse):
+def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True):
     """Draw the engine-settings modal over the board and return its clickable controls:
     ``{"pills": {mode: rect}, "sliders": [(track_rect, lo, hi, key), ...], "close": rect}``.
 
-    ``engine`` = ``{"mode", "N", "k", "l"}``. Fixed mode shows one ``N`` slider; branch/hybrid show ``k``
-    and ``l`` (l = effective legal-moves for a sub-decision card at selection)."""
+    ``engine`` = ``{"mode", "N", "k", "l"}``. Fixed mode shows one ``N`` slider; branch/hybrid/nn show ``k``
+    and ``l`` (l = effective legal-moves for a sub-decision card at selection). ``nn`` (NN+MCTS) is
+    hybrid-only; when ``nn_available`` is False that pill is drawn disabled and its click is ignored."""
     med, small = fonts["med"], fonts["small"]
     W, H = WINDOW
     dim = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -415,12 +416,15 @@ def draw_settings_overlay(surface, fonts, engine, mouse):
     pygame.draw.rect(surface, GOLD, (bx, by, bw, bh), 2, border_radius=8)
     _text(surface, med, "Engine settings  (bot + hint)", (bx + 20, by + 16), INK)
 
-    pills, pw = {}, (bw - 40 - 16) // 3
+    n = len(ENGINE_PILLS)
+    pills, pw = {}, (bw - 40 - 8 * (n - 1)) // n
     x = bx + 20
     for mode, label in ENGINE_PILLS:
         r = pygame.Rect(x, by + 56, pw, 36)
+        disabled = (mode == "nn") and not nn_available
         sel = engine["mode"] == mode
-        pygame.draw.rect(surface, GOLD if sel else BTN, r, border_radius=18)
+        fill = MUTE if disabled else (GOLD if sel else BTN)
+        pygame.draw.rect(surface, fill, r, border_radius=18)
         tw = small.size(label)[0]
         _text(surface, small, label, (r.centerx - tw // 2, r.y + 9), (20, 20, 20) if sel else INK)
         pills[mode] = r
@@ -443,8 +447,12 @@ def draw_settings_overlay(surface, fonts, engine, mouse):
         preview = f"~ {engine['N']} simulations / decision"
     else:
         sliders = [slider_row(by + 130, "k"), slider_row(by + 196, "l")]
-        preview = ("clamp(k * eff_n(l) * (1 + opp_cards), 64, 4096)" if engine["mode"] == "hybrid"
-                   else "clamp(k * eff_n(l), 64, 4096)")
+        if engine["mode"] == "nn":
+            preview = "NN eval-head + hybrid clamp(k * eff_n(l) * (1 + opp_cards), 64, 4096)"
+        elif engine["mode"] == "hybrid":
+            preview = "clamp(k * eff_n(l) * (1 + opp_cards), 64, 4096)"
+        else:
+            preview = "clamp(k * eff_n(l), 64, 4096)"
     _text(surface, small, preview, (bx + 20, by + bh - 72), MUTE)
 
     close = pygame.Rect(bx + bw - 20 - 78, by + bh - 44, 78, 28)

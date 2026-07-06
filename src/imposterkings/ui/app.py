@@ -27,18 +27,23 @@ _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
 
 
 def _engine_budget(engine: dict):
-    """A budget policy for the current engine config (drives BOTH the bot and the analysis)."""
-    if engine["mode"] == "hybrid":
+    """A budget policy for the current engine config (drives BOTH the bot and the analysis).
+    ``nn`` (NN+MCTS) reuses the hybrid schedule -- it is hybrid-only by design."""
+    if engine["mode"] in ("hybrid", "nn"):
         return budget_mod.hybrid(engine["k"], engine["l"])
     if engine["mode"] == "branching":
         return budget_mod.branching(engine["k"], engine["l"])
     return budget_mod.fixed(engine["N"])   # "mcts": fixed N (l/k unused)
 
 
-def _make_bot(random_bot: bool, engine: dict, nn_agent=None):
-    if nn_agent is not None:                          # a loaded NN checkpoint takes the bot seat
+def _make_bot(random_bot: bool, engine: dict, nn_agent=None, evaluator=None):
+    if nn_agent is not None:                          # a greedy NN checkpoint takes the bot seat
         return nn_agent
-    return RandomAgent() if random_bot else MCTSAgent(budget=_engine_budget(engine))
+    if random_bot:
+        return RandomAgent()
+    # In "nn" mode the evaluator turns the MCTS bot into NN-MCTS (PUCT); every other mode -> plain rollout.
+    ev = evaluator if engine["mode"] == "nn" else None
+    return MCTSAgent(budget=_engine_budget(engine), evaluator=ev)
 
 
 def _hover_index(mouse, n_legal: int):
@@ -63,14 +68,34 @@ def _describe(seat: int, view, move, human_seat: int, state) -> str:
 
 
 def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, start=None,
-        k: int = 100, l: int = 3, setup: bool = False, nn: str = None) -> None:
+        k: int = 100, l: int = 3, setup: bool = False, nn: str = None, nn_greedy: bool = False) -> None:
+    import os
     import pygame  # local import so the engine/tests never require pygame
 
+    # Resolve the NN checkpoint for the "NN+MCTS" mode: an explicit --nn, else the default if it exists.
+    nn_ckpt = nn if nn else ("models/mlp_32.pt" if os.path.exists("models/mlp_32.pt") else None)
+    nncfg = {"ckpt": nn_ckpt, "ev": None}           # ev is built lazily the first time NN mode is used
+    nn_available = nn_ckpt is not None
+
+    def nn_evaluator():
+        """Lazily build (and cache) the NN eval/policy head; None if no ckpt or the load fails."""
+        if nncfg["ckpt"] is None:
+            return None
+        if nncfg["ev"] is None:
+            try:                                    # torch is optional -> a load failure just disables NN
+                from ..machine_learning.evaluator import build_evaluator
+                nncfg["ev"] = build_evaluator(nncfg["ckpt"])
+                print(f"NN-MCTS head loaded from {nncfg['ckpt']}")
+            except Exception as e:                  # noqa: BLE001 -- report + degrade to plain MCTS
+                print(f"NN head unavailable ({e}); NN+MCTS disabled")
+                nncfg["ckpt"] = None
+        return nncfg["ev"]
+
     nn_agent = None
-    if nn:                                          # lazy import so torch stays optional for normal play
+    if nn and nn_greedy:                            # opt-in standalone greedy policy (no search)
         from ..machine_learning.agent import NNAgent
         nn_agent = NNAgent.from_checkpoint(nn)
-        print(f"NN bot loaded from {nn}")
+        print(f"greedy NN bot loaded from {nn} (no search; side panels still analyze independently)")
 
     pygame.init()
     screen = pygame.display.set_mode(WINDOW)
@@ -81,8 +106,10 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     log: deque = deque(maxlen=40)
     show_reasoning, show_hint = True, False
     # One engine config drives BOTH the bot and the dual-eval analysis (so the panels' sims match the bot).
-    engine = {"mode": p1 if p1 in ("mcts", "branching", "hybrid") else "mcts",
-              "N": iters, "k": k, "l": l}
+    # An explicit --nn (without --nn-greedy) starts directly in the "nn" (NN+MCTS) mode.
+    start_mode = "nn" if (nn and not nn_greedy and nn_available) else \
+                 (p1 if p1 in ("mcts", "branching", "hybrid") else "mcts")
+    engine = {"mode": start_mode, "N": iters, "k": k, "l": l}
     random_bot = (p1 == "random")
     engine_budget = _engine_budget(engine)          # rebuilt by apply_engine() on any settings change
     settings_open, dragging = False, None      # dragging = the active slider key ("N"/"k"/"l") or None
@@ -98,14 +125,16 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         """Rebuild the budget + bot from ``engine`` and re-analyze the current position (live retune)."""
         nonlocal engine_budget
         engine_budget = _engine_budget(engine)
-        game["bot"] = _make_bot(random_bot, engine, nn_agent)
+        ev = nn_evaluator() if engine["mode"] == "nn" else None
+        game["bot"] = _make_bot(random_bot, engine, nn_agent, ev)
         analysis["state"], analysis[0], analysis[1] = None, None, None
 
     def new_game(new_seed=None, initial_state=None):
         s = int(np.random.default_rng().integers(0, 2**31)) if new_seed is None else new_seed
         rng = np.random.default_rng(s)
         st0 = initial_state if initial_state is not None else GameState.deal(rng, starting_player=start)
-        game.update(seed=s, rng=rng, state=st0, bot=_make_bot(random_bot, engine, nn_agent))
+        ev = nn_evaluator() if engine["mode"] == "nn" else None
+        game.update(seed=s, rng=rng, state=st0, bot=_make_bot(random_bot, engine, nn_agent, ev))
         log.clear()
         trajectory.clear()
         analysis["state"], analysis[0], analysis[1] = None, None, None
@@ -172,11 +201,12 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         if not state.is_terminal():
             if game["state"] is not analysis["state"]:
                 analysis["state"], analysis[0], analysis[1] = game["state"], None, None
+            analysis_ev = nn_evaluator() if engine["mode"] == "nn" else None
             for s in (0, 1):
                 shown = show_reasoning if s == bot_seat else show_hint
                 if shown and analysis[s] is None:
                     its = budget_iters(state, s, engine_budget)
-                    analysis[s] = _search_from(state, s, its, analysis_rng)
+                    analysis[s] = _search_from(state, s, its, analysis_rng, evaluator=analysis_ev)
         bot_res, hint_res = analysis[bot_seat], analysis[human_seat]
         bot_eval = _result_eval(bot_res, state, bot_seat) if bot_res is not None else None
         hint_eval = _result_eval(hint_res, state, human_seat) if hint_res is not None else None
@@ -196,7 +226,9 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                              hint_result=hint_res, show_hint=show_hint,
                              knowledge=knowledge_cache["val"],
                              bot_eval=bot_eval, hint_eval=hint_eval)
-        controls = draw_settings_overlay(screen, fonts, engine, mouse) if settings_open else None
+        controls = (draw_settings_overlay(screen, fonts, engine, mouse,
+                                          nn_available=nncfg["ckpt"] is not None)
+                    if settings_open else None)
         pygame.display.flip()
 
         def _slider_at(pos):                        # the modal slider whose (padded) track contains pos
@@ -239,6 +271,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     else:
                         for mode, r in controls["pills"].items():
                             if r.collidepoint(pos):
+                                if mode == "nn" and nncfg["ckpt"] is None:
+                                    break                       # NN pill disabled (no checkpoint)
                                 engine["mode"], random_bot = mode, False
                                 apply_engine()
                                 break
@@ -271,7 +305,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         # dual-eval graph + dual icicles; turns analyzed live during play are reused, not recomputed.
         if review_requested and trajectory:
             annotated = list(trajectory)
-            n = annotate_dual_evals(annotated, engine_budget, np.random.default_rng(7))
+            review_ev = nn_evaluator() if engine["mode"] == "nn" else None
+            n = annotate_dual_evals(annotated, engine_budget, np.random.default_rng(7), evaluator=review_ev)
             if n:
                 print(f"computing {n} dual-eval searches (at the current engine budget) for turns not "
                       f"analyzed live during play...")
@@ -304,11 +339,15 @@ def main(argv=None) -> None:
     parser.add_argument("--start", type=int, default=None, choices=[0, 1])
     parser.add_argument("--setup", action="store_true",
                         help="open the scenario-setup screen first (also the in-game 'Scenario' button / S)")
-    parser.add_argument("--nn", default=None,
-                        help="seat a trained NN checkpoint as the bot (e.g. models/mlp_32.pt)")
+    parser.add_argument("--nn", nargs="?", const="models/mlp_32.pt", default=None,
+                        help="checkpoint for the NN+MCTS mode (bare --nn uses models/mlp_32.pt); passing it "
+                             "also starts in that mode. Toggle modes live in the Settings overlay.")
+    parser.add_argument("--nn-greedy", action="store_true",
+                        help="seat the --nn checkpoint as a standalone greedy policy (no search) instead of "
+                             "an NN+MCTS eval/policy head")
     args = parser.parse_args(argv)
     run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
-        k=args.k, l=args.l, setup=args.setup, nn=args.nn)
+        k=args.k, l=args.l, setup=args.setup, nn=args.nn, nn_greedy=args.nn_greedy)
 
 
 if __name__ == "__main__":
