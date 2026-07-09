@@ -13,7 +13,7 @@ bounded). CPU-only, matching the repo's ML pipeline.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -187,3 +187,18 @@ def print_attention(view: InformationSet, model: AttentionModel, action=None) ->
     for h in range(attn.shape[1]):
         top = sorted(zip(seq_labels, attn[0, h, 0, :].tolist()), key=lambda p: -p[1])[:5]
         print(f"  head{h} row0 top: " + ", ".join(f"{l}={w:.2f}" for l, w in top))
+
+
+# --- checkpoint (self-describing via AttnConfig; distinct model_type from the MLP's checkpoint) -----
+
+def save(path: str, model: AttentionModel, meta: Optional[dict] = None) -> None:
+    torch.save({"model_type": "attention", "config": asdict(model.cfg),
+                "state_dict": model.state_dict(), "meta": meta or {}}, path)
+
+
+def load(path: str, device: str = "cpu") -> Tuple[AttentionModel, dict]:
+    b = torch.load(path, map_location=device, weights_only=False)
+    model = AttentionModel(AttnConfig(**b["config"]))
+    model.load_state_dict(b["state_dict"])
+    model.eval()
+    return model, b.get("meta", {})
