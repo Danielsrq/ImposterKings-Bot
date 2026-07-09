@@ -48,14 +48,25 @@ def _make_agent(spec: Spec, evaluator=None):
     return MCTSAgent(budget=make_budget(spec[0], k=spec[1], l=spec[2]), evaluator=evaluator)
 
 
+def _evaluator_for(ckpt: str):
+    """Build the leaf evaluator matching the checkpoint: attention model (model_type=='attention') or
+    the default MLP (MLP checkpoints carry no model_type key)."""
+    import torch
+    mt = torch.load(ckpt, map_location="cpu", weights_only=False).get("model_type")
+    if mt == "attention":
+        from .attention_model import build_evaluator as be
+    else:
+        from .evaluator import build_evaluator as be
+    return be(ckpt)
+
+
 def _chunk(ckpt: str, label: str, spec: Spec, seeds: List[int], independent_rng: bool,
            nn_mcts: str = None) -> Dict:
     import torch
     torch.set_num_threads(1)                               # avoid thread oversubscription across workers
     t0 = time.perf_counter()
     if nn_mcts is not None:                               # challenger is the net AS AN MCTS eval/policy head
-        from .evaluator import build_evaluator
-        nn = _make_agent(parse_spec(nn_mcts), evaluator=build_evaluator(ckpt))
+        nn = _make_agent(parse_spec(nn_mcts), evaluator=_evaluator_for(ckpt))
     else:                                                 # challenger is the greedy net (no search)
         from .agent import NNAgent
         nn = NNAgent.from_checkpoint(ckpt)

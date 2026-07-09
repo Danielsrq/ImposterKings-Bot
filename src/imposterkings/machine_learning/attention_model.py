@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from ..rules import NUM_PLAYERS
 from .features import ACTION_DIM, BOARD_DIM, CARD_DIM, PHASE_DIM, InformationSet, Tokens, tokenize
 
 
@@ -202,3 +203,27 @@ def load(path: str, device: str = "cpu") -> Tuple[AttentionModel, dict]:
     model.load_state_dict(b["state_dict"])
     model.eval()
     return model, b.get("meta", {})
+
+
+def build_evaluator(checkpoint: str, device: str = "cpu"):
+    """`state -> ([per-seat value], {move: prior})` for `mcts.SearchConfig.evaluator` -- the attention
+    twin of `evaluator.build_evaluator`. Value = max_a Q (mover-relative, zero-sum negated for the
+    opponent), priors = softmax(Q) over the mover's legal moves. Kept in torch (no numpy reimpl): at
+    k20 the per-leaf volume is modest."""
+    model, _ = load(checkpoint, device)
+
+    @torch.no_grad()
+    def evaluate(state):
+        mover = state.to_play
+        view = state.information_set(mover)
+        moves = state.legal_moves()
+        batch = collate([tokenize(view, m) for m in moves])
+        q = model(batch["cards"], batch["board"], batch["phase"], batch["action"], batch["card_mask"])[0]
+        v = float(q.max())
+        value = [0.0] * NUM_PLAYERS
+        value[mover] = v
+        value[1 - mover] = -v
+        priors = {m: float(p) for m, p in zip(moves, torch.softmax(q, dim=0).tolist())}
+        return value, priors
+
+    return evaluate
