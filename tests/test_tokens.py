@@ -80,6 +80,7 @@ def test_action_in_marks_played_card():
     idx = t.labels.index(f"my_hand:{card_name(card)}")
     assert _cf(t.cards[idx], "st:candidate") == 1.0
     assert t.action[F.action_fields().index("act:PLAY_CARD")] == 1.0
+    assert t.action[F.action_fields().index(f"card:{card_name(card)}")] == 1.0   # explicit card one-hot
 
 
 def test_action_in_guess_adds_choice_token():
@@ -88,6 +89,7 @@ def test_action_in_guess_adds_choice_token():
     idx = t.labels.index("opp_known:Queen*")
     assert _cf(t.cards[idx], "st:candidate") == 1.0
     assert t.action[F.action_fields().index("act:GUESS_CARD")] == 1.0
+    assert t.action[F.action_fields().index("guess:Queen")] == 1.0              # explicit guess one-hot
 
 
 def test_setup_phase_and_setup_discard_token():

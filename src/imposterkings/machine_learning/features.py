@@ -183,7 +183,7 @@ _PSEL_IX = _STATE_OFF + 6                                           # pending_se
 
 BOARD_DIM = 2 + 2 + 2 + 8                                           # kings, sizes, turn, muted = 14
 PHASE_DIM = _N_STEP + _NTYPE + _NTYPE + 8 + 1 + 1                   # 15+14+14+8+1+1 = 53
-ACTION_DIM = _N_KIND + 8 + 1                                        # kind + number + target = 23
+ACTION_DIM = _N_KIND + _NTYPE + _NTYPE + 8 + 1                      # kind+card+guess+number+target = 51
 
 # Per-type tables (a card name fully determines its ability/value), precomputed once.
 _TYPE_ID0 = [card_ids_for_name(n)[0] for n in _NAMES]               # a representative id per type
@@ -291,13 +291,24 @@ def _phase_token(view: InformationSet) -> np.ndarray:
 
 
 def _action_vec(action: Optional[Action]) -> np.ndarray:
+    """Explicit action descriptor (mirrors the MLP's action block): the candidate move's kind, its card
+    type and guessed name, number and target -- so "which card am I evaluating" is a direct one-hot, not
+    a lone is_candidate_action bit the model has to hunt for on a card token."""
     v = np.zeros(ACTION_DIM, np.float32)
     if action is None:
         return v
     v[action.kind.value - 1] = 1.0                                # ActionKind one-hot  [0:14]
+    o = _N_KIND
+    if action.card is not None:
+        v[o + _type_ix(action.card)] = 1.0                       # candidate card type [14:28]
+    o += _NTYPE
+    if action.name is not None:
+        v[o + _TYPE_IX[action.name]] = 1.0                       # guessed name        [28:42]
+    o += _NTYPE
     if action.number is not None and 1 <= action.number <= 8:
-        v[_N_KIND + action.number - 1] = 1.0                     # number              [14:22]
-    v[_N_KIND + 8] = action.target / 8.0 if action.target is not None else 0.0   # target [22]
+        v[o + action.number - 1] = 1.0                           # number              [42:50]
+    o += 8
+    v[o] = action.target / 8.0 if action.target is not None else 0.0             # target [50]
     return v
 
 
@@ -420,4 +431,5 @@ def phase_fields() -> List[str]:
 
 
 def action_fields() -> List[str]:
-    return [f"act:{k.name}" for k in ActionKind] + [f"number:{v}" for v in range(1, 9)] + ["target"]
+    return ([f"act:{k.name}" for k in ActionKind] + [f"card:{n}" for n in _NAMES]
+            + [f"guess:{n}" for n in _NAMES] + [f"number:{v}" for v in range(1, 9)] + ["target"])
