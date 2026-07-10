@@ -64,6 +64,7 @@ class Frame(NamedTuple):
     review: Optional["pygame.Rect"]        # "Review game" button, shown only at game over
     settings: "pygame.Rect"                # opens the engine-settings modal
     scenario: "pygame.Rect"                # opens the scenario-setup screen
+    attn_toggle: Optional["pygame.Rect"] = None   # "Analysis" button (attention drawer); None if no ckpt
 
 # Friendly labels for the decision header (the raw StepKind names are long/cryptic).
 DECISION_LABELS = {
@@ -266,7 +267,7 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                  hover: Optional[int] = None, status: str = "", log: Optional[List[str]] = None,
                  bot_result=None, show_reasoning: bool = True, seed=None,
                  hint_result=None, show_hint: bool = False, knowledge=None,
-                 bot_eval=None, hint_eval=None) -> Frame:
+                 bot_eval=None, hint_eval=None, attn_available: bool = False) -> Frame:
     surface.fill(BG)
     big, med, small = fonts["big"], fonts["med"], fonts["small"]
     opp = 1 - view.observer
@@ -387,7 +388,11 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     settings = pygame.Rect(WINDOW[0] - 12 - 84, 12, 84, 24)   # engine-settings button (panel top-right)
     pygame.draw.rect(surface, BTN, settings, border_radius=4)
     _text(surface, small, "Settings", (settings.x + 10, settings.y + 4))
-    return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review, settings, scenario)
+    analysis = pygame.Rect(settings.x - 8 - 92, 12, 92, 24)   # attention-drawer toggle (left of Settings)
+    pygame.draw.rect(surface, BTN if attn_available else DIVIDER, analysis, border_radius=4)
+    _text(surface, small, "Analysis", (analysis.x + 12, analysis.y + 4), INK if attn_available else MUTE)
+    return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review, settings, scenario,
+                 attn_toggle=(analysis if attn_available else None))
 
 
 # The engine (bot + analysis) modes, in pill order: (mode key, label). ``nn`` = NN-MCTS (hybrid-only).
@@ -459,6 +464,67 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True):
     pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
     _text(surface, small, "Close", (close.x + 18, close.y + 5), INK)
     return {"pills": pills, "sliders": sliders, "close": close}
+
+
+def draw_attention_drawer(surface, fonts, payload, mouse, *, mode="absolute", hover=None,
+                          result=None, move=None, depth=5):
+    """Right-side "analysis mode" drawer over a dim scrim: the recommended move + q, the 2x2 per-head
+    attention heatmap (via ``attention_view``), and the PV. Returns clickable controls
+    ``{"close", "mode_toggle", "hits"}``. Opaque panel (heatmap must stay legible); scrim dims the board."""
+    from . import attention_view                          # lazy: attention_view imports palette from here
+    med, small = fonts["med"], fonts["small"]
+    W, H = WINDOW
+    dim = pygame.Surface((W, H), pygame.SRCALPHA)
+    dim.fill((0, 0, 0, 140))
+    surface.blit(dim, (0, 0))
+    dw = int(0.46 * W)
+    dx = W - dw
+    pygame.draw.rect(surface, PANEL, (dx, 0, dw, H))
+    pygame.draw.rect(surface, GOLD, (dx, 0, dw, H), 2)
+    pad = 16
+
+    _text(surface, med, "Attention  -  why this move", (dx + pad, 14), INK)
+    rec = _compact_action(move) if move is not None else "(no move)"
+    _text(surface, small, f"recommend: {rec}    q = {payload.q:+.2f}", (dx + pad, 46), GOLD)
+
+    mode_toggle = pygame.Rect(dx + pad, 74, 168, 24)
+    pygame.draw.rect(surface, BTN_HOVER if mode_toggle.collidepoint(mouse) else BTN,
+                     mode_toggle, border_radius=12)
+    _text(surface, small, f"scale: {'absolute' if mode == 'absolute' else 'row-norm'}",
+          (mode_toggle.x + 10, mode_toggle.y + 4))
+    close = pygame.Rect(dx + dw - pad - 82, 12, 82, 26)
+    pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
+    _text(surface, small, "Close [A]", (close.x + 10, close.y + 5), INK)
+
+    pv_h = 128
+    heat_rect = (dx + pad, 112, dw - 2 * pad, H - 112 - pv_h)
+    hits = attention_view.draw_attention(surface, fonts, payload, heat_rect, mode=mode,
+                                         emphasize_rows=(0,),
+                                         candidate_index=payload.candidate_seq_index, hover=hover)
+    if hover is not None:
+        hit = next((h for h in hits if (h.i, h.j, h.head) == hover), None)
+        if hit is not None:
+            attention_view.draw_tooltip(surface, fonts, payload, hit, mouse)
+
+    pv_y = H - pv_h + 6
+    pygame.draw.line(surface, DIVIDER, (dx + pad, pv_y - 6), (dx + dw - pad, pv_y - 6))
+    _text(surface, small, "Principal variation:", (dx + pad, pv_y), MUTE)
+    if result is not None and getattr(result, "root", None) is not None:
+        try:
+            pvs = result.principal_variations(top=2, depth=depth)
+        except Exception:                                # noqa: BLE001 -- PV is best-effort decoration
+            pvs = []
+        yy = pv_y + 22
+        for line in pvs:
+            xx = dx + pad
+            for step in line:
+                t = small.render(_compact_action(step.move), True, P_COLORS.get(step.player, INK))
+                if xx + t.get_width() > dx + dw - pad:
+                    break
+                surface.blit(t, (xx, yy))
+                xx += t.get_width() + 8
+            yy += 20
+    return {"close": close, "mode_toggle": mode_toggle, "hits": hits}
 
 
 def make_fonts():

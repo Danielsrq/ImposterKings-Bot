@@ -109,9 +109,11 @@ class AttentionModel(nn.Module):
         self.layers = nn.ModuleList([EncoderLayer(cfg) for _ in range(cfg.n_layers)])
         self.head = nn.Linear(cfg.d_model, 1)
 
-    def forward(self, cards, board, phase, action, card_mask=None):
-        """cards [B,N,44], board [B,14], phase [B,53], action [B,23], card_mask [B,N] bool (True=real).
-        Returns (q [B], attn [B, heads, S, S]) with S = N + 4 ([CLS] + N cards + board + phase + action)."""
+    def forward_layers(self, cards, board, phase, action, card_mask=None):
+        """Same encode as :meth:`forward` but returns EVERY layer's attention.
+        Returns (q [B], attns) where attns is a list of per-layer [B, heads, S, S] (len == n_layers).
+        ``forward`` is exactly ``q, attns[-1]``. Used by the interpretability path (`explain`) which wants
+        earlier layers' card->card maps (causal at L>=2) in addition to the last-layer CLS readout."""
         b, n = cards.shape[0], cards.shape[1]
         hc, hb, hp, ha = self.embed(cards, board, phase, action)
         cls = self.cls.view(1, 1, -1).expand(b, 1, -1)
@@ -125,13 +127,21 @@ class AttentionModel(nn.Module):
             add_mask = torch.zeros(b, 1, 1, s, device=cards.device)
             add_mask = add_mask.masked_fill(~valid[:, None, None, :], float("-inf"))
 
-        attn = None
+        attns = []
         for layer in self.layers:
             seq, attn = layer(seq, add_mask)
+            attns.append(attn)                                      # each [B, heads, S, S]
         q = self.head(seq[:, 0, :]).squeeze(-1)                     # CLS output -> scalar
         if self.cfg.bounded:
             q = torch.tanh(q)
-        return q, attn                                              # attn = last layer, [B, heads, S, S]
+        return q, attns
+
+    def forward(self, cards, board, phase, action, card_mask=None):
+        """cards [B,N,44], board [B,14], phase [B,53], action [B,23], card_mask [B,N] bool (True=real).
+        Returns (q [B], attn [B, heads, S, S]) with S = N + 4 ([CLS] + N cards + board + phase + action).
+        ``attn`` is the LAST layer (the CLS readout layer); use :meth:`forward_layers` for all layers."""
+        q, attns = self.forward_layers(cards, board, phase, action, card_mask)
+        return q, attns[-1]                                         # attn = last layer, [B, heads, S, S]
 
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -162,14 +172,24 @@ def collate(toks: List[Tokens]) -> dict:
             "card_mask": card_mask, "labels": labels}
 
 
-def cls_importance(attn: torch.Tensor, labels: List[List[str]]) -> List[List[Tuple[str, float]]]:
-    """CLS->card importance (head-averaged row 0, the card region) per batch element, sorted desc.
-    ``attn`` [B, heads, S, S]; ``labels`` the per-sample card-token labels. One weight per real card."""
+def cls_importance(attn: torch.Tensor, labels: List[List[str]], include_cls: bool = False,
+                   include_context: bool = False) -> List[List[Tuple[str, float]]]:
+    """CLS->token importance (head-averaged row 0) per batch element, sorted desc. ``attn`` [B, heads, S, S];
+    ``labels`` the per-sample card-token labels. Default: the card region only (positions 1..1+N), one weight
+    per real card -- the "which cards mattered" ranking. ``include_cls`` prepends the CLS self-weight
+    (position 0 -- the attention-sink signal you'd otherwise hide); ``include_context`` appends the trailing
+    board/phase/action tokens. With BOTH True the weights are the full head-averaged row and sum to 1, so
+    nothing is silently dropped (the card-only default does not sum to 1)."""
     row0 = attn[:, :, 0, :].mean(dim=1)                             # [B, S] head-averaged CLS row
     out: List[List[Tuple[str, float]]] = []
     for i, labs in enumerate(labels):
-        weights = row0[i, 1:1 + len(labs)].tolist()                # card region = positions 1 .. 1+N
-        out.append(sorted(zip(labs, weights), key=lambda p: -p[1]))
+        n = len(labs)
+        names = (["CLS"] if include_cls else []) + list(labs) + (
+            ["board", "phase", "action"] if include_context else [])
+        idx = ([0] if include_cls else []) + list(range(1, 1 + n)) + (
+            [1 + n, 2 + n, 3 + n] if include_context else [])
+        weights = row0[i, idx].tolist()                            # positions selected from the S-length row
+        out.append(sorted(zip(names, weights), key=lambda p: -p[1]))
     return out
 
 
@@ -181,8 +201,8 @@ def print_attention(view: InformationSet, model: AttentionModel, action=None) ->
     batch = collate([tok])
     q, attn = model(batch["cards"], batch["board"], batch["phase"], batch["action"], batch["card_mask"])
     print(f"q = {q.item():+.3f}   (S={attn.shape[-1]} tokens, {attn.shape[1]} heads)")
-    print("CLS->card importance (head-avg):")
-    for lb, w in cls_importance(attn, batch["labels"])[0]:
+    print("CLS attention (head-avg, full row sums to 1; CLS row = attention-sink self-weight):")
+    for lb, w in cls_importance(attn, batch["labels"], include_cls=True, include_context=True)[0]:
         print(f"  {lb:24s} {w:.3f}")
     seq_labels = ["CLS"] + tok.labels + ["board", "phase", "action"]
     for h in range(attn.shape[1]):
@@ -205,13 +225,11 @@ def load(path: str, device: str = "cpu") -> Tuple[AttentionModel, dict]:
     return model, b.get("meta", {})
 
 
-def build_evaluator(checkpoint: str, device: str = "cpu"):
-    """`state -> ([per-seat value], {move: prior})` for `mcts.SearchConfig.evaluator` -- the attention
-    twin of `evaluator.build_evaluator`. Value = max_a Q (mover-relative, zero-sum negated for the
-    opponent), priors = softmax(Q) over the mover's legal moves. Kept in torch (no numpy reimpl): at
-    k20 the per-leaf volume is modest."""
-    model, _ = load(checkpoint, device)
-
+def evaluator_from_model(model: AttentionModel):
+    """`state -> ([per-seat value], {move: prior})` from an ALREADY-LOADED model. Value = max_a Q
+    (mover-relative, zero-sum negated for the opponent), priors = softmax(Q) over the mover's legal moves.
+    Factored out so a caller (e.g. the UI) can share one model instance between the leaf evaluator and the
+    `explain` readout instead of loading the checkpoint twice."""
     @torch.no_grad()
     def evaluate(state):
         mover = state.to_play
@@ -227,3 +245,11 @@ def build_evaluator(checkpoint: str, device: str = "cpu"):
         return value, priors
 
     return evaluate
+
+
+def build_evaluator(checkpoint: str, device: str = "cpu"):
+    """`state -> ([per-seat value], {move: prior})` for `mcts.SearchConfig.evaluator` -- the attention
+    twin of `evaluator.build_evaluator`. Loads ``checkpoint`` and wraps it via :func:`evaluator_from_model`.
+    Kept in torch (no numpy reimpl): at k20 the per-leaf volume is modest."""
+    model, _ = load(checkpoint, device)
+    return evaluator_from_model(model)

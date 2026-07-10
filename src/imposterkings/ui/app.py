@@ -18,7 +18,8 @@ from ..actions import ActionKind, StepKind
 from ..agents import MCTSAgent, RandomAgent
 from ..explain import format_action
 from ..state import GameState
-from .render import BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_settings_overlay, make_fonts, render_frame
+from .render import (BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_attention_drawer, draw_settings_overlay,
+                     make_fonts, render_frame)
 from .review import PlyRecord, annotate_dual_evals, budget_iters, run_review, _result_eval, _search_from
 from .scenario_setup import run_setup
 
@@ -68,7 +69,8 @@ def _describe(seat: int, view, move, human_seat: int, state) -> str:
 
 
 def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, start=None,
-        k: int = 100, l: int = 3, setup: bool = False, nn: str = None, nn_greedy: bool = False) -> None:
+        k: int = 100, l: int = 3, setup: bool = False, nn: str = None, nn_greedy: bool = False,
+        attn: str = None) -> None:
     import os
     import pygame  # local import so the engine/tests never require pygame
 
@@ -90,6 +92,28 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 print(f"NN head unavailable ({e}); NN+MCTS disabled")
                 nncfg["ckpt"] = None
         return nncfg["ev"]
+
+    # Attention explainability head: an explicit --attn, else the deployed L1 checkpoint if present.
+    attn_ckpt = attn if attn else ("models/attn_d64_L1.pt" if os.path.exists("models/attn_d64_L1.pt") else None)
+    attncfg = {"ckpt": attn_ckpt, "model": None, "ev": None, "id": None}
+
+    def attn_bundle():
+        """Lazily load (and cache) the attention model + its leaf evaluator + a checkpoint fingerprint.
+        Returns (model, evaluator); (None, None) if no ckpt or torch/load fails (Analysis then disabled)."""
+        if attncfg["ckpt"] is None:
+            return None, None
+        if attncfg["model"] is None:
+            try:                                    # torch optional -> a load failure disables Analysis
+                from ..machine_learning.attention_model import evaluator_from_model
+                from ..machine_learning.attention_model import load as _attn_load
+                m, _ = _attn_load(attncfg["ckpt"])
+                attncfg["model"], attncfg["ev"] = m, evaluator_from_model(m)
+                attncfg["id"] = f"{os.path.abspath(attncfg['ckpt'])}:{int(os.path.getmtime(attncfg['ckpt']))}"
+                print(f"attention explain head loaded from {attncfg['ckpt']} (L={m.cfg.n_layers})")
+            except Exception as e:                  # noqa: BLE001 -- report + disable Analysis
+                print(f"attention head unavailable ({e}); Analysis disabled")
+                attncfg["ckpt"] = None
+        return attncfg["model"], attncfg["ev"]
 
     nn_agent = None
     if nn and nn_greedy:                            # opt-in standalone greedy policy (no search)
@@ -113,6 +137,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     random_bot = (p1 == "random")
     engine_budget = _engine_budget(engine)          # rebuilt by apply_engine() on any settings change
     settings_open, dragging = False, None      # dragging = the active slider key ("N"/"k"/"l") or None
+    show_attn, attn_mode, attn_hover = False, "absolute", None      # attention-drawer state
+    attn_cache: dict = {"state": None, "move": None, "payload": None, "result": None, "hits": []}
     analysis_rng = np.random.default_rng(1234567)   # dedicated so analysis never perturbs the game rng
     # Per-state dual analysis: BOTH seats' read of the current position (keyed by state identity), so the
     # two side panels are live every turn -- like ui.review. Each entry is a SearchResult (or None).
@@ -202,11 +228,16 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             if game["state"] is not analysis["state"]:
                 analysis["state"], analysis[0], analysis[1] = game["state"], None, None
             analysis_ev = nn_evaluator() if engine["mode"] == "nn" else None
+            _am, attn_ev = attn_bundle()                    # (None, None) if no --attn / torch missing
             for s in (0, 1):
                 shown = show_reasoning if s == bot_seat else show_hint
-                if shown and analysis[s] is None:
+                want = shown or (show_attn and s == view_seat)      # the drawer needs the view seat's read
+                # Your hint is attention-powered when a --attn head is loaded, so the bottom-right panel and
+                # the Analysis drawer are ONE search and agree; the bot's panel stays on the engine.
+                ev = attn_ev if (attn_ev is not None and s == view_seat) else analysis_ev
+                if want and analysis[s] is None:
                     its = budget_iters(state, s, engine_budget)
-                    analysis[s] = _search_from(state, s, its, analysis_rng, evaluator=analysis_ev)
+                    analysis[s] = _search_from(state, s, its, analysis_rng, evaluator=ev)
         bot_res, hint_res = analysis[bot_seat], analysis[human_seat]
         bot_eval = _result_eval(bot_res, state, bot_seat) if bot_res is not None else None
         hint_eval = _result_eval(hint_res, state, human_seat) if hint_res is not None else None
@@ -219,16 +250,40 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 kn.append((v.opp_hand_has, v.opp_hand_lacks, v.knowledge_level()))
             knowledge_cache["state"], knowledge_cache["val"] = game["state"], kn
 
+        # Attention analysis (drawer open): explain the human hint's recommended move with one forward pass.
+        # Reuses analysis[view_seat] -- the SAME attention-MCTS search that feeds the bottom-right panel -- so
+        # the panel PV, the drawer header, and the heatmap all agree. Cached by state identity.
+        if show_attn and not settings_open and not state.is_terminal() and human_turn and legal:
+            model, _ = attn_bundle()
+            if model is None:
+                show_attn = False                               # load failed -> Analysis unavailable
+            elif attn_cache["state"] is not game["state"]:
+                res = analysis[view_seat]                       # attention-MCTS hint search (run just above)
+                rec_move = res.best_move if (res is not None and len(legal) > 1) else legal[0]
+                from ..machine_learning.explain import explain
+                payload = explain(view, rec_move, model,
+                                  all_layers=(model.cfg.n_layers > 1), ckpt_id=attncfg["id"])
+                attn_cache.update(state=game["state"], move=rec_move, payload=payload,
+                                  result=res, hits=[])
+                attn_hover = None                               # stale hover indices from the prior state
+
         mouse = pygame.mouse.get_pos()
         frame = render_frame(screen, view, fonts, legal, hover=hover, status=status,
                              log=list(log), bot_result=bot_res,
                              show_reasoning=show_reasoning, seed=game["seed"],
                              hint_result=hint_res, show_hint=show_hint,
                              knowledge=knowledge_cache["val"],
-                             bot_eval=bot_eval, hint_eval=hint_eval)
+                             bot_eval=bot_eval, hint_eval=hint_eval,
+                             attn_available=attncfg["ckpt"] is not None)
         controls = (draw_settings_overlay(screen, fonts, engine, mouse,
                                           nn_available=nncfg["ckpt"] is not None)
                     if settings_open else None)
+        attn_ctrl = None
+        if show_attn and not settings_open and attn_cache["payload"] is not None:
+            attn_ctrl = draw_attention_drawer(screen, fonts, attn_cache["payload"], mouse,
+                                              mode=attn_mode, hover=attn_hover,
+                                              result=attn_cache["result"], move=attn_cache["move"])
+            attn_cache["hits"] = attn_ctrl["hits"]
         pygame.display.flip()
 
         def _slider_at(pos):                        # the modal slider whose (padded) track contains pos
@@ -251,10 +306,21 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 if settings_open:
                     settings_open = False
+                elif show_attn:
+                    show_attn = False
                 else:
                     running = False
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_s and not settings_open:
                 open_setup()                            # S -> build a custom position
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_a and not settings_open:
+                if attncfg["ckpt"] is not None:         # A -> toggle the attention analysis drawer
+                    show_attn = not show_attn
+                    if show_attn:
+                        attn_cache["state"] = None      # force an explain() for the current position
+            elif event.type == pygame.MOUSEMOTION and show_attn and not settings_open:
+                from .attention_view import attn_cell_at
+                hit = attn_cell_at(attn_cache["hits"], event.pos)
+                attn_hover = (hit.i, hit.j, hit.head) if hit else None
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if dragging is not None:            # end of a slider drag -> apply the new value
                     dragging = None
@@ -276,6 +342,15 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                                 engine["mode"], random_bot = mode, False
                                 apply_engine()
                                 break
+                elif show_attn and attn_ctrl is not None:       # modal: route to the drawer, ignore board
+                    if attn_ctrl["close"].collidepoint(pos) or \
+                            (frame.attn_toggle and frame.attn_toggle.collidepoint(pos)):
+                        show_attn = False
+                    elif attn_ctrl["mode_toggle"].collidepoint(pos):
+                        attn_mode = "row_norm" if attn_mode == "absolute" else "absolute"
+                elif frame.attn_toggle and frame.attn_toggle.collidepoint(pos):
+                    show_attn = True                            # open the analysis drawer
+                    attn_cache["state"] = None
                 elif frame.settings.collidepoint(pos):
                     settings_open = True
                 elif frame.scenario.collidepoint(pos):          # build a custom position
@@ -345,9 +420,12 @@ def main(argv=None) -> None:
     parser.add_argument("--nn-greedy", action="store_true",
                         help="seat the --nn checkpoint as a standalone greedy policy (no search) instead of "
                              "an NN+MCTS eval/policy head")
+    parser.add_argument("--attn", nargs="?", const="models/attn_d64_L1.pt", default=None,
+                        help="attention checkpoint for the explainability 'Analysis' drawer (press A); "
+                             "bare --attn uses models/attn_d64_L1.pt. Defaults to that file if it exists.")
     args = parser.parse_args(argv)
     run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
-        k=args.k, l=args.l, setup=args.setup, nn=args.nn, nn_greedy=args.nn_greedy)
+        k=args.k, l=args.l, setup=args.setup, nn=args.nn, nn_greedy=args.nn_greedy, attn=args.attn)
 
 
 if __name__ == "__main__":

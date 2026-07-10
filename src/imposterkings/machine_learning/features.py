@@ -180,6 +180,8 @@ _BELIEF_OFF = _STATE_OFF + 7                                        # 41
 CARD_DIM = _BELIEF_OFF + 2                                          # 43
 _CAND_IX = _STATE_OFF + 4                                           # is_candidate_action -> 38
 _PSEL_IX = _STATE_OFF + 6                                           # pending_selected     -> 40
+CAND_COL = _CAND_IX                                                 # public alias: the is_candidate_action
+#                                                                    column of a card token (used by `explain`)
 
 BOARD_DIM = 2 + 2 + 2 + 8                                           # kings, sizes, turn, muted = 14
 PHASE_DIM = _N_STEP + _NTYPE + _NTYPE + 8 + 1 + 1                   # 15+14+14+8+1+1 = 53
