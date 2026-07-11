@@ -90,3 +90,26 @@ def test_single_layer_no_per_layer_by_default():
     v = _view()
     p = explain(v, v.legal_moves()[0], _model(layers=1))
     assert p.per_layer is None and p.n_layers == 1
+    assert p.row0_signed is None and p.attribution is None    # attribution off by default
+
+
+def test_signed_attribution_shapes_and_reference():
+    v = _view()
+    a = v.legal_moves()[0]
+    m = _model(layers=1)
+    p = explain(v, a, m, attribution=True)
+    S = len(p.seq_labels)
+    assert p.row0_signed.shape == (p.n_heads, S) and p.attribution.shape == (S,)
+    assert np.isfinite(p.row0_signed).all() and np.isfinite(p.attribution).all()
+    assert np.allclose(p.attribution, p.row0_signed.sum(0), atol=1e-5)   # head-sum consistency
+
+    # Reference: sum of signed contributions == head.weight @ (W_o @ out_concat_cls), i.e. the readout
+    # layer's ATTENTION-PATH contribution to the q-logit, computed independently.
+    b = collate([tokenize(v, a)])
+    args = (b["cards"], b["board"], b["phase"], b["action"], b["card_mask"])
+    with torch.no_grad():
+        q, attns, values = m.forward_layers(*args, need_values=True)
+        attn_last, v_last = attns[-1][0], values[-1][0]                  # [heads,S,S], [heads,S,dh]
+        o = (attn_last[:, 0, :].unsqueeze(-1) * v_last).sum(1).reshape(-1)   # concat_h sum_j A[h,0,j] v[h,j]
+        ref = float(m.head.weight[0] @ (m.layers[-1].attn.wo.weight @ o))
+    assert abs(float(p.row0_signed.sum()) - ref) < 1e-4

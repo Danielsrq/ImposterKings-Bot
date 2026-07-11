@@ -487,11 +487,11 @@ def draw_attention_drawer(surface, fonts, payload, mouse, *, mode="absolute", ho
     rec = _compact_action(move) if move is not None else "(no move)"
     _text(surface, small, f"recommend: {rec}    q = {payload.q:+.2f}", (dx + pad, 46), GOLD)
 
-    mode_toggle = pygame.Rect(dx + pad, 74, 168, 24)
+    mode_toggle = pygame.Rect(dx + pad, 74, 210, 24)
     pygame.draw.rect(surface, BTN_HOVER if mode_toggle.collidepoint(mouse) else BTN,
                      mode_toggle, border_radius=12)
-    _text(surface, small, f"scale: {'absolute' if mode == 'absolute' else 'row-norm'}",
-          (mode_toggle.x + 10, mode_toggle.y + 4))
+    _mode_label = {"absolute": "absolute", "row_norm": "row-norm", "signed": "signed (dq)"}.get(mode, mode)
+    _text(surface, small, f"scale: {_mode_label}", (mode_toggle.x + 10, mode_toggle.y + 4))
     close = pygame.Rect(dx + dw - pad - 82, 12, 82, 26)
     pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
     _text(surface, small, "Close [A]", (close.x + 10, close.y + 5), INK)
@@ -508,22 +508,36 @@ def draw_attention_drawer(surface, fonts, payload, mouse, *, mode="absolute", ho
 
     pv_y = H - pv_h + 6
     pygame.draw.line(surface, DIVIDER, (dx + pad, pv_y - 6), (dx + dw - pad, pv_y - 6))
-    _text(surface, small, "Principal variation:", (dx + pad, pv_y), MUTE)
-    if result is not None and getattr(result, "root", None) is not None:
-        try:
-            pvs = result.principal_variations(top=2, depth=depth)
-        except Exception:                                # noqa: BLE001 -- PV is best-effort decoration
-            pvs = []
-        yy = pv_y + 22
-        for line in pvs:
-            xx = dx + pad
-            for step in line:
-                t = small.render(_compact_action(step.move), True, P_COLORS.get(step.player, INK))
-                if xx + t.get_width() > dx + dw - pad:
-                    break
-                surface.blit(t, (xx, yy))
-                xx += t.get_width() + 8
-            yy += 20
+    attribution = getattr(payload, "attribution", None)
+    if mode == "signed" and attribution is not None:            # top +/- contributors to the recommendation
+        _text(surface, small, "Top contributors (dq to q):", (dx + pad, pv_y), MUTE)
+        order = sorted(range(len(attribution)), key=lambda k: -abs(float(attribution[k])))
+        xx, yy = dx + pad, pv_y + 22
+        for k in order[:6]:
+            val = float(attribution[k])
+            col = (74, 190, 110) if val >= 0 else (214, 72, 72)
+            t = small.render(f"{payload.seq_labels[k]} {val:+.2f}", True, col)
+            if xx + t.get_width() > dx + dw - pad:
+                xx, yy = dx + pad, yy + 20
+            surface.blit(t, (xx, yy))
+            xx += t.get_width() + 12
+    else:
+        _text(surface, small, "Principal variation:", (dx + pad, pv_y), MUTE)
+        if result is not None and getattr(result, "root", None) is not None:
+            try:
+                pvs = result.principal_variations(top=2, depth=depth)
+            except Exception:                            # noqa: BLE001 -- PV is best-effort decoration
+                pvs = []
+            yy = pv_y + 22
+            for line in pvs:
+                xx = dx + pad
+                for step in line:
+                    t = small.render(_compact_action(step.move), True, P_COLORS.get(step.player, INK))
+                    if xx + t.get_width() > dx + dw - pad:
+                        break
+                    surface.blit(t, (xx, yy))
+                    xx += t.get_width() + 8
+                yy += 20
     return {"close": close, "mode_toggle": mode_toggle, "hits": hits}
 
 

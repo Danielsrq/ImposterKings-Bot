@@ -60,3 +60,19 @@ def test_miss_returns_none():
     p = _payload()
     hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820))
     assert av.attn_cell_at(hits, (5, 5)) is None                     # outside the grid
+
+
+def test_signed_mode_diverging():
+    surf = pygame.Surface((1000, 900))
+    p = _payload()
+    s = len(p.seq_labels)
+    rs = np.zeros((p.n_heads, s), np.float32)
+    rs[0, 1], rs[0, 2] = 0.5, -0.5                                   # token1 raises q, token2 lowers q
+    p.row0_signed = rs
+    hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820), mode="signed", candidate_index=1)
+    assert len(hits) == p.n_heads * s * s
+    pos = next(h for h in hits if h.head == 0 and h.i == 0 and h.j == 1)
+    neg = next(h for h in hits if h.head == 0 and h.i == 0 and h.j == 2)
+    cp, cn = surf.get_at(pos.rect.center), surf.get_at(neg.rect.center)
+    assert cp[:3] != cn[:3]                                          # opposite signs -> distinct colors
+    assert cp[1] > cp[0] and cn[0] > cn[1]                           # positive greener, negative redder

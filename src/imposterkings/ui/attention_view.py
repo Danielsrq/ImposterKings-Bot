@@ -12,6 +12,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pygame
 
 from ..cards import card_ids_for_name
@@ -71,6 +72,19 @@ def _heat(t: float) -> RGB:
 
 def _blend(c: RGB, bg: RGB, a: float) -> RGB:
     return tuple(int(round(c[k] * a + bg[k] * (1.0 - a))) for k in range(3))
+
+
+_DIV_NEG: RGB = (214, 72, 72)      # red   = lowers q
+_DIV_MID: RGB = (44, 48, 58)       # ~0    = dark grey
+_DIV_POS: RGB = (74, 190, 110)     # green = raises q
+
+
+def _heat_div(x: float, xmax: float) -> RGB:
+    """Diverging color for a SIGNED value in [-xmax, xmax]: red (negative) -> grey (0) -> green (positive),
+    magnitude via sqrt so small contributions still read."""
+    t = math.sqrt(min(1.0, abs(x) / max(xmax, 1e-9)))
+    end = _DIV_POS if x >= 0 else _DIV_NEG
+    return tuple(int(round(_DIV_MID[k] + (end[k] - _DIV_MID[k]) * t)) for k in range(3))
 
 
 def _grid_shape(n_heads: int) -> Tuple[int, int]:
@@ -136,6 +150,10 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
     ox = rx + max(0, (rw - grid_w) // 2)
     oy = ry + max(0, (rh - grid_h) // 2)
 
+    # "signed" mode colors ROW 0 by the value-weighted signed contribution (diverging); falls back to the
+    # attention view if attribution wasn't computed.
+    signed = getattr(payload, "row0_signed", None) if mode == "signed" else None
+    smax = float(np.abs(signed).max()) if signed is not None else 1.0
     gmax = float(attn.max()) or 1.0
     hits: List[AttnHit] = []
     geoms: List[AttnGeom] = []
@@ -149,9 +167,13 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
             denom = (float(row_max[i]) or 1.0) if row_max is not None else gmax
             primary_row = (i in emphasize_rows) or (i == candidate_index)
             for j in range(s):
-                col = _heat(math.sqrt(max(0.0, float(attn[h, i, j])) / denom))
-                if not (primary_row or j == candidate_index):
-                    col = _blend(col, BG, 0.45)            # de-emphasize non-load-bearing cells
+                if signed is not None:
+                    col = (_heat_div(float(signed[h, j]), smax) if i == 0
+                           else _blend((60, 64, 74), BG, 0.5))   # only row 0 is load-bearing here
+                else:
+                    col = _heat(math.sqrt(max(0.0, float(attn[h, i, j])) / denom))
+                    if not (primary_row or j == candidate_index):
+                        col = _blend(col, BG, 0.45)        # de-emphasize non-load-bearing cells
                 r = pygame.Rect(bx + j * cell, by + i * cell, cell, cell)
                 pygame.draw.rect(surface, col, r)
                 hits.append(AttnHit(r, i, j, h))
@@ -208,6 +230,9 @@ def draw_tooltip(surface, fonts, payload, hit: AttnHit, pos) -> None:
     v = float(payload.attn[hit.head, hit.i, hit.j])
     lines = [f"{payload.seq_labels[hit.i]} -> {payload.seq_labels[hit.j]}",
              f"head {hit.head}   weight {v:.2f}"]
+    rs = getattr(payload, "row0_signed", None)
+    if hit.i == 0 and rs is not None:                          # signed contribution to q (row-0 readout)
+        lines.append(f"dq {float(rs[hit.head, hit.j]):+.3f}")
     lh = small.get_linesize()
     w = max(small.size(t)[0] for t in lines) + 12
     h = len(lines) * lh + 8

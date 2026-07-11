@@ -261,8 +261,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 res = analysis[view_seat]                       # attention-MCTS hint search (run just above)
                 rec_move = res.best_move if (res is not None and len(legal) > 1) else legal[0]
                 from ..machine_learning.explain import explain
-                payload = explain(view, rec_move, model,
-                                  all_layers=(model.cfg.n_layers > 1), ckpt_id=attncfg["id"])
+                payload = explain(view, rec_move, model, all_layers=(model.cfg.n_layers > 1),
+                                  attribution=True, ckpt_id=attncfg["id"])
                 attn_cache.update(state=game["state"], move=rec_move, payload=payload,
                                   result=res, hits=[])
                 attn_hover = None                               # stale hover indices from the prior state
@@ -347,7 +347,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                             (frame.attn_toggle and frame.attn_toggle.collidepoint(pos)):
                         show_attn = False
                     elif attn_ctrl["mode_toggle"].collidepoint(pos):
-                        attn_mode = "row_norm" if attn_mode == "absolute" else "absolute"
+                        attn_mode = {"absolute": "row_norm", "row_norm": "signed",
+                                     "signed": "absolute"}[attn_mode]
                 elif frame.attn_toggle and frame.attn_toggle.collidepoint(pos):
                     show_attn = True                            # open the analysis drawer
                     attn_cache["state"] = None

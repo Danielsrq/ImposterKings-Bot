@@ -5,6 +5,18 @@ a token-based, action-in q-model (`f(state, action) → q`) with per-head CLS→
 interpretability readout. This file records the two studies run to (1) profile its cost as an MCTS leaf
 evaluator and (2) sweep its capacity (depth `L`, FFN width, and the head-to-head playing strength each buys).
 
+## References (the value-weighted attribution follows these closely)
+
+- Kobayashi, Kuribayashi, Yokoi & Inui (EMNLP 2020), **"Attention is Not Only a Weight: Analyzing
+  Transformers with Vector Norms"** — attention output is `Σⱼ A[i,j]·f(xⱼ)` with `f(x)=(xW_v)W_o`, so
+  importance = the *norm of the attention-weighted transformed value*, not `A` alone (our unsigned cousin).
+  https://aclanthology.org/2020.emnlp-main.574/  (code: https://github.com/gorokoba560/norm-analysis-of-transformer)
+- Elhage, Nanda, Olsson et al. (Anthropic, 2021), **"A Mathematical Framework for Transformer Circuits"** —
+  the OV circuit (`W_V·W_O` = the "what content moves the output" linear map, attention = the mixing
+  weights) and direct logit attribution; our signed `Δq(j) = Σₕ Aʰ[0][j]·(uʰ·vⱼʰ)` is DLA specialized to a
+  scalar value head. Web-native article (no arXiv/official PDF):
+  https://transformer-circuits.pub/2021/framework/index.html
+
 ## Setup (common to all results)
 
 - **Game:** 2-player ImposterKings.
@@ -117,3 +129,205 @@ card↔card attention rows causal (layer-1 → layer-2 CLS), so swapping to it l
   baseline (predict-the-mean) ≈ 0.258.
 - **params** — total learnable parameters. **train-time** — wall-clock to train (CPU, torch 2.12.1+cpu).
 - **eval cost / rollout cost** (Study 1) — mean ms per NN leaf evaluation vs per random rollout playout.
+
+---
+
+## Value-weighted attribution (the math behind the drawer's "signed" mode)
+
+The attention drawer's raw-attention view shows `A[0][j]` = *where CLS looked*, which is **not** *how much
+token j moved the recommendation* — attention drops the value vector. The "signed" mode fixes this with a
+**value-weighted attribution**, computed post-hoc on the trained model (no retrain). Below is the full
+derivation with shapes. Config: **d = d_model = 64, H = n_heads = 4, dₕ = d/H = 16**, sequence length **S**
+(= `1 CLS + N cards + 3` context tokens).
+
+### Shapes
+
+| symbol | meaning | shape |
+|---|---|---|
+| `X` | readout-layer input (one row per token, post-embedding) | `[S, 64]` |
+| `W_q, W_k, W_v, W_o` | the four learned `nn.Linear(64,64)` maps | `[64, 64]` |
+| `w_head` | value head weight (`nn.Linear(64,1)`) | `[64]` |
+| `Qʰ, Kʰ, Vʰ` | per-head query/key/value projections | `[S, 16]` |
+| `Aʰ` | attention matrix, head h (`softmax` rows) | `[S, S]` |
+| `o₀ʰ` / `o₀` | CLS attention output, per head / concatenated | `[16]` / `[64]` |
+| `u = w_head·W_o` | readout direction (fixed), split into `uʰ` | `[64]` / `[16]` |
+| `c_jʰ = uʰ·vⱼʰ` | value-to-readout alignment | scalar |
+| `Δq(j) = Σₕ Aʰ[0][j]·c_jʰ` | token j's signed contribution | scalar |
+
+### Forward pass (where each weight acts)
+
+1. Project (after LayerNorm): `qᵢ = W_q x̃ᵢ`, `kⱼ = W_k x̃ⱼ`, `vⱼ = W_v x̃ⱼ`, each `[64]` → split to heads `[16]`.
+2. **`W_q` and `W_k` build the attention** — the *only* place `W_q` enters:
+   `Sʰ[i,j] = (qᵢʰ·kⱼʰ)/√16`, `Aʰ = softmax_j(Sʰ)`. `Aʰ` decides *where CLS looks*; it carries no value content.
+3. Pool + project + read out:
+   `o₀ʰ = Σⱼ Aʰ[0][j] vⱼʰ`, `o₀ = concat_h`, `a₀ = W_o o₀`,
+   `CLS_out = x₀(residual) + a₀(attention) + FFN`, `q_logit = w_head·CLS_out`, `q = tanh(q_logit)`.
+
+### Decomposing q into per-token contributions
+
+The attention path's share of the logit: `w_head·a₀ = (w_head·W_o)·o₀ = u·o₀`. Expanding `o₀`:
+
+`w_head·a₀ = Σₕ uʰ·(Σⱼ Aʰ[0][j] vⱼʰ) = Σⱼ Σₕ Aʰ[0][j] (uʰ·vⱼʰ) = Σⱼ Σₕ Aʰ[0][j] c_jʰ`.
+
+So **`c_jʰ = uʰ·vⱼʰ`** — token j's **value vector** (from `W_v`) dotted with the **readout direction** `uʰ`
+(from `W_o` and `w_head`). It is the signed amount j's content would move the logit *per unit attention*;
+it does **not** involve `W_q`. The realized contribution multiplies it by the actual attention:
+
+`Δq(j) = Σₕ Aʰ[0][j]·c_jʰ`  —  `A` is the "how much CLS looks" (W_q/W_k) half, `c_j` is the "how much j's
+content moves q" (W_v/W_o/w_head) half.
+
+### q vs dq
+- **q** = `tanh(q_logit)` = the model's scalar value estimate (the drawer header + the tooltip's `weight` is
+  the raw attention). One output number.
+- **dq (Δq)** = a **contribution/decomposition** term (delta, not a derivative): token j's share of the
+  logit. Green = raised q, red = lowered it.
+- Caveats: `Σⱼ Δq(j)` is only the **attention-path** slice of `q_logit` (the residual `x₀` and the FFN also
+  contribute, un-attributed); it is attributed to the **pre-tanh logit**, so the effect on the bounded `q`
+  scales by `1 − q²` — monotone, so signs/rankings are exact, only magnitudes rescale. It is also a
+  **last-layer** attribution (ignores earlier layers at L≥2). **Biases:** `b_v` is inside each `vⱼ` and is
+  correctly attributed per token, but `b_o`/`b_head` are token-independent constants — `Σⱼ Δq(j)` matches
+  the attention-path logit share up to `w_head·b_o + b_head`, which lives in the un-attributed constant
+  slice (cannot belong to any token; signs/rankings unaffected).
+
+### Code
+`explain(view, action, model, attribution=True)` (`machine_learning/explain.py`) returns
+`row0_signed [H,S]` (= `Aʰ[0][j]·c_jʰ`) and `attribution [S]` (head-summed `Δq(j)`); it reads the value
+vectors via `AttentionModel.forward_layers(..., need_values=True)` and computes
+`u = head.weight[0] @ layers[-1].attn.wo.weight`. Verified by the reference-equivalence test in
+`tests/test_explain.py` (`row0_signed.sum()` equals an independent `w_head·(W_o·o₀_cls)`).
+
+**Empirical payoff:** on a position where raw attention was dominated by the `board` token, the signed view
+ranks `my_hand:Assassin` first (+0.25) and `board` only third (−0.14) — the cards that actually swing the
+value surface once the value vector is included.
+
+# Math scratch
+Per attn head h , for each j-th token,
+$$s_j = \frac{q_0^h \cdot k_j^h}{\sqrt{16}} ;;\text{(scalar per } j\text{)}, \qquad A^h[0][\cdot] = \text{softmax}_j(s_j) ;\in [1\times S]$$
+
+$$out_0^h = (\sum_{j} A^h[0][j] ) v_j^h \qquad [1\times16]$$
+v_j^h is the 1x16 value vector
+
+- concat 4 heads: out₀ = [out₀¹ ; out₀² ; out₀³ ; out₀⁴] → [1×64] ; subscript 0 for 0th token?
+- output projection: a₀ = out₀ @ W_o → [1×64] ; a_0 for attention
+- residual + FFN: CLS_out = x₀ + a₀ + FFN(...) → [1×64]
+- value head: q_logit = CLS_out · w_head (scalar), Q = tanh(q_logit)
+
+Matrix form (if it helps)
+
+The same line as one matrix product: o₀ʰ = Aʰ[0] @ Vʰ where Aʰ[0] is [1×S] and Vʰ is [S×16] → result [1×S] @ [S×16] = [1×16]. ✓ (And doing all rows at once is Aʰ @ Vʰ = [S×S]@[S×16] = [S×16] — every token gets its own blended output; we only read row 0's.)
+
+Step 1 — what A @ V is
+
+$$Out = A @ V \qquad [S\times S],@,[S\times16] = [S\times16]$$
+
+This is called the attention output (of head h) — sometimes "context vectors." There's no single universal name; in our code it's literally the variable out (attention_model.py line 77: out = (attn @ v)...).
+
+Step 2 — concatenate the 4 heads back together
+Out_h is [Sx16] but there are 4 heads so we concatenate O = [O_1 | O_2 | O_3 | O_4] is Sx64
+
+Step 3 — the output projection W_o
+
+$$A_{out} = O_{cat} ,@, W_o \qquad [S\times64],@,[64\times64] = [S\times64]$$
+
+
+W_o is a learned mixer: the four heads computed their blends independently, and W_o recombines them into one coherent 64-dim update per token.
+
+Break both matrices into rows:
+
+$$X = \begin{bmatrix} x_1 \ x_2 \ \vdots \ x_S \end{bmatrix}, \qquad A_{out} = \begin{bmatrix} a_1 \ a_2 \ \vdots \ a_S \end{bmatrix} \qquad \text{each row } [1\times64]$$
+
+Then
+
+$$X' = X + A_{out} = \begin{bmatrix} x_1 + a_1 \ x_2 + a_2 \ \vdots \ x_S + a_S \end{bmatrix}$$
+
+$$a_i = O_{cat}[i] ,@, W_o \qquad [1\times64],@,[64\times64] = [1\times64]$$
+This ends the attention sublayer.
+
+Step 4 — residual add (attention's contribution joins the stream)
+
+$$X' = X + A_{out} \qquad [S\times64]$$
+
+Each token's representation is updated by its attention result, not replaced. (This is the residual stream from our earlier diagram.)
+
+Step 5 — the FFN sublayer (per token, own residual)
+
+$$X'' = X' + \text{FFN}(\text{LN}(X')) \qquad [S\times64]$$
+
+LN = LayerNorm (a per-token "recentering")
+
+LN takes one token's 64-vector and standardizes it across its own 64 features:
+
+$$\text{LN}(x) = \gamma \odot \frac{x - \mu}{\sigma} + \beta$$
+
+where, for that single row x [1×64]:
+- μ = mean of its 64 numbers (scalar), σ = their std (scalar) → (x−μ)/σ has mean 0, std 1
+- γ, β = learned [64] scale-and-shift vectors (so the network can undo/adjust the normalization per feature); ⊙ = elementwise
+
+The FFN (64→128→GELU→64) touches each row independently — no cross-token mixing here.
+
+Step 6 — the readout (last layer only)
+
+Take row 0 only (CLS) of the final X'': (we still have 1 last linear layer with weights and bias)
+
+$$q_{logit} = X''[0] \cdot w_{head} + b_{head} \quad(\text{scalar}), \qquad Q = \tanh(q_{logit})$$
+
+[1×64] · [64×1] → scalar. That scalar is the value the drawer displays. Rows 1..S−1 of X'' are computed but never read (at L=1) — that's the "card rows are discarded" point from before.
+
+Swap trick,
+
+From step 6 and step 4/5, CLS's final vector is a sum of three pieces:
+
+$$q_{logit} = \big(\underbrace{x_0}{\text{residual}} + \underbrace{a_0}{\text{attention}} + \underbrace{f_0}{\text{FFN}}\big)\cdot w_{head} + b_{head}$$
+
+q_logit splits into x₀·w_head + a₀·w_head + f₀·w_head + b_head. Only the a₀·w_head piece came through attention
+
+Move 1: collapse the linear tail into one vector u
+
+From step 3, a₀ = o₀ @ W_o. So:
+
+$$a_0 \cdot w_{head} = (o_0 @ W_o)\cdot w_{head} = o_0 \cdot \underbrace{(w_{head} ,@, W_o^\top)}_{u;[1\times64]}$$
+
+Two linear maps in a row (W_o, then dot with w_head) are just one dot with a precomputed vector u. Split u into head blocks like everything else: u = [u¹|u²|u³|u⁴], each [1×16]. Then, since o₀ is the head-concat:
+
+$$a_0\cdot w_{head} = \sum_{h=1}^{4} o_0^h \cdot u^h$$
+
+In "physics" terms I think of `u` as a kind of good-ness measurement. since w_head is learnt via NN training that means w_head learnt weights to align input to output example. Since `u` is derived from w_head and W_o it is some measurement of goodness according to its alignemnt to the dataset.
+
+Move 2: THE swap
+
+Substitute step 1's row-0 blend o₀ʰ = Σⱼ Aʰ[0][j]·v_jʰ and use one algebra rule — a dot product distributes over a weighted sum:
+
+$$\sum_h \Big(\sum_j A^h[0][j], v_j^h\Big)\cdot u^h ;=; \sum_j \sum_h A^h[0][j],\underbrace{\big(v_j^h\cdot u^h\big)}_{c_j^h \text{ (scalar)}} ;=; \sum_j \Delta q(j)$$
+
+That's the entire trick. Forward order: blend the vectors first (Σⱼ), dot with u last → one total. Attribution order: dot each token's value vector with u first (c_jʰ), blend the scalars with the same attention weights → the same total, but it arrives pre-split per token j.
+
+Now we have mathematically massaged a term `c_j^h = v_j^h . u^`. This can be viewed as a projection - the contribution `c` of the j-th token is its value `v` projected onto `u` the 'goodness' axis.
+
+The micro-example, both orders (same numbers as before, plus u = [1, 0.5, −1])
+
+A[0] = [0.7, 0.2, 0.1], v₁=[1,0,2], v₂=[0,10,0], v₃=[−5,0,1].
+
+Forward order (steps 1→6): o₀ = [0.2, 2.0, 1.5] (computed earlier), then
+o₀·u = 0.2·1 + 2.0·0.5 + 1.5·(−1) = **−0.3**. One number, no idea who caused it.
+
+Swapped order: project each ingredient first:
+c₁ = v₁·u = 1 + 0 − 2  = −1
+c₂ = v₂·u = 0 + 5 + 0  = +5
+c₃ = v₃·u = −5 + 0 − 1 = −6
+then blend the scalars: Δq = [0.7·(−1), 0.2·(+5), 0.1·(−6)] = [−0.7, +1.0, −0.6], sum = −0.3 ✓.
+
+Write the attention-path logit share as one explicit contraction (per head, indices j = token, t = the 16 feature dims):
+$$a_0\cdot w_{head}\big|h ;=; \sum{j}\sum_{t} A^h[0,j]; V^h[j,t]; u^h[t]$$
+
+In einsum notation: einsum("j,jt,t->", A0, V, u). It's a double contraction, and the "trick" is nothing but choosing which index to contract first:
+
+- contract j first: (A0 @ V) · u → build o₀, then project → the forward order
+- contract t first: A0 · (V @ u) → build c_j = v_j·u per token, then blend → the attribution order
+
+Associativity of contraction. Same tensor, two evaluation orders, one of which happens to leave the answer factored per token.
+
+And the bra-ket analogy is genuinely apt, not just vibes: with c_j = ⟨u|v_j⟩,
+
+$$\langle u | o_0\rangle = \Big\langle u \Big| \sum_j A_j, v_j \Big\rangle = \sum_j A_j ,\langle u | v_j\rangle$$
+
+— a linear functional distributing over a superposition, exactly the manipulation you'd do expanding a state in components and evaluating an overlap term-by-term. ⟨u| is the fixed "measurement" (the readout direction), the |v_j⟩ are the components, A_j the mixture weights, and the attribution is just reading the expectation before collapsing the sum. The place the analogy (and the method) hard-stops is the same place linearity stops: the softmax that made A and the FFN/tanh are nonlinear, so no bra-ket games survive passing through them — which is precisely why the attribution is scoped to "attention path, last layer, pre-tanh."

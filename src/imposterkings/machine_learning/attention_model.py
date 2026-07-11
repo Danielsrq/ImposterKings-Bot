@@ -63,7 +63,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.wo = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x, add_mask=None):
+    def forward(self, x, add_mask=None, need_values=False):
         b, s, d = x.shape
 
         def split(t):                                       # [B,S,d] -> [B,h,S,dh]
@@ -75,6 +75,8 @@ class MultiHeadSelfAttention(nn.Module):
             scores = scores + add_mask                      # additive -inf on padded keys
         attn = torch.softmax(scores, dim=-1)
         out = (self.drop(attn) @ v).transpose(1, 2).reshape(b, s, d)
+        if need_values:                                     # v [B,h,S,dh] for value-weighted attribution
+            return self.wo(out), attn, v
         return self.wo(out), attn
 
 
@@ -91,10 +93,15 @@ class EncoderLayer(nn.Module):
             nn.Dropout(cfg.dropout), nn.Linear(cfg.ffn_hidden, cfg.d_model))
         self.drop = nn.Dropout(cfg.dropout)
 
-    def forward(self, x, add_mask=None):
-        a, attn = self.attn(self.ln1(x), add_mask)
+    def forward(self, x, add_mask=None, need_values=False):
+        if need_values:
+            a, attn, v = self.attn(self.ln1(x), add_mask, need_values=True)
+        else:
+            a, attn, v = *self.attn(self.ln1(x), add_mask), None
         x = x + self.drop(a)
         x = x + self.drop(self.ffn(self.ln2(x)))
+        if need_values:
+            return x, attn, v
         return x, attn
 
 
@@ -109,11 +116,11 @@ class AttentionModel(nn.Module):
         self.layers = nn.ModuleList([EncoderLayer(cfg) for _ in range(cfg.n_layers)])
         self.head = nn.Linear(cfg.d_model, 1)
 
-    def forward_layers(self, cards, board, phase, action, card_mask=None):
+    def forward_layers(self, cards, board, phase, action, card_mask=None, need_values=False):
         """Same encode as :meth:`forward` but returns EVERY layer's attention.
-        Returns (q [B], attns) where attns is a list of per-layer [B, heads, S, S] (len == n_layers).
-        ``forward`` is exactly ``q, attns[-1]``. Used by the interpretability path (`explain`) which wants
-        earlier layers' card->card maps (causal at L>=2) in addition to the last-layer CLS readout."""
+        Returns (q [B], attns) where attns is a list of per-layer [B, heads, S, S] (len == n_layers), or
+        (q, attns, values) with per-layer value vectors [B, heads, S, dh] when ``need_values`` (for the
+        value-weighted attribution in `explain`). ``forward`` is exactly ``q, attns[-1]``."""
         b, n = cards.shape[0], cards.shape[1]
         hc, hb, hp, ha = self.embed(cards, board, phase, action)
         cls = self.cls.view(1, 1, -1).expand(b, 1, -1)
@@ -127,13 +134,19 @@ class AttentionModel(nn.Module):
             add_mask = torch.zeros(b, 1, 1, s, device=cards.device)
             add_mask = add_mask.masked_fill(~valid[:, None, None, :], float("-inf"))
 
-        attns = []
+        attns, values = [], []
         for layer in self.layers:
-            seq, attn = layer(seq, add_mask)
+            if need_values:
+                seq, attn, v = layer(seq, add_mask, need_values=True)
+                values.append(v)                                   # each [B, heads, S, dh]
+            else:
+                seq, attn = layer(seq, add_mask)
             attns.append(attn)                                      # each [B, heads, S, S]
         q = self.head(seq[:, 0, :]).squeeze(-1)                     # CLS output -> scalar
         if self.cfg.bounded:
             q = torch.tanh(q)
+        if need_values:
+            return q, attns, values
         return q, attns
 
     def forward(self, cards, board, phase, action, card_mask=None):
