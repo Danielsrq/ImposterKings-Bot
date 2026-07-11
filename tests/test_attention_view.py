@@ -62,6 +62,32 @@ def test_miss_returns_none():
     assert av.attn_cell_at(hits, (5, 5)) is None                     # outside the grid
 
 
+def test_exclude_indices_renormalizes_and_keeps_original_indices():
+    surf = pygame.Surface((1000, 900))
+    p = _payload()
+    s = len(p.seq_labels)
+    board = p.seq_labels.index("board")
+    hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820),
+                             exclude_indices=(board,), candidate_index=1)
+    assert len(hits) == p.n_heads * (s - 1) ** 2                     # board row+col dropped
+    assert all(h.i != board and h.j != board for h in hits)          # hits keep ORIGINAL indices
+    # hover on the excluded token is a no-op (no crash); hover on a kept token draws
+    av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820),
+                      exclude_indices=(board,), hover=(0, board, 0))
+    av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820),
+                      exclude_indices=(board,), hover=(0, 1, 0))
+
+
+def test_tooltip_with_attribution_shows_total():
+    surf = pygame.Surface((1000, 900))
+    p = _payload()
+    s = len(p.seq_labels)
+    p.row0_signed = np.zeros((p.n_heads, s), np.float32)
+    p.attribution = np.arange(s, dtype=np.float32)                   # head-summed totals present
+    hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820), mode="signed")
+    av.draw_tooltip(surf, _fonts(), p, hits[0], (500, 400))          # renders the Σheads Δq line
+
+
 def test_signed_mode_diverging():
     surf = pygame.Surface((1000, 900))
     p = _payload()

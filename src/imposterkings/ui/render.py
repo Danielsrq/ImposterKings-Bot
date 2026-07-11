@@ -466,11 +466,14 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True):
     return {"pills": pills, "sliders": sliders, "close": close}
 
 
-def draw_attention_drawer(surface, fonts, payload, mouse, *, mode="absolute", hover=None,
-                          result=None, move=None, depth=5):
-    """Right-side "analysis mode" drawer over a dim scrim: the recommended move + q, the 2x2 per-head
-    attention heatmap (via ``attention_view``), and the PV. Returns clickable controls
-    ``{"close", "mode_toggle", "hits"}``. Opaque panel (heatmap must stay legible); scrim dims the board."""
+def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", hover=None,
+                          selected=0, hide_board=False, result=None, depth=5):
+    """Right-side "analysis mode" drawer over a dim scrim. ``entries`` = the top recommendations as
+    ``[(move, payload), ...]`` (payload = an AttentionExplanation); ``selected`` picks which entry the
+    heatmap shows (clickable rec pills switch). ``hide_board`` drops the board token from the heatmap and
+    renormalizes the remaining attention rows. In "signed" mode the bottom shows per-entry Top-contributor
+    columns (the side-by-side comparison); otherwise the PV. Returns clickable controls
+    ``{"close", "mode_toggle", "board_toggle", "rec_pills", "hits"}``."""
     from . import attention_view                          # lazy: attention_view imports palette from here
     med, small = fonts["med"], fonts["small"]
     W, H = WINDOW
@@ -484,23 +487,47 @@ def draw_attention_drawer(surface, fonts, payload, mouse, *, mode="absolute", ho
     pad = 16
 
     _text(surface, med, "Attention  -  why this move", (dx + pad, 14), INK)
-    rec = _compact_action(move) if move is not None else "(no move)"
-    _text(surface, small, f"recommend: {rec}    q = {payload.q:+.2f}", (dx + pad, 46), GOLD)
-
-    mode_toggle = pygame.Rect(dx + pad, 74, 210, 24)
-    pygame.draw.rect(surface, BTN_HOVER if mode_toggle.collidepoint(mouse) else BTN,
-                     mode_toggle, border_radius=12)
-    _mode_label = {"absolute": "absolute", "row_norm": "row-norm", "signed": "signed (dq)"}.get(mode, mode)
-    _text(surface, small, f"scale: {_mode_label}", (mode_toggle.x + 10, mode_toggle.y + 4))
     close = pygame.Rect(dx + dw - pad - 82, 12, 82, 26)
     pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
     _text(surface, small, "Close [A]", (close.x + 10, close.y + 5), INK)
+
+    # Rec pills: the search's top recommendations; click switches which one the heatmap explains.
+    selected = max(0, min(selected, len(entries) - 1))
+    rec_pills = []
+    xx = dx + pad
+    for i, (mv, pl) in enumerate(entries):
+        label = f"{i + 1}. {_compact_action(mv)}   q = {pl.q:+.2f}"
+        wpx = small.size(label)[0] + 20
+        r = pygame.Rect(xx, 44, wpx, 26)
+        pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=13)
+        if i == selected:
+            pygame.draw.rect(surface, GOLD, r, 2, border_radius=13)
+        _text(surface, small, label, (r.x + 10, r.y + 5), GOLD if i == selected else INK)
+        rec_pills.append(r)
+        xx += wpx + 10
+
+    mode_toggle = pygame.Rect(dx + pad, 78, 190, 24)
+    pygame.draw.rect(surface, BTN_HOVER if mode_toggle.collidepoint(mouse) else BTN,
+                     mode_toggle, border_radius=12)
+    _mode_label = {"absolute": "absolute", "row_norm": "row-norm", "signed": "signed (Δq)"}.get(mode, mode)
+    _text(surface, small, f"scale: {_mode_label}", (mode_toggle.x + 10, mode_toggle.y + 4))
+    board_toggle = pygame.Rect(mode_toggle.right + 10, 78, 170, 24)
+    pygame.draw.rect(surface, BTN_HOVER if board_toggle.collidepoint(mouse) else BTN,
+                     board_toggle, border_radius=12)
+    _text(surface, small, f"board: {'hidden' if hide_board else 'shown'}",
+          (board_toggle.x + 10, board_toggle.y + 4))
+
+    move, payload = entries[selected]
+    exclude = ()
+    if hide_board and "board" in payload.seq_labels:
+        exclude = (payload.seq_labels.index("board"),)
 
     pv_h = 128
     heat_rect = (dx + pad, 112, dw - 2 * pad, H - 112 - pv_h)
     hits = attention_view.draw_attention(surface, fonts, payload, heat_rect, mode=mode,
                                          emphasize_rows=(0,),
-                                         candidate_index=payload.candidate_seq_index, hover=hover)
+                                         candidate_index=payload.candidate_seq_index, hover=hover,
+                                         exclude_indices=exclude)
     if hover is not None:
         hit = next((h for h in hits if (h.i, h.j, h.head) == hover), None)
         if hit is not None:
@@ -508,19 +535,22 @@ def draw_attention_drawer(surface, fonts, payload, mouse, *, mode="absolute", ho
 
     pv_y = H - pv_h + 6
     pygame.draw.line(surface, DIVIDER, (dx + pad, pv_y - 6), (dx + dw - pad, pv_y - 6))
-    attribution = getattr(payload, "attribution", None)
-    if mode == "signed" and attribution is not None:            # top +/- contributors to the recommendation
-        _text(surface, small, "Top contributors (dq to q):", (dx + pad, pv_y), MUTE)
-        order = sorted(range(len(attribution)), key=lambda k: -abs(float(attribution[k])))
-        xx, yy = dx + pad, pv_y + 22
-        for k in order[:6]:
-            val = float(attribution[k])
-            col = (74, 190, 110) if val >= 0 else (214, 72, 72)
-            t = small.render(f"{payload.seq_labels[k]} {val:+.2f}", True, col)
-            if xx + t.get_width() > dx + dw - pad:
-                xx, yy = dx + pad, yy + 20
-            surface.blit(t, (xx, yy))
-            xx += t.get_width() + 12
+    if mode == "signed" and any(getattr(pl, "attribution", None) is not None for _, pl in entries):
+        # per-entry Top-contributor columns: which parts of the position drove each candidate's value
+        _text(surface, small, "Top contributors (Δq to q-logit):", (dx + pad, pv_y), MUTE)
+        col_w = (dw - 2 * pad) // max(1, len(entries))
+        for i, (mv, pl) in enumerate(entries):
+            cx = dx + pad + i * col_w
+            _text(surface, small, f"{i + 1}. {_compact_action(mv)}", (cx, pv_y + 20),
+                  GOLD if i == selected else INK)
+            att = getattr(pl, "attribution", None)
+            if att is None:
+                continue
+            order = sorted(range(len(att)), key=lambda k: -abs(float(att[k])))
+            for row, k in enumerate(order[:4]):
+                val = float(att[k])
+                col = (74, 190, 110) if val >= 0 else (214, 72, 72)
+                _text(surface, small, f"{pl.seq_labels[k]} {val:+.2f}", (cx, pv_y + 40 + row * 18), col)
     else:
         _text(surface, small, "Principal variation:", (dx + pad, pv_y), MUTE)
         if result is not None and getattr(result, "root", None) is not None:
@@ -538,7 +568,8 @@ def draw_attention_drawer(surface, fonts, payload, mouse, *, mode="absolute", ho
                     surface.blit(t, (xx, yy))
                     xx += t.get_width() + 8
                 yy += 20
-    return {"close": close, "mode_toggle": mode_toggle, "hits": hits}
+    return {"close": close, "mode_toggle": mode_toggle, "board_toggle": board_toggle,
+            "rec_pills": rec_pills, "hits": hits}
 
 
 def make_fonts():

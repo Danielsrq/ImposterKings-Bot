@@ -128,17 +128,29 @@ def _axis_tile(surface, payload, k: int, x: int, y: int, size: int) -> None:
 def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
                    mode: str = "absolute", emphasize_rows: Tuple[int, ...] = (0,),
                    candidate_index: Optional[int] = None,
-                   hover: Optional[Tuple[int, int, int]] = None) -> List[AttnHit]:
+                   hover: Optional[Tuple[int, int, int]] = None,
+                   exclude_indices: Tuple[int, ...] = ()) -> List[AttnHit]:
     """Draw the per-head heatmap grid into ``rect`` and return per-cell hitboxes.
 
-    ``mode``: "absolute" (global max over shown heads) or "row_norm" (each query row by its own max).
-    ``emphasize_rows`` + ``candidate_index``: full-color/framed rows & the candidate row+column; other
-    rows are blended toward the background (they are computed-but-discarded at L=1). ``hover`` = (i,j,head)
-    draws the crosshair. Returns ``List[AttnHit]`` for :func:`attn_cell_at`."""
+    ``mode``: "absolute" (global max over shown heads), "row_norm" (each query row by its own max), or
+    "signed" (row 0 colored by the value-weighted signed contribution, diverging). ``emphasize_rows`` +
+    ``candidate_index``: full-color/framed rows & the candidate row+column; other rows are blended toward
+    the background (computed-but-discarded at L=1). ``hover`` = (i,j,head) draws the crosshair.
+    ``exclude_indices`` drops those seq positions from the display and RENORMALIZES each remaining
+    attention row to sum to 1 (the conditional distribution over the remaining tokens); signed values are
+    dropped but NOT renormalized (additive logit shares, not a distribution). Hits carry ORIGINAL seq
+    indices so tooltips/hover always read the true payload arrays."""
     rx, ry, rw, rh = rect
     attn = payload.attn                                   # [heads, S, S], readout layer
-    heads, s, _ = attn.shape
+    heads = attn.shape[0]
     rows, cols = _grid_shape(heads)
+    idx = [k for k in range(attn.shape[1]) if k not in exclude_indices]   # displayed original indices
+    s = len(idx)
+    disp = {k: p for p, k in enumerate(idx)}                              # original -> display position
+
+    sub = attn[:, idx, :][:, :, idx]                                      # [heads, s, s]
+    if exclude_indices:                                                   # renormalize remaining rows
+        sub = sub / np.maximum(sub.sum(axis=-1, keepdims=True), 1e-9)
 
     avail_w = (rw - AX - 2 * PAD - (cols - 1) * GAP) // cols
     avail_h = (rh - AX - 2 * PAD - (rows - 1) * GAP) // rows
@@ -154,7 +166,9 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
     # attention view if attribution wasn't computed.
     signed = getattr(payload, "row0_signed", None) if mode == "signed" else None
     smax = float(np.abs(signed).max()) if signed is not None else 1.0
-    gmax = float(attn.max()) or 1.0
+    gmax = float(sub.max()) or 1.0
+    emph_disp = {disp[i] for i in emphasize_rows if i in disp}
+    cand_disp = disp.get(candidate_index) if candidate_index is not None else None
     hits: List[AttnHit] = []
     geoms: List[AttnGeom] = []
     for h in range(heads):
@@ -162,58 +176,58 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
         bx = ox + AX + gc * (box + GAP)
         by = oy + AX + gr * (box + GAP)
         geoms.append(AttnGeom(h, bx, by, cell, s))
-        row_max = attn[h].max(axis=1) if mode == "row_norm" else None
+        row_max = sub[h].max(axis=1) if mode == "row_norm" else None
         for i in range(s):
             denom = (float(row_max[i]) or 1.0) if row_max is not None else gmax
-            primary_row = (i in emphasize_rows) or (i == candidate_index)
+            primary_row = (i in emph_disp) or (i == cand_disp)
             for j in range(s):
                 if signed is not None:
-                    col = (_heat_div(float(signed[h, j]), smax) if i == 0
+                    col = (_heat_div(float(signed[h, idx[j]]), smax) if i == 0
                            else _blend((60, 64, 74), BG, 0.5))   # only row 0 is load-bearing here
                 else:
-                    col = _heat(math.sqrt(max(0.0, float(attn[h, i, j])) / denom))
-                    if not (primary_row or j == candidate_index):
+                    col = _heat(math.sqrt(max(0.0, float(sub[h, i, j])) / denom))
+                    if not (primary_row or j == cand_disp):
                         col = _blend(col, BG, 0.45)        # de-emphasize non-load-bearing cells
                 r = pygame.Rect(bx + j * cell, by + i * cell, cell, cell)
                 pygame.draw.rect(surface, col, r)
-                hits.append(AttnHit(r, i, j, h))
+                hits.append(AttnHit(r, idx[i], idx[j], h))     # ORIGINAL indices
         # gold frames on the load-bearing bands
-        for i in emphasize_rows:
-            if i < s:
-                pygame.draw.rect(surface, GOLD, (bx, by + i * cell, box, cell), 1)
-        if candidate_index is not None and candidate_index < s:
-            ci = candidate_index
-            pygame.draw.rect(surface, GOLD, (bx, by + ci * cell, box, cell), 1)
-            pygame.draw.rect(surface, GOLD, (bx + ci * cell, by, cell, box), 1)
+        for i in emph_disp:
+            pygame.draw.rect(surface, GOLD, (bx, by + i * cell, box, cell), 1)
+        if cand_disp is not None:
+            pygame.draw.rect(surface, GOLD, (bx, by + cand_disp * cell, box, cell), 1)
+            pygame.draw.rect(surface, GOLD, (bx + cand_disp * cell, by, cell, box), 1)
         # shared axes: vertical strip once per grid row (gc==0), horizontal strip once per grid column (gr==0)
         if gc == 0:
-            for k in range(s):
-                _axis_tile(surface, payload, k, ox, by + k * cell, min(AX, cell))
+            for p in range(s):
+                _axis_tile(surface, payload, idx[p], ox, by + p * cell, min(AX, cell))
         if gr == 0:
-            for k in range(s):
-                _axis_tile(surface, payload, k, bx + k * cell, oy, min(AX, cell))
+            for p in range(s):
+                _axis_tile(surface, payload, idx[p], bx + p * cell, oy, min(AX, cell))
 
     if hover is not None:
-        _draw_crosshair(surface, payload, geoms, hover)
+        _draw_crosshair(surface, payload, geoms, hover, disp)
     return hits
 
 
-def _draw_crosshair(surface, payload, geoms: List[AttnGeom], hover: Tuple[int, int, int]) -> None:
-    hi, hj, hh = hover
+def _draw_crosshair(surface, payload, geoms: List[AttnGeom], hover: Tuple[int, int, int],
+                    disp: dict) -> None:
+    hi, hj, hh = hover                                    # ORIGINAL seq indices
     g = next((g for g in geoms if g.head == hh), None)
-    if g is None or hi >= g.s or hj >= g.s:
+    pi, pj = disp.get(hi), disp.get(hj)                   # display positions (None if excluded)
+    if g is None or pi is None or pj is None:
         return
     band = pygame.Surface((g.cell * g.s, g.cell), pygame.SRCALPHA)
     band.fill((*GOLD, 60))
-    surface.blit(band, (g.bx, g.by + hi * g.cell))                    # row highlight
+    surface.blit(band, (g.bx, g.by + pi * g.cell))                    # row highlight
     colband = pygame.Surface((g.cell, g.cell * g.s), pygame.SRCALPHA)
     colband.fill((*GOLD, 60))
-    surface.blit(colband, (g.bx + hj * g.cell, g.by))                 # column highlight
-    pygame.draw.rect(surface, INK, (g.bx + hj * g.cell, g.by + hi * g.cell, g.cell, g.cell), 2)
+    surface.blit(colband, (g.bx + pj * g.cell, g.by))                 # column highlight
+    pygame.draw.rect(surface, INK, (g.bx + pj * g.cell, g.by + pi * g.cell, g.cell, g.cell), 2)
     # enlarge the two involved axis sprites (pop-out beside the box)
     big = min(48, max(24, g.cell * 2))
-    _axis_tile(surface, payload, hi, g.bx - big - 4, g.by + hi * g.cell, big)
-    _axis_tile(surface, payload, hj, g.bx + hj * g.cell, g.by - big - 4, big)
+    _axis_tile(surface, payload, hi, g.bx - big - 4, g.by + pi * g.cell, big)
+    _axis_tile(surface, payload, hj, g.bx + pj * g.cell, g.by - big - 4, big)
 
 
 def attn_cell_at(hits: List[AttnHit], pos) -> Optional[AttnHit]:
@@ -225,14 +239,19 @@ def attn_cell_at(hits: List[AttnHit], pos) -> Optional[AttnHit]:
 
 
 def draw_tooltip(surface, fonts, payload, hit: AttnHit, pos) -> None:
-    """Floating 2dp tooltip: ``<label i> -> <label j> = 0.24`` near the mouse."""
+    """Floating 2dp tooltip: ``<label i> -> <label j> = 0.24`` near the mouse. On row-0 cells also the
+    hovered head's signed contribution and the head-summed total for the column token (the bridge between
+    a single head's cell and the Top-contributors ranking -- heads can cancel)."""
     small = fonts["small"]
     v = float(payload.attn[hit.head, hit.i, hit.j])
     lines = [f"{payload.seq_labels[hit.i]} -> {payload.seq_labels[hit.j]}",
              f"head {hit.head}   weight {v:.2f}"]
     rs = getattr(payload, "row0_signed", None)
+    att = getattr(payload, "attribution", None)
     if hit.i == 0 and rs is not None:                          # signed contribution to q (row-0 readout)
-        lines.append(f"dq {float(rs[hit.head, hit.j]):+.3f}")
+        lines.append(f"Δq (head {hit.head}) {float(rs[hit.head, hit.j]):+.3f}")
+    if att is not None:                                        # head-summed total for the column token
+        lines.append(f"Σheads Δq {float(att[hit.j]):+.3f}")
     lh = small.get_linesize()
     w = max(small.size(t)[0] for t in lines) + 12
     h = len(lines) * lh + 8

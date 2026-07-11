@@ -138,7 +138,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     engine_budget = _engine_budget(engine)          # rebuilt by apply_engine() on any settings change
     settings_open, dragging = False, None      # dragging = the active slider key ("N"/"k"/"l") or None
     show_attn, attn_mode, attn_hover = False, "absolute", None      # attention-drawer state
-    attn_cache: dict = {"state": None, "move": None, "payload": None, "result": None, "hits": []}
+    attn_sel, attn_hide_board = 0, False                            # selected rec pill / board-token toggle
+    attn_cache: dict = {"state": None, "entries": [], "result": None, "hits": []}
     analysis_rng = np.random.default_rng(1234567)   # dedicated so analysis never perturbs the game rng
     # Per-state dual analysis: BOTH seats' read of the current position (keyed by state identity), so the
     # two side panels are live every turn -- like ui.review. Each entry is a SearchResult (or None).
@@ -250,22 +251,24 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 kn.append((v.opp_hand_has, v.opp_hand_lacks, v.knowledge_level()))
             knowledge_cache["state"], knowledge_cache["val"] = game["state"], kn
 
-        # Attention analysis (drawer open): explain the human hint's recommended move with one forward pass.
-        # Reuses analysis[view_seat] -- the SAME attention-MCTS search that feeds the bottom-right panel -- so
-        # the panel PV, the drawer header, and the heatmap all agree. Cached by state identity.
+        # Attention analysis (drawer open): explain the hint search's TOP-2 recommendations (one forward
+        # pass each). Reuses analysis[view_seat] -- the SAME attention-MCTS search that feeds the
+        # bottom-right panel -- so panel PV, drawer pills, and heatmaps all agree. Cached by state identity.
         if show_attn and not settings_open and not state.is_terminal() and human_turn and legal:
             model, _ = attn_bundle()
             if model is None:
                 show_attn = False                               # load failed -> Analysis unavailable
             elif attn_cache["state"] is not game["state"]:
                 res = analysis[view_seat]                       # attention-MCTS hint search (run just above)
-                rec_move = res.best_move if (res is not None and len(legal) > 1) else legal[0]
+                if res is not None and len(legal) > 1 and getattr(res, "stats", None):
+                    moves = [st.move for st in res.stats[:2]]   # top-2 by visits
+                else:
+                    moves = [legal[0]]                          # forced / no search
                 from ..machine_learning.explain import explain
-                payload = explain(view, rec_move, model, all_layers=(model.cfg.n_layers > 1),
-                                  attribution=True, ckpt_id=attncfg["id"])
-                attn_cache.update(state=game["state"], move=rec_move, payload=payload,
-                                  result=res, hits=[])
-                attn_hover = None                               # stale hover indices from the prior state
+                entries = [(m, explain(view, m, model, all_layers=(model.cfg.n_layers > 1),
+                                       attribution=True, ckpt_id=attncfg["id"])) for m in moves]
+                attn_cache.update(state=game["state"], entries=entries, result=res, hits=[])
+                attn_sel, attn_hover = 0, None                  # reset selection + stale hover
 
         mouse = pygame.mouse.get_pos()
         frame = render_frame(screen, view, fonts, legal, hover=hover, status=status,
@@ -279,10 +282,10 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                                           nn_available=nncfg["ckpt"] is not None)
                     if settings_open else None)
         attn_ctrl = None
-        if show_attn and not settings_open and attn_cache["payload"] is not None:
-            attn_ctrl = draw_attention_drawer(screen, fonts, attn_cache["payload"], mouse,
-                                              mode=attn_mode, hover=attn_hover,
-                                              result=attn_cache["result"], move=attn_cache["move"])
+        if show_attn and not settings_open and attn_cache["entries"]:
+            attn_ctrl = draw_attention_drawer(screen, fonts, attn_cache["entries"], mouse,
+                                              mode=attn_mode, hover=attn_hover, selected=attn_sel,
+                                              hide_board=attn_hide_board, result=attn_cache["result"])
             attn_cache["hits"] = attn_ctrl["hits"]
         pygame.display.flip()
 
@@ -349,6 +352,13 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     elif attn_ctrl["mode_toggle"].collidepoint(pos):
                         attn_mode = {"absolute": "row_norm", "row_norm": "signed",
                                      "signed": "absolute"}[attn_mode]
+                    elif attn_ctrl["board_toggle"].collidepoint(pos):
+                        attn_hide_board = not attn_hide_board   # re-render only, no recompute
+                    else:
+                        for i, r in enumerate(attn_ctrl["rec_pills"]):
+                            if r.collidepoint(pos):
+                                attn_sel = i                    # switch which rec the heatmap explains
+                                break
                 elif frame.attn_toggle and frame.attn_toggle.collidepoint(pos):
                     show_attn = True                            # open the analysis drawer
                     attn_cache["state"] = None
