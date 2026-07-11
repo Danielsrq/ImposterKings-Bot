@@ -467,13 +467,15 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True):
 
 
 def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", hover=None,
-                          selected=0, hide_board=False, result=None, depth=5):
+                          selected=0, hide_board=False, result=None, depth=5,
+                          seat_labels=None, seat_selected=0):
     """Right-side "analysis mode" drawer over a dim scrim. ``entries`` = the top recommendations as
     ``[(move, payload), ...]`` (payload = an AttentionExplanation); ``selected`` picks which entry the
     heatmap shows (clickable rec pills switch). ``hide_board`` drops the board token from the heatmap and
     renormalizes the remaining attention rows. In "signed" mode the bottom shows per-entry Top-contributor
-    columns (the side-by-side comparison); otherwise the PV. Returns clickable controls
-    ``{"close", "mode_toggle", "board_toggle", "rec_pills", "hits"}``."""
+    columns (the side-by-side comparison); otherwise the PV. ``seat_labels`` (e.g. ("P0","P1"), used by the
+    review screen) draws clickable seat pills selecting whose read is explained. Returns clickable controls
+    ``{"close", "mode_toggle", "board_toggle", "rec_pills", "seat_pills", "hits"}``."""
     from . import attention_view                          # lazy: attention_view imports palette from here
     med, small = fonts["med"], fonts["small"]
     W, H = WINDOW
@@ -516,6 +518,17 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
                      board_toggle, border_radius=12)
     _text(surface, small, f"board: {'hidden' if hide_board else 'shown'}",
           (board_toggle.x + 10, board_toggle.y + 4))
+    seat_pills = []
+    if seat_labels:                                       # review: whose read is being explained
+        sx = board_toggle.right + 10
+        for i, lab in enumerate(seat_labels):
+            r = pygame.Rect(sx, 78, small.size(lab)[0] + 20, 24)
+            pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=12)
+            if i == seat_selected:
+                pygame.draw.rect(surface, GOLD, r, 2, border_radius=12)
+            _text(surface, small, lab, (r.x + 10, r.y + 4), GOLD if i == seat_selected else INK)
+            seat_pills.append(r)
+            sx = r.right + 6
 
     move, payload = entries[selected]
     exclude = ()
@@ -569,7 +582,7 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
                     xx += t.get_width() + 8
                 yy += 20
     return {"close": close, "mode_toggle": mode_toggle, "board_toggle": board_toggle,
-            "rec_pills": rec_pills, "hits": hits}
+            "rec_pills": rec_pills, "seat_pills": seat_pills, "hits": hits}
 
 
 def make_fonts():

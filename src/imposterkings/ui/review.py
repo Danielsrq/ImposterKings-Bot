@@ -19,7 +19,7 @@ from .. import cards
 from ..actions import Action, ActionKind, StepKind
 from ..infoset import InformationSet
 from .render import (BTN, BTN_HOVER, CARD_COLORS, DIVIDER, GOLD, INK, MUTE, P_COLORS, PANEL, RED,
-                     WINDOW, _compact_action, _cross, _text, _tick, make_fonts)
+                     WINDOW, _compact_action, _cross, _text, _tick, draw_attention_drawer, make_fonts)
 from . import assets
 from .tree_view import block_at, draw_crown, draw_icicle, draw_outline, draw_tooltip, graft_node
 
@@ -629,7 +629,46 @@ def render_review_frame(screen, fonts, traj, turns, *, cursor, mode="icicle", re
     return {"btns": btns, "strip_hits": strip_hits, "blocks": blocks, "mid": mid, "ptop": ptop}
 
 
-def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
+def _seat_result(rec0: PlyRecord, owner: int, seat: int):
+    """Seat ``seat``'s SearchResult at a turn start -- mirrors _draw_panel's resolution: the cross-search
+    when annotate_dual_evals filled it, else the mover's own recorded search, else None."""
+    if rec0.result_by_seat is not None:
+        return rec0.result_by_seat[seat]
+    return rec0.result if seat == owner else None
+
+
+def attn_entries_for(rec0: PlyRecord, owner: int, seat: int, model, ckpt_id: str) -> list:
+    """Explanation entries ``[(move, AttentionExplanation), ...]`` for one (turn-start rec, seat) -- the
+    review twin of the live drawer's top-2. Mover: the LOGGED played move first, plus the seat's search
+    best when different (the "you played X, the search preferred Y" comparison). Opponent: its
+    cross-search's top-2 by visits; ``[]`` when there is nothing to explain (no state / no read).
+    Deterministic given (checkpoint, view, move) -> safe to memoize."""
+    if rec0.state is None or model is None:
+        return []
+    res = _seat_result(rec0, owner, seat)
+    if seat == owner:
+        # Played move first, then the search's best ALTERNATIVE (its top-visited move that is not the
+        # played one) -- the played move usually IS the search best, so "best if different" would collapse
+        # to a single pill almost every ply; the alternative keeps the comparison alive.
+        moves = [rec0.move]
+        if res is not None and getattr(res, "stats", None):
+            alt = next((st.move for st in res.stats if st.move != rec0.move), None)
+            if alt is not None:
+                moves.append(alt)
+    else:
+        moves = ([st.move for st in res.stats[:2]]
+                 if (res is not None and getattr(res, "stats", None)) else [])
+    if not moves:
+        return []
+    from ..machine_learning.explain import explain      # torch only on use (review stays torch-optional)
+    view = rec0.state.information_set(seat)
+    return [(m, explain(view, m, model, all_layers=(model.cfg.n_layers > 1),
+                        attribution=True, ckpt_id=ckpt_id)) for m in moves]
+
+
+def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
+    """``attn_loader``: optional callable returning ``(model|None, ckpt_id)`` -- enables the attention
+    drawer (press A). None / a failed load leaves review fully functional with the drawer disabled."""
     import pygame
     if not traj:
         return
@@ -642,6 +681,23 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
     last_tree = {0: None, 1: None}              # last non-None (result, played_path) per seat
     mid = W // 2
     turns = turns_of(traj)
+    # Attention drawer state: entries are explained lazily per (ckpt, turn-start, seat) and memoized --
+    # the forward pass is deterministic, so first view pays one pass per entry, revisits are instant.
+    show_attn, attn_mode, attn_hide_board = False, "absolute", False
+    attn_sel, attn_hover, attn_hits, attn_turn = 0, None, [], None
+    attn_seat = None                            # None -> follow the current turn's owner
+    attn_model = {"tried": False, "model": None, "id": ""}
+    attn_cache: dict = {}                       # (ckpt_id, turn_start, seat) -> entries
+
+    def attn_get_model():
+        if not attn_model["tried"]:
+            attn_model["tried"] = True
+            if attn_loader is not None:
+                try:                            # torch optional -> failure just disables the drawer
+                    attn_model["model"], attn_model["id"] = attn_loader()
+                except Exception as ex:         # noqa: BLE001
+                    print(f"attention drawer unavailable in review ({ex})")
+        return attn_model["model"]
 
     running = True
     while running:
@@ -649,14 +705,54 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
         hit = render_review_frame(screen, fonts, traj, turns, cursor=cursor, mode=mode, renorm=renorm,
                                   ost=ost, zoom=zoom, last_tree=last_tree, mouse=mouse)
         btns, strip_hits, blocks, ptop = hit["btns"], hit["strip_hits"], hit["blocks"], hit["ptop"]
+
+        # Attention drawer overlay (drawn AFTER the frame, BEFORE flip -- render_review_frame is reused
+        # by ui.headless, so the overlay lives here). Explains the CURRENT turn for the selected seat.
+        attn_ctrl = None
+        if show_attn:
+            start, _end, owner = turns[_current_turn(turns, cursor)]
+            if start != attn_turn:                        # stepped to a new turn -> reset selection
+                attn_turn, attn_sel, attn_hover, attn_seat = start, 0, None, None
+            amodel = attn_get_model()
+            if amodel is None:
+                show_attn = False                         # no loader / load failed
+            else:
+                seat = attn_seat if attn_seat is not None else owner
+                key = (attn_model["id"], start, seat)
+                if key not in attn_cache:                 # memo: one explain() per (ckpt, turn, seat)
+                    attn_cache[key] = attn_entries_for(traj[start], owner, seat, amodel, attn_model["id"])
+                entries = attn_cache[key]
+                if entries:
+                    attn_ctrl = draw_attention_drawer(
+                        screen, fonts, entries, mouse, mode=attn_mode, hover=attn_hover,
+                        selected=attn_sel, hide_board=attn_hide_board,
+                        result=_seat_result(traj[start], owner, seat),
+                        seat_labels=("P0", "P1"), seat_selected=seat)
+                    attn_hits = attn_ctrl["hits"]
+                else:                                     # nothing to explain for this (turn, seat)
+                    box = pygame.Rect(W - 360, 8, 352, 30)
+                    pygame.draw.rect(screen, PANEL, box, border_radius=6)
+                    pygame.draw.rect(screen, GOLD, box, 1, border_radius=6)
+                    _text(screen, fonts["small"], f"(no P{seat} read to explain here -- A closes)",
+                          (box.x + 10, box.y + 7), MUTE)
+                    attn_hits = []
         pygame.display.flip()
 
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 running = False
             elif e.type == pygame.KEYDOWN:
-                if e.key in (pygame.K_ESCAPE, pygame.K_q):
+                if e.key == pygame.K_ESCAPE:
+                    if show_attn:
+                        show_attn = False                 # ESC closes the drawer first, then exits
+                    else:
+                        running = False
+                elif e.key == pygame.K_q:
                     running = False
+                elif e.key == pygame.K_a:
+                    if attn_loader is not None:           # A toggles the attention drawer
+                        show_attn = not show_attn
+                        attn_turn = None                  # force re-resolve of turn/seat on open
                 elif e.key == pygame.K_LEFT:
                     cursor = max(0, cursor - 1)
                 elif e.key == pygame.K_RIGHT:
@@ -671,6 +767,10 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
                     for z in zoom.values():
                         if z:
                             z.pop()
+            elif e.type == pygame.MOUSEMOTION and show_attn:
+                from .attention_view import attn_cell_at
+                hc = attn_cell_at(attn_hits, e.pos)
+                attn_hover = (hc.i, hc.j, hc.head) if hc else None
             elif e.type == pygame.MOUSEWHEEL and mode == "outline":
                 ost[0 if mouse[0] < mid else 1]["scroll"] = max(
                     0, ost[0 if mouse[0] < mid else 1]["scroll"] - e.y)
@@ -678,6 +778,26 @@ def run_review(screen, fonts, traj: List[PlyRecord]) -> None:
                 zseat = 0 if e.pos[0] < mid else 1
                 if zoom[zseat]:
                     zoom[zseat].pop()
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and show_attn \
+                    and attn_ctrl is not None:            # modal: route clicks to the drawer only
+                pos = e.pos
+                if attn_ctrl["close"].collidepoint(pos):
+                    show_attn = False
+                elif attn_ctrl["mode_toggle"].collidepoint(pos):
+                    attn_mode = {"absolute": "row_norm", "row_norm": "signed",
+                                 "signed": "absolute"}[attn_mode]
+                elif attn_ctrl["board_toggle"].collidepoint(pos):
+                    attn_hide_board = not attn_hide_board
+                else:
+                    for i, r in enumerate(attn_ctrl["rec_pills"]):
+                        if r.collidepoint(pos):
+                            attn_sel = i                  # switch which rec the heatmap explains
+                            break
+                    else:
+                        for i, r in enumerate(attn_ctrl["seat_pills"]):
+                            if r.collidepoint(pos):       # explain the other player's read
+                                attn_seat, attn_sel, attn_hover = i, 0, None
+                                break
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 pos = e.pos
                 if btns["prev"].collidepoint(pos):

@@ -205,3 +205,19 @@ def test_princess_swaps_one_card_each():
              _hand(cid("Fool")), _hand(cid("Soldier")))
     assert cid("Soldier") in st.hands[0]
     assert cid("Fool") in st.hands[1]
+
+
+def test_princess_no_window_when_owner_has_no_card_left():
+    # Princess as the owner's LAST card: a swap needs a card from each side, so the "Use ability?"
+    # window is not offered at all -- the play just lands and the turn passes.
+    st = mainstate(hand0=(cid("Princess"),), hand1=(cid("Soldier"),), stack=(sc("Elder"),))
+    st = run(st, _play(cid("Princess")))
+    assert st.pending and st.pending[-1].kind == StepKind.MAIN and st.to_play == 1
+    assert st.hands[1] == (cid("Soldier"),)                        # nothing traded
+
+
+def test_princess_no_window_when_opponent_hand_empty():
+    st = mainstate(hand0=(cid("Princess"), cid("Fool")), hand1=(), stack=(sc("Elder"),))
+    st = run(st, _play(cid("Princess")))
+    assert st.pending and st.pending[-1].kind != StepKind.ABILITY_MAY   # no window; opponent to move
+    assert cid("Fool") in st.hands[0]                              # nothing traded

@@ -396,7 +396,9 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             if n:
                 print(f"computing {n} dual-eval searches (at the current engine budget) for turns not "
                       f"analyzed live during play...")
-            run_review(screen, fonts, annotated)
+            run_review(screen, fonts, annotated,
+                       attn_loader=((lambda: (attn_bundle()[0], attncfg["id"]))
+                                    if attncfg["ckpt"] is not None else None))
 
         if (not settings_open) and (not hotseat) and (not game["state"].is_terminal()) \
                 and game["state"].to_play == bot_seat:

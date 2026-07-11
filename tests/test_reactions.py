@@ -30,7 +30,8 @@ def test_kingshand_counters_may_and_discards_both():
 
 
 def test_kingshand_unavailable_when_muted():
-    st = mainstate(hand0=(cid("Princess"),), hand1=(cid("KingsHand"),),
+    # (owner keeps a second card: Princess with an empty hand no longer opens the ability window)
+    st = mainstate(hand0=(cid("Princess"), cid("Fool")), hand1=(cid("KingsHand"),),
                    stack=(sc("Elder"),), muted={8})  # value 8 muted -> reaction tag stripped
     st = run(st, _play(cid("Princess")), DECLARE)
     assert REVEAL_KINGSHAND not in st.legal_moves()

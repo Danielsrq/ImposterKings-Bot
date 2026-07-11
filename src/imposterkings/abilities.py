@@ -144,6 +144,8 @@ def _land(state: GameState, card: int, actor: int, *, ascended: bool, v_top: Opt
         # (in _resolve_guess); the ability's effect only applies on a correct, uncountered guess.
         return st, (PendingStep(StepKind.ABILITY_GUESS, actor, source=card),)
     if ability in _OPTIONAL_ONPLAY:
+        if ability == Ability.PRINCESS and not (st.hands[actor] and st.hands[1 - actor]):
+            return st, ()   # a swap needs a card from EACH side -> no "Use ability?" window at all
         return st, (PendingStep(StepKind.ABILITY_MAY, actor, source=card),)
     return st, ()
 
