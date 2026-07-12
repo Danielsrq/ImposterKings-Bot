@@ -212,6 +212,33 @@ def test_v2_payload_renders_ghosts_kings_and_belief_tooltip():
     av.draw_tooltip(surf, _fonts(), p, king, (500, 400))              # king column: renders, no zone line
 
 
+def test_token_views_drop_the_right_tokens_and_grow_the_cells():
+    """all | hide_board | cards. CLS always survives (it is the readout); "cards" drops kings + context;
+    fewer tokens over the same grid => BIGGER cells; the displayed rows renormalize to 1."""
+    surf = pygame.Surface((1100, 950))
+    rect = (20, 20, 1000, 880)
+    for p, ctx in ((_payload_v2(), {"king:mine", "king:theirs", "board", "phase", "action"}),
+                   (_payload(), {"board", "phase", "action"})):
+        S = len(p.seq_labels)
+        cells = {}
+        for view in av.TOKEN_VIEWS:
+            exc = av.token_exclusions(p, view)
+            kept = [i for i in range(S) if i not in exc]
+            assert 0 in kept                                          # CLS is never dropped
+            hits = av.draw_attention(surf, _fonts(), p, rect, exclude_indices=exc)
+            assert len(hits) == p.n_heads * len(kept) ** 2            # grid shrank to the kept tokens
+            cells[view] = next(h for h in hits if h.head == 0).rect.w
+            # renormalized rows of the displayed submatrix
+            sub = p.attn[:, kept, :][:, :, kept]
+            sub = sub / np.maximum(sub.sum(-1, keepdims=True), 1e-9)
+            assert np.allclose(sub.sum(-1), 1.0, atol=1e-5)
+
+        assert av.token_exclusions(p, "all") == ()
+        assert {p.seq_labels[i] for i in av.token_exclusions(p, "hide_board")} == {"board"}
+        assert {p.seq_labels[i] for i in av.token_exclusions(p, "cards")} == ctx
+        assert cells["cards"] > cells["all"], "dropping tokens must ENLARGE the cells"
+
+
 def test_v1_payload_has_no_beliefs_and_still_draws():
     surf = pygame.Surface((1000, 900))
     p = _payload()                                                    # no feat / zone_posterior fields

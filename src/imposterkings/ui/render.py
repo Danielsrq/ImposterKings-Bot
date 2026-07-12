@@ -634,15 +634,17 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True,
 
 
 def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", hover=None,
-                          selected=0, hide_board=False, result=None, depth=5,
+                          selected=0, token_view="all", result=None, depth=5,
                           seat_labels=None, seat_selected=0, layer_view="causal"):
     """Right-side "analysis mode" drawer over a dim scrim. ``entries`` = the top recommendations as
     ``[(move, payload), ...]`` (payload = an AttentionExplanation); ``selected`` picks which entry the
-    heatmap shows (clickable rec pills switch). ``hide_board`` drops the board token from the heatmap and
-    renormalizes the remaining attention rows. In "signed" mode the bottom shows per-entry Top-contributor
-    columns (the side-by-side comparison); otherwise the PV. ``seat_labels`` (e.g. ("P0","P1"), used by the
-    review screen) draws clickable seat pills selecting whose read is explained. Returns clickable controls
-    ``{"close", "mode_toggle", "board_toggle", "rec_pills", "seat_pills", "hits"}``."""
+    heatmap shows (clickable rec pills switch). ``token_view`` ("all" | "hide_board" | "cards") drops the
+    context tokens from the heatmap and renormalizes the remaining attention rows -- with fewer tokens the
+    grid keeps its size, so the CELLS GROW (see ``attention_view.token_exclusions``). In "signed" mode the
+    bottom shows per-entry Top-contributor columns (the side-by-side comparison); otherwise the PV.
+    ``seat_labels`` (e.g. ("P0","P1"), used by the review screen) draws clickable seat pills selecting whose
+    read is explained. Returns clickable controls
+    ``{"close", "mode_toggle", "board_toggle", "rec_pills", "seat_pills", "layer_pills", "hits"}``."""
     from . import attention_view                          # lazy: attention_view imports palette from here
     med, small = fonts["med"], fonts["small"]
     W, H = WINDOW
@@ -680,10 +682,10 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
                      mode_toggle, border_radius=12)
     _mode_label = {"absolute": "absolute", "row_norm": "row-norm", "signed": "signed (Δq)"}.get(mode, mode)
     _text(surface, small, f"scale: {_mode_label}", (mode_toggle.x + 10, mode_toggle.y + 4))
-    board_toggle = pygame.Rect(mode_toggle.right + 10, 78, 170, 24)
+    board_toggle = pygame.Rect(mode_toggle.right + 10, 78, 180, 24)   # cycles the token view
     pygame.draw.rect(surface, BTN_HOVER if board_toggle.collidepoint(mouse) else BTN,
                      board_toggle, border_radius=12)
-    _text(surface, small, f"board: {'hidden' if hide_board else 'shown'}",
+    _text(surface, small, f"tokens: {attention_view.TOKEN_VIEW_LABELS.get(token_view, token_view)}",
           (board_toggle.x + 10, board_toggle.y + 4))
     seat_pills = []
     if seat_labels:                                       # review: whose read is being explained
@@ -710,9 +712,7 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
             _text(surface, small, lab, (r.x + 10, r.y + 4), GOLD if key == layer_view else INK)
             layer_pills[key] = r
             lx = r.right + 8
-    exclude = ()
-    if hide_board and "board" in payload.seq_labels:
-        exclude = (payload.seq_labels.index("board"),)
+    exclude = attention_view.token_exclusions(payload, token_view)
 
     pv_h = 122                                            # tuned: leaves the heat grid an exact 16px cell
     heat_top = 112                                        # one control row -> the heatmap gets the rest

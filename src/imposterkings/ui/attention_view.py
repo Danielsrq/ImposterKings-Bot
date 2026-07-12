@@ -158,6 +158,30 @@ def _axis_tile(surface, payload, k: int, x: int, y: int, size: int) -> None:
         surface.blit(t, (x + (size - t.get_width()) // 2, y + (size - t.get_height()) // 2))
 
 
+TOKEN_VIEWS = ("all", "hide_board", "cards")            # cycled by the drawer's token toggle
+TOKEN_VIEW_LABELS = {"all": "all tokens", "hide_board": "hide board", "cards": "cards only"}
+
+
+def token_exclusions(payload, view: str = "all") -> Tuple[int, ...]:
+    """Seq indices to DROP for a token view (``draw_attention`` renormalizes each remaining row).
+
+    - "all": nothing dropped.
+    - "hide_board": just the board token (the old board toggle).
+    - "cards": keep CLS + the card tokens only -- kings/board/phase/action go, so the heatmap is purely
+      card<->card (and the cells grow, since the grid keeps its size over fewer tokens).
+    """
+    labels = list(payload.seq_labels)
+    s = len(labels)
+    if view == "hide_board":
+        return (labels.index("board"),) if "board" in labels else ()
+    if view == "cards":
+        rng = getattr(payload, "card_seq_range", None)          # v2 says so explicitly; v1 = [CLS|N|3 ctx]
+        lo, hi = rng if rng is not None else (1, s - 3)
+        keep = {0} | set(range(lo, hi))                         # CLS is the readout -- always kept
+        return tuple(i for i in range(s) if i not in keep)
+    return ()
+
+
 def routed_attention(payload, view: str = "causal") -> Tuple[np.ndarray, bool, bool]:
     """The DISPLAY matrix for a given ``view``. Returns (matrix [heads,S,S], routed?, dead_card_rows?).
 

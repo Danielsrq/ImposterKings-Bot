@@ -175,7 +175,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     settings_open, dragging = False, None      # dragging = the active slider key ("N"/"k"/"l") or None
     preview = None                          # right-click card zoom: (assets/ filename, upside_down) or None
     show_attn, attn_mode, attn_hover = False, "absolute", None      # attention-drawer state
-    attn_sel, attn_hide_board = 0, False                            # selected rec pill / board-token toggle
+    attn_sel, attn_token_view = 0, "all"           # selected rec pill / token view (all|hide_board|cards)
     attn_layer_view = "causal"                                      # L>=2: causal composite | l1 | l2
     attn_cache: dict = {"state": None, "entries": [], "result": None, "hits": []}
     analysis_rng = np.random.default_rng(1234567)   # dedicated so analysis never perturbs the game rng
@@ -325,7 +325,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         if show_attn and not settings_open and attn_cache["entries"]:
             attn_ctrl = draw_attention_drawer(screen, fonts, attn_cache["entries"], mouse,
                                               mode=attn_mode, hover=attn_hover, selected=attn_sel,
-                                              hide_board=attn_hide_board, result=attn_cache["result"],
+                                              token_view=attn_token_view, result=attn_cache["result"],
                                               layer_view=attn_layer_view)
             attn_cache["hits"] = attn_ctrl["hits"]
         if preview is not None:                        # right-click zoom sits on top of everything
@@ -413,7 +413,9 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                         attn_mode = {"absolute": "row_norm", "row_norm": "signed",
                                      "signed": "absolute"}[attn_mode]
                     elif attn_ctrl["board_toggle"].collidepoint(pos):
-                        attn_hide_board = not attn_hide_board   # re-render only, no recompute
+                        from .attention_view import TOKEN_VIEWS   # cycle all -> hide_board -> cards
+                        attn_token_view = TOKEN_VIEWS[(TOKEN_VIEWS.index(attn_token_view) + 1)
+                                                      % len(TOKEN_VIEWS)]   # re-render only, no recompute
                     else:
                         for key, r in attn_ctrl["layer_pills"].items():
                             if r.collidepoint(pos):

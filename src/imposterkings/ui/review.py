@@ -683,7 +683,7 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
     turns = turns_of(traj)
     # Attention drawer state: entries are explained lazily per (ckpt, turn-start, seat) and memoized --
     # the forward pass is deterministic, so first view pays one pass per entry, revisits are instant.
-    show_attn, attn_mode, attn_hide_board = False, "absolute", False
+    show_attn, attn_mode, attn_token_view = False, "absolute", "all"   # token view: all|hide_board|cards
     attn_layer_view = "causal"                  # L>=2: causal composite | l1 | l2
     attn_sel, attn_hover, attn_hits, attn_turn = 0, None, [], None
     attn_seat = None                            # None -> follow the current turn's owner
@@ -726,7 +726,7 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
                 if entries:
                     attn_ctrl = draw_attention_drawer(
                         screen, fonts, entries, mouse, mode=attn_mode, hover=attn_hover,
-                        selected=attn_sel, hide_board=attn_hide_board,
+                        selected=attn_sel, token_view=attn_token_view,
                         result=_seat_result(traj[start], owner, seat),
                         seat_labels=("P0", "P1"), seat_selected=seat, layer_view=attn_layer_view)
                     attn_hits = attn_ctrl["hits"]
@@ -788,7 +788,9 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
                     attn_mode = {"absolute": "row_norm", "row_norm": "signed",
                                  "signed": "absolute"}[attn_mode]
                 elif attn_ctrl["board_toggle"].collidepoint(pos):
-                    attn_hide_board = not attn_hide_board
+                    from .attention_view import TOKEN_VIEWS        # all -> hide_board -> cards
+                    attn_token_view = TOKEN_VIEWS[(TOKEN_VIEWS.index(attn_token_view) + 1)
+                                                  % len(TOKEN_VIEWS)]
                 else:
                     for lk, r in attn_ctrl["layer_pills"].items():
                         if r.collidepoint(pos):
