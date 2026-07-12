@@ -8,6 +8,7 @@ moves automatically. The board is always drawn from the human's perspective.
 from __future__ import annotations
 
 import argparse
+import os
 from collections import deque
 
 import numpy as np
@@ -25,6 +26,11 @@ from .scenario_setup import run_setup
 
 # Opponent's setup hide/discard are private -- never reveal the card identity in the log.
 _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
+
+# Attention-drawer checkpoints, best first: the v2 (featurization 2.2) net gives the drawer fixed 18-card
+# axes, attendable unseen cards and zone posteriors; the v1 net is the fallback.
+DEFAULT_ATTN_CKPTS = (os.path.join("models", "gen1_v3c_v2feat", "attn_d64_L2.pt"),
+                      os.path.join("models", "attn_d64_L1.pt"))
 
 
 def _engine_budget(engine: dict):
@@ -93,8 +99,9 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 nncfg["ckpt"] = None
         return nncfg["ev"]
 
-    # Attention explainability head: an explicit --attn, else the deployed L1 checkpoint if present.
-    attn_ckpt = attn if attn else ("models/attn_d64_L1.pt" if os.path.exists("models/attn_d64_L1.pt") else None)
+    # Attention explainability head: an explicit --attn, else the best deployed checkpoint present. The
+    # v2 (featurization 2.2) net is preferred -- fixed 18-card axes + zone posteriors in the drawer.
+    attn_ckpt = attn or next((p for p in DEFAULT_ATTN_CKPTS if os.path.exists(p)), None)
     attncfg = {"ckpt": attn_ckpt, "model": None, "ev": None, "id": None}
 
     def attn_bundle():
@@ -421,11 +428,14 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Play ImposterKings in a PyGame window.")
-    parser.add_argument("--p1", default="mcts", choices=["random", "mcts", "hybrid", "branching"],
-                        help="opponent bot (mcts=fixed --iters; hybrid/branching scale budget by --k)")
+    parser.add_argument("--p1", default="hybrid", choices=["random", "mcts", "hybrid", "branching"],
+                        help="opponent bot (mcts=fixed --iters; hybrid/branching scale budget by --k). "
+                             "Default hybrid: with --k 20 --l 3 this is the SAME budget every model in the "
+                             "study was trained and benchmarked at, so the bot and the drawer agree with "
+                             "the published strength numbers.")
     parser.add_argument("--iters", type=int, default=800, help="MCTS iterations per decision (mcts mode)")
-    parser.add_argument("--k", type=int, default=100,
-                        help="budget multiplier for the hybrid/branching bot modes")
+    parser.add_argument("--k", type=int, default=20,
+                        help="budget multiplier for the hybrid/branching bot modes (20 = the study budget)")
     parser.add_argument("--l", type=int, default=3,
                         help="effective legal-moves for a sub-decision card at selection (branch/hybrid)")
     parser.add_argument("--seed", type=int, default=None,
@@ -440,9 +450,10 @@ def main(argv=None) -> None:
     parser.add_argument("--nn-greedy", action="store_true",
                         help="seat the --nn checkpoint as a standalone greedy policy (no search) instead of "
                              "an NN+MCTS eval/policy head")
-    parser.add_argument("--attn", nargs="?", const="models/attn_d64_L1.pt", default=None,
-                        help="attention checkpoint for the explainability 'Analysis' drawer (press A); "
-                             "bare --attn uses models/attn_d64_L1.pt. Defaults to that file if it exists.")
+    parser.add_argument("--attn", nargs="?", const=DEFAULT_ATTN_CKPTS[0], default=None,
+                        help="attention checkpoint for the explainability 'Analysis' drawer (press A). "
+                             f"Defaults to the first of {list(DEFAULT_ATTN_CKPTS)} that exists (the v2 net "
+                             "gives fixed 18-card axes + zone posteriors).")
     args = parser.parse_args(argv)
     run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
         k=args.k, l=args.l, setup=args.setup, nn=args.nn, nn_greedy=args.nn_greedy, attn=args.attn)

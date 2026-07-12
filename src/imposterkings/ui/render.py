@@ -482,13 +482,13 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
     dim = pygame.Surface((W, H), pygame.SRCALPHA)
     dim.fill((0, 0, 0, 140))
     surface.blit(dim, (0, 0))
-    dw = int(0.46 * W)
+    dw = int(0.52 * W if getattr(entries[0][1], "feat", "v1") == "v2" else 0.46 * W)   # v2: fixed S=24
     dx = W - dw
     pygame.draw.rect(surface, PANEL, (dx, 0, dw, H))
     pygame.draw.rect(surface, GOLD, (dx, 0, dw, H), 2)
     pad = 16
 
-    _text(surface, med, "Attention  -  why this move", (dx + pad, 14), INK)
+    _text(surface, med, "Attention  [Experimental]", (dx + pad, 14), INK)
     close = pygame.Rect(dx + dw - pad - 82, 12, 82, 26)
     pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
     _text(surface, small, "Close [A]", (close.x + 10, close.y + 5), INK)
@@ -530,25 +530,25 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
             seat_pills.append(r)
             sx = r.right + 6
 
+    # Layer-view pills (L>=2 only) share the control row, to the right of scale/board/seat.
     move, payload = entries[selected]
     layer_pills = {}
-    if getattr(payload, "per_layer", None) and len(payload.per_layer) >= 2:   # L>=2: layer view pills
-        _text(surface, small, "view:", (dx + pad, 106), MUTE)
-        lx = dx + pad + 44
-        for key, lab in (("causal", "causal (L1 cards + L2 CLS)"), ("l1", "L1"), ("l2", "L2")):
-            r = pygame.Rect(lx, 103, small.size(lab)[0] + 18, 22)
-            pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=11)
+    if getattr(payload, "per_layer", None) and len(payload.per_layer) >= 2:
+        lx = (seat_pills[-1].right if seat_pills else board_toggle.right) + 16
+        for key, lab in (("causal", "causal"), ("l1", "L1"), ("l2", "L2")):
+            r = pygame.Rect(lx, 78, small.size(lab)[0] + 20, 24)
+            pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=12)
             if key == layer_view:
-                pygame.draw.rect(surface, GOLD, r, 2, border_radius=11)
-            _text(surface, small, lab, (r.x + 9, r.y + 3), GOLD if key == layer_view else INK)
+                pygame.draw.rect(surface, GOLD, r, 2, border_radius=12)
+            _text(surface, small, lab, (r.x + 10, r.y + 4), GOLD if key == layer_view else INK)
             layer_pills[key] = r
             lx = r.right + 8
     exclude = ()
     if hide_board and "board" in payload.seq_labels:
         exclude = (payload.seq_labels.index("board"),)
 
-    pv_h = 128
-    heat_top = 132 if layer_pills else 112
+    pv_h = 122                                            # tuned: leaves the heat grid an exact 16px cell
+    heat_top = 112                                        # one control row -> the heatmap gets the rest
     heat_rect = (dx + pad, heat_top, dw - 2 * pad, H - heat_top - pv_h)
     hits = attention_view.draw_attention(surface, fonts, payload, heat_rect, mode=mode,
                                          emphasize_rows=(0,),

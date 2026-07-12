@@ -292,6 +292,27 @@ Attention cells ~13^2 -> 24^2 (~+50-70% per-leaf eval; partially offset by dropp
 storage). Fixed shapes should SPEED training (the GPU DataLoader/collate was the measured bottleneck).
 Dataset rebuild + retrain: minutes (same JSONL logs — featurization never touches the corpus).
 
+### Drawer support (shipped 2026-07-12, after the Study-4 A/B)
+
+`explain()` now dispatches on the checkpoint's `cfg.feat`, so the UI reads a v2 net natively and the
+design's explainability promises are cashed in:
+
+- **Stable axes** — the 18 card slots never permute, so a heatmap row means the same card all game
+  (v1's axes reshuffled every ply, making cross-ply comparison impossible).
+- **Attendable absence, quantified** — unseen cards are real tokens, drawn **ghosted with a `?` badge**;
+  they carry Δq like any other. Measured on the trained gen-1 v2 net at a live midgame position: the
+  **unseen Princess contributes −0.033 to q** while the model believes it is 78% in the opponent's hand.
+  "Fear of the card you cannot see" is now a number on the screen — structurally impossible in v1.
+- **Beliefs on hover** — the payload carries `zone_posterior [18,12]`; hovering a card shows
+  `belief: their_hand 0.78  their_setup 0.11` (seen cards read `zone: my_setup (seen)`).
+- **Kings as entities** — 2 king tokens with real art, so the Assassin↔king edge is inspectable.
+
+Payload gains `feat`, `zone_posterior`, `zone_names`, `card_seen`, `card_seq_range` (all `None` at v1, so
+v1 stays bit-identical). The UI's default explain head is now the v2 gen-1 checkpoint, falling back to the
+v1 net. Also fixed three latent v1-layout assumptions that would have mislabeled a v2 model:
+`cls_importance`'s context indices (`[1+n,2+n,3+n]` selected the kings), `forward_layers`' mask branch
+(hardcoded 3 trailing tokens; v2 has 5), and `print_attention`'s tokenizer.
+
 ---
 
 ## Study 4 (gen-1) — AlphaZero-style bootstrap of v3c + featurization v2.2 A/B (2026-07-12)

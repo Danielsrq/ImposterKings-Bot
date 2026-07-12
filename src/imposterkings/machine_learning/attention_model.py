@@ -151,8 +151,9 @@ class AttentionModel(nn.Module):
 
         add_mask = None
         if card_mask is not None:
+            n_ctx = 5 if self.cfg.feat == "v2" else 3        # v2 trails 2 kings + board/phase/action
             ones = torch.ones(b, 1, dtype=torch.bool, device=cards.device)
-            valid = torch.cat([ones, card_mask, ones.expand(b, 3)], dim=1)          # [B,S]; CLS/ctx valid
+            valid = torch.cat([ones, card_mask, ones.expand(b, n_ctx)], dim=1)      # [B,S]; CLS/ctx valid
             add_mask = torch.zeros(b, 1, 1, s, device=cards.device)
             add_mask = add_mask.masked_fill(~valid[:, None, None, :], float("-inf"))
 
@@ -225,16 +226,18 @@ def cls_importance(attn: torch.Tensor, labels: List[List[str]], include_cls: boo
     ``labels`` the per-sample card-token labels. Default: the card region only (positions 1..1+N), one weight
     per real card -- the "which cards mattered" ranking. ``include_cls`` prepends the CLS self-weight
     (position 0 -- the attention-sink signal you'd otherwise hide); ``include_context`` appends the trailing
-    board/phase/action tokens. With BOTH True the weights are the full head-averaged row and sum to 1, so
-    nothing is silently dropped (the card-only default does not sum to 1)."""
+    non-card tokens (board/phase/action, plus the 2 king tokens at feat="v2"). With BOTH True the weights
+    are the full head-averaged row and sum to 1, so nothing is silently dropped (the card-only default does
+    not sum to 1). The trailing block is derived from S, so it is correct at either featurization."""
     row0 = attn[:, :, 0, :].mean(dim=1)                             # [B, S] head-averaged CLS row
+    s = int(attn.shape[-1])
     out: List[List[Tuple[str, float]]] = []
     for i, labs in enumerate(labels):
         n = len(labs)
-        names = (["CLS"] if include_cls else []) + list(labs) + (
-            ["board", "phase", "action"] if include_context else [])
+        ctx = (["king:mine", "king:theirs"] if s - 1 - n == 5 else []) + ["board", "phase", "action"]
+        names = (["CLS"] if include_cls else []) + list(labs) + (ctx if include_context else [])
         idx = ([0] if include_cls else []) + list(range(1, 1 + n)) + (
-            [1 + n, 2 + n, 3 + n] if include_context else [])
+            list(range(s - len(ctx), s)) if include_context else [])
         weights = row0[i, idx].tolist()                            # positions selected from the S-length row
         out.append(sorted(zip(names, weights), key=lambda p: -p[1]))
     return out
@@ -242,16 +245,26 @@ def cls_importance(attn: torch.Tensor, labels: List[List[str]], include_cls: boo
 
 @torch.no_grad()
 def print_attention(view: InformationSet, model: AttentionModel, action=None) -> None:
-    """Tokenize a position, run the model, and print q + the CLS->card importance + per-head row-0 tops."""
+    """Tokenize a position, run the model, and print q + the CLS->card importance + per-head row-0 tops.
+    Dispatches on the model's featurization (v2 adds the 2 king tokens between cards and context)."""
     model.eval()
-    tok = tokenize(view, action)
-    batch = collate([tok])
-    q, attn = model(batch["cards"], batch["board"], batch["phase"], batch["action"], batch["card_mask"])
+    v2 = getattr(model.cfg, "feat", "v1") == "v2"
+    if v2:
+        from .features2 import tokenize as tokenize2
+        tok = tokenize2(view, action)
+        batch = collate2([tok])
+        kings = ["king:mine", "king:theirs"]
+    else:
+        tok = tokenize(view, action)
+        batch = collate([tok])
+        kings = []
+    q, attn = model(batch["cards"], batch["board"], batch["phase"], batch["action"],
+                    batch["card_mask"], kings=batch.get("kings"))
     print(f"q = {q.item():+.3f}   (S={attn.shape[-1]} tokens, {attn.shape[1]} heads)")
     print("CLS attention (head-avg, full row sums to 1; CLS row = attention-sink self-weight):")
     for lb, w in cls_importance(attn, batch["labels"], include_cls=True, include_context=True)[0]:
         print(f"  {lb:24s} {w:.3f}")
-    seq_labels = ["CLS"] + tok.labels + ["board", "phase", "action"]
+    seq_labels = ["CLS"] + list(tok.labels) + kings + ["board", "phase", "action"]
     for h in range(attn.shape[1]):
         top = sorted(zip(seq_labels, attn[0, h, 0, :].tolist()), key=lambda p: -p[1])[:5]
         print(f"  head{h} row0 top: " + ", ".join(f"{l}={w:.2f}" for l, w in top))

@@ -113,3 +113,80 @@ def test_signed_attribution_shapes_and_reference():
         o = (attn_last[:, 0, :].unsqueeze(-1) * v_last).sum(1).reshape(-1)   # concat_h sum_j A[h,0,j] v[h,j]
         ref = float(m.head.weight[0] @ (m.layers[-1].attn.wo.weight @ o))
     assert abs(float(p.row0_signed.sum()) - ref) < 1e-4
+
+
+# --- featurization v2: fixed S=24 axes, kings as tokens, zone posteriors -------------------------------
+
+from imposterkings.machine_learning import features2 as F2      # noqa: E402
+
+
+def _model2(d=32, layers=1):
+    torch.manual_seed(0)
+    return AttentionModel(AttnConfig(d_model=d, n_layers=layers, feat="v2")).eval()
+
+
+def test_v2_payload_shape_and_fixed_axes():
+    v = _view()
+    p = explain(v, v.legal_moves()[0], _model2())
+    assert p.feat == "v2" and len(p.seq_labels) == 24                # [CLS|18 cards|2 kings|brd|ph|act]
+    assert p.attn.shape == (p.n_heads, 24, 24)
+    assert p.seq_labels[0] == "CLS"
+    assert p.seq_labels[1:19] == F2.INSTANCE_LABELS                  # the deck IS the axis, in fixed order
+    assert p.seq_labels[19:21] == ["king:mine", "king:theirs"]
+    assert p.seq_labels[-3:] == ["board", "phase", "action"]         # same contract as v1
+    assert np.allclose(p.attn.sum(axis=-1), 1.0, atol=1e-4)          # rows are softmaxes over keys
+    assert p.card_seq_range == (1, 19)
+
+
+def test_v2_every_card_token_has_art_and_kings_do_not():
+    v = _view()
+    p = explain(v, v.legal_moves()[0], _model2())
+    assert all(p.display_names[i] in CARD_NAMES for i in range(1, 19))   # all 18 render as cards
+    assert p.display_names[1] == "Princess" and p.display_names[-4] is None   # kings carry no card name
+    assert p.display_names[0] is None and p.display_names[-3:] == [None, None, None]
+
+
+def test_v2_zone_posterior_rows_sum_to_one_and_seen_are_deltas():
+    v = _view()
+    p = explain(v, v.legal_moves()[0], _model2())
+    assert p.zone_posterior.shape == (18, 12) and p.zone_names == F2.ZONES
+    assert np.allclose(p.zone_posterior.sum(axis=1), 1.0, atol=1e-5)
+    assert len(p.card_seen) == 18
+    for i, seen in enumerate(p.card_seen):                            # seen <=> the posterior is a delta
+        assert seen == bool(p.zone_posterior[i].max() >= 1.0 - 1e-6)
+    assert any(p.card_seen) and not all(p.card_seen)                  # my hand is seen; the rest is belief
+    # my own hand cards are located exactly, on my_hand
+    for c in v.own_hand:
+        i = F2.INSTANCE_NAMES.index(card_name(c))
+        assert p.card_seen[i] and p.zone_posterior[i][F2._Z["my_hand"]] == 1.0
+
+
+def test_v2_candidate_is_the_owned_copy():
+    v = _view()
+    act = next(a for a in v.legal_moves() if a.card is not None)
+    p = explain(v, act, _model2())
+    ci = p.candidate_seq_index
+    assert ci is not None and ci in p.candidate_seq_indices
+    assert p.display_names[ci] == card_name(act.card)
+    assert p.card_seen[ci - 1]                                        # the played copy is one I can see
+    assert p.zone_posterior[ci - 1][F2._Z["my_hand"]] == 1.0 or \
+           p.zone_posterior[ci - 1][F2._Z["my_ante"]] == 1.0
+
+
+def test_v2_guess_flags_every_instance_of_the_name():
+    # No synthetic "*" token in v2: a claim lights up BOTH Soldiers; their posteriors say how plausible.
+    v = _view()
+    p = explain(v, Action(ActionKind.GUESS_CARD, name="Soldier"), _model2())
+    flagged = {p.display_names[i] for i in p.candidate_seq_indices}
+    assert flagged == {"Soldier"} and len(p.candidate_seq_indices) == 2
+    assert [p.seq_labels[i] for i in p.candidate_seq_indices] == ["Soldier#0", "Soldier#1"]
+
+
+def test_v2_attribution_and_layers():
+    v = _view()
+    a = v.legal_moves()[0]
+    p = explain(v, a, _model2(layers=2), all_layers=True, attribution=True)
+    assert p.row0_signed.shape == (p.n_heads, 24) and p.attribution.shape == (24,)
+    assert np.allclose(p.attribution, p.row0_signed.sum(0), atol=1e-5)
+    assert p.per_layer is not None and len(p.per_layer) == 2
+    assert np.allclose(p.per_layer[-1], p.attn, atol=1e-6)

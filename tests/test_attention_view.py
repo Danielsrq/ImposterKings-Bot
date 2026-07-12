@@ -162,3 +162,59 @@ def test_layer_view_pills_select_matrices():
     for view in ("causal", "l1", "l2"):
         hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820), mode="signed", layer_view=view)
         av.draw_tooltip(surf, _fonts(), p, hits[0], (500, 400), layer_view=view)
+
+
+# --- featurization v2 payloads: fixed 24 axes, king tiles, ghosted unseen cards, belief tooltip --------
+
+_V2_ZONES = ["my_hand", "my_hidden", "my_setup", "their_hand", "their_hidden", "their_setup",
+             "my_ante", "their_ante", "stack", "discard", "faceup", "facedown"]
+
+
+def _payload_v2(heads=4):
+    """A v2-shaped payload: 18 card tokens (slots 1..18), 2 kings, board/phase/action. Slot 0 (Princess)
+    is SEEN in my_hand; the rest carry a spread posterior (unseen -> ghosted)."""
+    names18 = ["Princess", "Queen", "KingsHand", "Sentry", "Mystic", "Warlord", "Oathbound", "Oathbound",
+               "Judge", "Soldier", "Soldier", "Inquisitor", "Inquisitor", "Elder", "Elder", "Zealot",
+               "Assassin", "Fool"]
+    labels18 = ["Princess", "Queen", "KingsHand", "Sentry", "Mystic", "Warlord", "Oathbound#0",
+                "Oathbound#1", "Judge", "Soldier#0", "Soldier#1", "Inquisitor#0", "Inquisitor#1",
+                "Elder#0", "Elder#1", "Zealot", "Assassin", "Fool"]
+    seq = ["CLS"] + labels18 + ["king:mine", "king:theirs", "board", "phase", "action"]
+    names = [None] + names18 + [None] * 5
+    s = len(seq)
+    assert s == 24
+    a = np.random.RandomState(1).rand(heads, s, s).astype(np.float32)
+    a /= a.sum(axis=-1, keepdims=True)
+    post = np.full((18, 12), 1.0 / 12.0, np.float32)                  # default: a flat belief
+    post[0] = 0.0
+    post[0][_V2_ZONES.index("my_hand")] = 1.0                         # Princess: seen, in my hand
+    seen = [bool(p.max() >= 1.0 - 1e-6) for p in post]
+    return SimpleNamespace(attn=a, seq_labels=seq, display_names=names, n_heads=heads, feat="v2",
+                           zone_posterior=post, zone_names=list(_V2_ZONES), card_seen=seen,
+                           card_seq_range=(1, 19))
+
+
+def test_v2_payload_renders_ghosts_kings_and_belief_tooltip():
+    surf = pygame.Surface((1100, 950))
+    p = _payload_v2()
+    hits = av.draw_attention(surf, _fonts(), p, (20, 20, 1000, 880), candidate_index=17)
+    assert len(hits) == p.n_heads * 24 * 24                           # every cell of the fixed grid
+    assert av._is_unseen(p, 17) and not av._is_unseen(p, 1)           # Assassin is a belief; Princess seen
+    assert av._card_slot(p, 1) == 0 and av._card_slot(p, 18) == 17
+    assert av._card_slot(p, 19) is None and av._card_slot(p, 0) is None    # kings/CLS aren't cards
+    # tooltips: an unseen card reports its belief, a seen one its (delta) zone
+    unseen = next(h for h in hits if h.j == 17)                       # key token = Assassin (unseen)
+    av.draw_tooltip(surf, _fonts(), p, unseen, (500, 400))
+    assert av._zone_lines(p, 17)[0].startswith("belief:")
+    assert av._zone_lines(p, 1) == ["zone: my_hand (seen)"]
+    assert av._zone_lines(p, 19) == [] and av._zone_lines(p, 0) == []      # non-card tokens: no belief
+    king = next(h for h in hits if h.j == 19)
+    av.draw_tooltip(surf, _fonts(), p, king, (500, 400))              # king column: renders, no zone line
+
+
+def test_v1_payload_has_no_beliefs_and_still_draws():
+    surf = pygame.Surface((1000, 900))
+    p = _payload()                                                    # no feat / zone_posterior fields
+    hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820))
+    av.draw_tooltip(surf, _fonts(), p, hits[0], (400, 300))
+    assert av._zone_lines(p, 1) == [] and not av._is_unseen(p, 1)     # belief helpers are inert at v1

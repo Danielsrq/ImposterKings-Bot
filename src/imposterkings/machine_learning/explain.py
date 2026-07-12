@@ -4,23 +4,32 @@ One forward pass of the attention q-net on a single ``(InformationSet, candidate
 per-head CLS->token attention that "explains" scoring that move. Torch-only (NO pygame) so it is the single
 shared entry point for both the live UI drawer and the post-game review, and is unit-testable with no display.
 
-The sequence axis is ``S = N + 4``, laid out ``[CLS, N card tokens, board, phase, action]``; ``seq_labels``
-mirror that order. At ``L=1`` only row 0 (CLS) causally feeds ``q``; at ``L>=2`` layer-1's card rows feed
-layer-2's CLS (``per_layer`` carries every layer so the renderer can route accordingly).
+Both featurizations are supported; the checkpoint's ``cfg.feat`` picks the path:
+
+- **v1** -- ``S = N + 4``: ``[CLS, N card tokens, board, phase, action]``; the card tokens are only the
+  VISIBLE cards, so ``N`` (and the axis order) changes every ply.
+- **v2** -- ``S = 24`` FIXED: ``[CLS, 18 card instances, king_mine, king_theirs, board, phase, action]``.
+  The token set IS the deck, so a heatmap row means the same card all game, unseen cards are attendable
+  (``card_seen`` False), and each card carries a ``zone_posterior`` (where the model believes it is).
+
+In both, ``seq_labels`` mirrors the sequence and the last three tokens are board/phase/action. At ``L=1``
+only row 0 (CLS) causally feeds ``q``; at ``L>=2`` layer-1's card rows feed layer-2's CLS (``per_layer``
+carries every layer so the renderer can route accordingly).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from ..cards import CARD_NAMES, asset_path, card_ids_for_name
-from .attention_model import AttentionModel, collate
+from .attention_model import AttentionModel, collate, collate2
 from .features import CAND_COL, tokenize
 
 _CTX_LABELS = ["board", "phase", "action"]                          # the 3 singleton tokens (no card art)
+_KING_LABELS = ["king:mine", "king:theirs"]                         # v2 only, between cards and context
 _NAME_TO_ASSET: Dict[str, str] = {n: asset_path(card_ids_for_name(n)[0]) for n in CARD_NAMES}
 
 
@@ -40,6 +49,12 @@ class AttentionExplanation:
     row0_signed: Optional[np.ndarray] = None # [heads, S] signed per-head contribution of each token to the
     #                                          q-logit via the readout-layer CLS row; None unless requested
     attribution: Optional[np.ndarray] = None # [S] head-summed signed contribution (Δq-logit per token)
+    feat: str = "v1"                         # featurization behind this payload ("v1" | "v2")
+    # --- v2 only (None at v1): the belief block -- ghost the unseen cards, show WHERE they might be -----
+    zone_posterior: Optional[np.ndarray] = None   # [18, 12] P(zone) per card instance; each row sums to 1
+    zone_names: Optional[List[str]] = None        # len 12; the zone_posterior column names
+    card_seen: Optional[List[bool]] = None        # len 18; True = located exactly (the posterior is a delta)
+    card_seq_range: Optional[Tuple[int, int]] = None   # [lo, hi) seq indices holding the card tokens
 
 
 def _parse_name(label: str) -> Optional[str]:
@@ -53,27 +68,38 @@ def _parse_name(label: str) -> Optional[str]:
     return name if name in _NAME_TO_ASSET else None
 
 
+def _parse_name2(label: str) -> Optional[str]:
+    """v2 instance label (``"Soldier#1"`` / ``"Judge"``) -> CardName, else None (CLS / kings / context).
+    v2 labels carry no zone prefix: location is the zone posterior, not part of the token's identity."""
+    name = label.split("#", 1)[0]
+    return name if name in _NAME_TO_ASSET else None
+
+
 @torch.no_grad()
 def explain(view, action, model: AttentionModel, *, all_layers: bool = False,
             attribution: bool = False, ckpt_id: str = "") -> AttentionExplanation:
     """Run one forward pass for ``(view, action)`` and package the per-head CLS->token attention.
 
     ``view`` an InformationSet, ``action`` the candidate move to explain (or None), ``model`` an
-    already-loaded :class:`AttentionModel`. With ``all_layers`` the payload carries every layer's attention
-    (for L>=2 card-row routing); otherwise only the last (readout) layer. With ``attribution`` it also
-    computes the signed value-weighted contribution of each token to the q-logit (``row0_signed`` /
-    ``attribution``). Deterministic (eval, no dropout)."""
-    if getattr(model.cfg, "feat", "v1") != "v1":
-        raise NotImplementedError(
-            "explain() UI support for featurization v2 is deferred (plan step 6) -- the v2 evaluator "
-            "plays fine; only the drawer payload is v1-only for now")
+    already-loaded :class:`AttentionModel` (its ``cfg.feat`` selects the v1/v2 featurization). With
+    ``all_layers`` the payload carries every layer's attention (for L>=2 card-row routing); otherwise only
+    the last (readout) layer. With ``attribution`` it also computes the signed value-weighted contribution
+    of each token to the q-logit (``row0_signed`` / ``attribution``). Deterministic (eval, no dropout)."""
     model.eval()
-    tok = tokenize(view, action)
-    batch = collate([tok])
+    feat = getattr(model.cfg, "feat", "v1")
+    if feat == "v2":
+        from . import features2 as F2
+        tok = F2.tokenize(view, action)
+        batch = collate2([tok])
+        kw = {"kings": batch["kings"]}
+    else:
+        tok = tokenize(view, action)
+        batch = collate([tok])
+        kw = {}
     args = (batch["cards"], batch["board"], batch["phase"], batch["action"], batch["card_mask"])
     values_t = None
     if all_layers or attribution:
-        res = model.forward_layers(*args, need_values=attribution)
+        res = model.forward_layers(*args, need_values=attribution, **kw)
         q_t, attns_t = res[0], res[1]
         if attribution:
             values_t = res[2]
@@ -81,7 +107,7 @@ def explain(view, action, model: AttentionModel, *, all_layers: bool = False,
         per_layer: Optional[List[np.ndarray]] = (
             [a[0].cpu().numpy().astype(np.float32) for a in attns_t] if all_layers else None)
     else:
-        q_t, attn_t = model(*args)
+        q_t, attn_t = model(*args, **kw)
         per_layer = None
         attn = attn_t[0].cpu().numpy().astype(np.float32)
 
@@ -97,21 +123,42 @@ def explain(view, action, model: AttentionModel, *, all_layers: bool = False,
         row0_signed = rs.cpu().numpy().astype(np.float32)
         attribution_vec = rs.sum(0).cpu().numpy().astype(np.float32)  # [S] head-summed
 
-    seq_labels = ["CLS"] + list(tok.labels) + list(_CTX_LABELS)
-    display_names = [_parse_name(lb) for lb in seq_labels]
-
-    # Candidate token(s): the is_candidate_action column of the (padded) card block -- catches both the
-    # matched token and the synthetic "*" claim token. Card-region index j -> seq index 1 + j.
     n_cards = len(tok.labels)
-    cand_col = batch["cards"][0, :, CAND_COL].cpu().numpy()
+    zone_posterior = zone_names = card_seen = card_seq_range = None
+    if feat == "v2":
+        seq_labels = ["CLS"] + list(tok.labels) + list(_KING_LABELS) + list(_CTX_LABELS)
+        display_names = [_parse_name2(lb) for lb in seq_labels]
+        zone_posterior = tok.cards[:, F2._ZONE_OFF:].astype(np.float32).copy()   # [18, 12]
+        zone_names = list(F2.ZONES)
+        card_seen = [bool(p.max() >= 1.0 - 1e-6) for p in zone_posterior]        # delta == located
+        card_seq_range = (1, 1 + n_cards)
+        cand_ix = F2.CAND_COL
+    else:
+        seq_labels = ["CLS"] + list(tok.labels) + list(_CTX_LABELS)
+        display_names = [_parse_name(lb) for lb in seq_labels]
+        cand_ix = CAND_COL
+
+    # Candidate token(s): the is_candidate_action column of the card block. Card-region index j -> seq
+    # index 1 + j (cards are contiguous from 1 in both featurizations). v1 also catches the synthetic "*"
+    # claim token; v2 has no synthetic token -- a guess flags EVERY instance of the named card instead.
+    cand_col = batch["cards"][0, :, cand_ix].cpu().numpy()
     cand = [1 + j for j in np.flatnonzero(cand_col == 1.0).tolist() if j < n_cards]
-    if not cand:                                                   # fallback: any "*"-suffixed label
+    if not cand and feat != "v2":                                   # fallback: any "*"-suffixed label
         cand = [i for i, lb in enumerate(seq_labels) if lb.endswith("*")]
-    # Primary: prefer the my_hand play token; else the first flagged token.
-    primary = next((i for i in cand if seq_labels[i].startswith("my_hand:")), cand[0] if cand else None)
+    if feat == "v2":
+        # Primary = the copy I actually own (its posterior is a delta on my_hand/my_ante); a play+guess or
+        # a duplicate-name guess legitimately flags several instances.
+        mine = (F2._ZONE_OFF + F2._Z["my_hand"], F2._ZONE_OFF + F2._Z["my_ante"])
+        primary = next((i for i in cand if any(tok.cards[i - 1, c] >= 1.0 for c in mine)),
+                       cand[0] if cand else None)
+    else:                                                          # v1: prefer the my_hand play token
+        primary = next((i for i in cand if seq_labels[i].startswith("my_hand:")),
+                       cand[0] if cand else None)
 
     return AttentionExplanation(
         q=float(q_t.item()), seq_labels=seq_labels, attn=attn, per_layer=per_layer,
         candidate_seq_index=primary, candidate_seq_indices=cand, display_names=display_names,
         name_to_asset=dict(_NAME_TO_ASSET), n_heads=int(attn.shape[0]), n_layers=model.cfg.n_layers,
-        ckpt_id=ckpt_id, row0_signed=row0_signed, attribution=attribution_vec)
+        ckpt_id=ckpt_id, row0_signed=row0_signed, attribution=attribution_vec, feat=feat,
+        zone_posterior=zone_posterior, zone_names=zone_names, card_seen=card_seen,
+        card_seq_range=card_seq_range)

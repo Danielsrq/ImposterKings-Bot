@@ -24,7 +24,7 @@ RGB = Tuple[int, int, int]
 AX = 22            # axis-gutter thickness (one tiny sprite)
 GAP = 20           # gap between head boxes
 PAD = 8
-BOX_MAX = 320      # cap on a single head box (keeps cells from getting huge on small-S turns)
+BOX_MAX = 520      # cap on a single head box (v2 is a fixed S=24: let the grid use the room it has)
 MIN_CELL = 6       # floor so big-S turns still tile (sprites just get tiny)
 
 # Perceptual, colorblind-safe "viridis" ramp (purple -> blue -> green -> yellow). Applied to sqrt(weight);
@@ -94,23 +94,56 @@ def _grid_shape(n_heads: int) -> Tuple[int, int]:
 
 
 def _abbrev(label: str) -> str:
-    return {"CLS": "CLS", "board": "brd", "phase": "ph", "action": "act"}.get(label, label[:3])
+    return {"CLS": "CLS", "board": "brd", "phase": "ph", "action": "act",
+            "king:mine": "K+", "king:theirs": "K-"}.get(label, label[:3])
+
+
+def _card_slot(payload, k: int) -> Optional[int]:
+    """Seq index -> card-instance slot, or None if ``k`` isn't a card token (v2 payloads only)."""
+    rng = getattr(payload, "card_seq_range", None)
+    return (k - rng[0]) if (rng is not None and rng[0] <= k < rng[1]) else None
+
+
+def _is_unseen(payload, k: int) -> bool:
+    """v2: this card's location is a BELIEF (posterior spread), not an observation."""
+    seen = getattr(payload, "card_seen", None)
+    slot = _card_slot(payload, k)
+    return seen is not None and slot is not None and not seen[slot]
 
 
 def _axis_tile(surface, payload, k: int, x: int, y: int, size: int) -> None:
     """Draw the token-``k`` axis sprite in a ``size``-square slot at (x,y): the card art for a card token,
-    the card back for ``opp_unknown``, else a small text tile (CLS/board/phase/action)."""
+    a king for the v2 king tokens, the card back for v1's ``opp_unknown``, else a text tile.
+
+    v2 only: a card whose location is UNSEEN (its zone posterior is a spread, not a delta) is drawn
+    **ghosted** with a ``?`` badge -- the token is real and attendable, but where it sits is a belief."""
     name = payload.display_names[k]
     label = payload.seq_labels[k]
     slot = pygame.Rect(x, y, size, size)
     if name is not None:
         try:
             img = assets.card_surface(card_ids_for_name(name)[0], (size, size))
+            if _is_unseen(payload, k):                    # belief, not observation -> fade toward the bg
+                img = img.copy()
+                veil = pygame.Surface((size, size))
+                veil.fill(BG)
+                veil.set_alpha(150)
+                img.blit(veil, (0, 0))
             surface.blit(img, (x, y))
         except Exception:
             pygame.draw.rect(surface, MUTE, slot)
-        if label.endswith("*") and size >= 10:            # synthetic "claim" token -> asterisk badge
-            surface.blit(_tile_font().render("*", True, GOLD), (x + size - 6, y - 1))
+        if size >= 10:
+            if _is_unseen(payload, k):                    # unseen -> "?" badge
+                surface.blit(_tile_font().render("?", True, GOLD), (x + size - 6, y - 1))
+            elif label.endswith("*"):                     # v1 synthetic "claim" token -> asterisk badge
+                surface.blit(_tile_font().render("*", True, GOLD), (x + size - 6, y - 1))
+        return
+    if label.startswith("king:"):                         # v2: kings are entities, not context
+        try:
+            surface.blit(assets.king_surface((size, size)), (x, y))
+        except Exception:
+            pygame.draw.rect(surface, MUTE, slot)
+        pygame.draw.rect(surface, GOLD if label == "king:mine" else MUTE, slot, 1)
         return
     if label.startswith("opp_unknown"):
         try:
@@ -263,10 +296,27 @@ def attn_cell_at(hits: List[AttnHit], pos) -> Optional[AttnHit]:
     return None
 
 
+def _zone_lines(payload, k: int, top: int = 2) -> List[str]:
+    """v2 belief read-out for the card token at seq index ``k``: where the model thinks it is.
+    A seen card is a delta (``zone: stack (seen)``); an unseen one is a posterior over hidden zones."""
+    post = getattr(payload, "zone_posterior", None)
+    names = getattr(payload, "zone_names", None)
+    slot = _card_slot(payload, k)
+    if post is None or names is None or slot is None:
+        return []
+    p = post[slot]
+    order = sorted(range(len(p)), key=lambda z: -float(p[z]))
+    if not _is_unseen(payload, k):
+        return [f"zone: {names[order[0]]} (seen)"]
+    parts = [f"{names[z]} {float(p[z]):.2f}" for z in order[:top] if float(p[z]) > 0.005]
+    return [f"belief: {'  '.join(parts)}"] if parts else []
+
+
 def draw_tooltip(surface, fonts, payload, hit: AttnHit, pos, layer_view: str = "causal") -> None:
     """Floating 2dp tooltip: ``<label i> -> <label j> = 0.24`` near the mouse. On row-0 cells also the
     hovered head's signed contribution and the head-summed total for the column token (the bridge between
-    a single head's cell and the Top-contributors ranking -- heads can cancel)."""
+    a single head's cell and the Top-contributors ranking -- heads can cancel). At v2, a card KEY token
+    also reports its zone posterior -- the belief the attention is being paid to."""
     small = fonts["small"]
     m, routed, _dead = routed_attention(payload, layer_view)   # same routing as the display
     v = float(m[hit.head, hit.i, hit.j])
@@ -286,6 +336,7 @@ def draw_tooltip(surface, fonts, payload, hit: AttnHit, pos, layer_view: str = "
         lines.append(f"Δq (head {hit.head}) {float(rs[hit.head, hit.j]):+.3f}")
     if att is not None:                                        # head-summed total for the column token
         lines.append(f"Σheads Δq {float(att[hit.j]):+.3f}")
+    lines += _zone_lines(payload, hit.j)                       # v2: the attended card's location belief
     lh = small.get_linesize()
     w = max(small.size(t)[0] for t in lines) + 12
     h = len(lines) * lh + 8
