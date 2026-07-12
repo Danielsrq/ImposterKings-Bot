@@ -5,6 +5,11 @@
 Same target/loss/split as the MLP trainer (``train.py``): MCTS ``mean_q``, visit-share-weighted MSE,
 split by ``game_id`` -- but over the variable-length token sets (``features.tokenize``), collated per
 batch. Reports regression + ranking metrics and the **total training wall-time**.
+
+GPU: ``--device auto`` (default) trains on CUDA when available (~3x+ per epoch; the DataLoader/collate is
+the remaining CPU-side bottleneck). Checkpoints are always saved as CPU tensors, so the evaluator/UI/
+explain consumers never see the training device. The venv pins the CUDA build (RTX 3060 Ti, driver-
+compatible): ``pip install torch==2.12.1+cu126 --index-url https://download.pytorch.org/whl/cu126``.
 """
 from __future__ import annotations
 
@@ -47,28 +52,42 @@ def collate_fn(batch):
     return packed, y, w
 
 
+def resolve_device(name: str = "auto") -> "torch.device":
+    """"auto" -> cuda when available, else cpu. Training-only: checkpoints are saved as CPU tensors, so
+    every downstream consumer (evaluator, UI, explain) is unaffected by the training device."""
+    if name == "auto":
+        name = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(name)
+
+
+def _to_device(packed, device):
+    return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in packed.items()}
+
+
 def _forward(model, packed):
     q, _ = model(packed["cards"], packed["board"], packed["phase"], packed["action"], packed["card_mask"])
     return q
 
 
 @torch.no_grad()
-def _predict(model, rows, idx, batch) -> np.ndarray:
+def _predict(model, rows, idx, batch, device) -> np.ndarray:
     model.eval()
     dl = DataLoader(TokenTorchDataset(rows, idx), batch_size=batch, shuffle=False, collate_fn=collate_fn)
-    preds = [_forward(model, packed).numpy() for packed, _, _ in dl]
+    preds = [_forward(model, _to_device(packed, device)).cpu().numpy() for packed, _, _ in dl]
     return np.concatenate(preds) if preds else np.zeros(0, np.float32)
 
 
 def run(rows: TokenRows, cfg: AttnConfig, hp: Dict) -> Dict:
     torch.manual_seed(hp["seed"])
+    device = resolve_device(hp.get("device", "auto"))
     tr, va = game_split(rows.game_id, hp["val_frac"], hp["seed"])
     tri, vai = np.where(tr)[0], np.where(va)[0]
 
-    model = AttentionModel(cfg)
+    model = AttentionModel(cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=hp["lr"])
+    pin = device.type == "cuda"
     dl = DataLoader(TokenTorchDataset(rows, tri), batch_size=hp["batch"], shuffle=True,
-                    collate_fn=collate_fn)
+                    collate_fn=collate_fn, pin_memory=pin)
 
     yva = rows.y[vai].astype(np.float32)
     t0 = time.perf_counter()
@@ -77,11 +96,12 @@ def run(rows: TokenRows, cfg: AttnConfig, hp: Dict) -> Dict:
         te = time.perf_counter()
         model.train()
         for packed, yb, wb in dl:
+            packed, yb, wb = _to_device(packed, device), yb.to(device), wb.to(device)
             opt.zero_grad()
             pred = _forward(model, packed)
             loss = (wb * (pred - yb) ** 2).sum() / wb.sum().clamp_min(1e-8)
             loss.backward(); opt.step()
-        vmse = float(np.mean((_predict(model, rows, vai, hp["batch"]) - yva) ** 2))
+        vmse = float(np.mean((_predict(model, rows, vai, hp["batch"], device) - yva) ** 2))
         epochs_run, esec = ep + 1, time.perf_counter() - te
         epoch_secs.append(esec)
         print(f"  epoch {ep + 1:>2}: val_mse {vmse:.4f}  ({esec:.1f}s)", flush=True)
@@ -95,7 +115,8 @@ def run(rows: TokenRows, cfg: AttnConfig, hp: Dict) -> Dict:
         model.load_state_dict(best_state)
     seconds = time.perf_counter() - t0
 
-    pv, pt = _predict(model, rows, vai, hp["batch"]), _predict(model, rows, tri, hp["batch"])
+    pv, pt = _predict(model, rows, vai, hp["batch"], device), _predict(model, rows, tri, hp["batch"], device)
+    model.cpu()                                   # checkpoints + downstream consumers stay CPU-native
     yt = rows.y[tri].astype(np.float32)
     rank = ranking_metrics(pv, yva, rows.decision_id[vai], rows.is_chosen[vai])
     n = len(tri) + len(vai)
@@ -122,13 +143,15 @@ def main(argv=None) -> None:
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-hidden", type=int, default=128)
     p.add_argument("--out-dir", default="models")
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                   help="training device (auto = cuda when available); checkpoints are always CPU-saved")
     args = p.parse_args(argv)
 
     rows = load_tokens(args.npz)
     cfg = AttnConfig(d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads,
                      ffn_hidden=args.ffn_hidden, dropout=args.dropout)
-    hp = {k: getattr(args, k) for k in ("epochs", "batch", "lr", "patience", "val_frac", "seed")}
-    print(f"loaded {len(rows)} rows; cfg={cfg}; target=q", flush=True)
+    hp = {k: getattr(args, k) for k in ("epochs", "batch", "lr", "patience", "val_frac", "seed", "device")}
+    print(f"loaded {len(rows)} rows; cfg={cfg}; target=q; device={resolve_device(args.device)}", flush=True)
 
     r = run(rows, cfg, hp)
     print(f"\nparams {r['params']}  epochs {r['epochs']}  TIME {r['seconds']:.1f}s "

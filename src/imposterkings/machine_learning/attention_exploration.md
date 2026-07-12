@@ -76,7 +76,7 @@ mirrored deals (200 games)**, reported as **winrate (± 95% CI)**.
 
 | variant | config (d/L/ffn) | params | train-time | epochs | val_mse | top1_bestq | recall@2 | spearman | **winrate (± 95% CI)** |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| **v2** (deploy) | 64 / **1** / 128 | 42,945 | 2018 s | 50 | 0.0647 | 51.3% | 75.8% | 0.434 | **57.5% (± 5.6%)** |
+| **v2** (deploy) | 64 / **1** / 128 | 44,737 | 2018 s | 50 | 0.0647 | 51.3% | 75.8% | 0.434 | **57.5% (± 5.6%)** |
 | **v3a** | 64 / **2** / 128 | 78,209 | 2331 s | 19 (best 14) | 0.0646 | 51.7% | 76.3% | 0.437 | **55.5% (± 5.2%)** |
 | **v3b** | 64 / 1 / **256** | 61,249 | 643 s | 9 (best 4) | 0.0756 | 48.3% | 74.5% | 0.388 | **51.0% (± 5.9%)** |
 | **v3c** | 64 / **2** / **256** | 111,233 | 2088 s | 17 (best 12) | **0.0628** | 51.2% | **76.6%** | 0.422 | **62.0% (± 5.4%)** |
@@ -129,7 +129,7 @@ but 48.5% vs this opponent.
 
 | variant | config (d/h/L) | head_dim | params | train-time | epochs | val_mse | top1_bestq | recall@2 | spearman | **winrate (± 95% CI)** |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| **v2** (anchor) | 64 / 4 / 1 | 16 | 42,945 | 2018 s | 50 | 0.0647 | 51.3% | 75.8% | 0.434 | **48.5% (± 4.9%)** |
+| **v2** (anchor) | 64 / 4 / 1 | 16 | 44,737 | 2018 s | 50 | 0.0647 | 51.3% | 75.8% | 0.434 | **48.5% (± 4.9%)** |
 | **v4a** | 96 / 4 / 1 | 24 | 79,329 | 768 s | 10 | 0.0722 | 49.7% | 75.4% | 0.415 | **51.0% (± 5.6%)** |
 | **v4b** | 96 / 8 / 1 | 12 | 79,329 | 1456 s | 17 | 0.0690 | 51.2% | 75.4% | 0.407 | **50.0% (± 5.7%)** |
 | **v4c** | 128 / 4 / 1 | 32 | 122,113 | 813 s | 9 | 0.0713 | 48.6% | 74.3% | 0.395 | **47.0% (± 6.0%)** |
@@ -151,12 +151,12 @@ challenger's own eval cost — an empirical inference-cost column, sorted by win
 | v4a-L2 | 96/4/2/128 | 141,761 | 101/200 | 0.505 | ±0.055 | 69% | 116.4 | 1.25× |
 | v3c (re-anchor) | 64/4/2/256 | 111,233 | 100/200 | 0.500 | ±0.054 | 70% | 120.6 | 1.29× |
 | v4b | 96/8/1/128 | 79,329 | 100/200 | 0.500 | ±0.057 | 66% | 98.7 | 1.06× |
-| v2 (anchor) | 64/4/1/128 | 42,945 | 97/200 | 0.485 | ±0.049 | 75% | 93.5 | 1.00× |
+| v2 (anchor) | 64/4/1/128 | 44,737 | 97/200 | 0.485 | ±0.049 | 75% | 93.5 | 1.00× |
 | v4d-L2 | 128/8/2/128 | 221,697 | 96/200 | 0.480 | ±0.052 | 72% | 128.1 | 1.37× |
 | v4c | 128/4/1/128 | 122,113 | 94/200 | 0.470 | ±0.060 | 62% | 98.6 | 1.05× |
 
 **Inference cost is driven by LAYERS, not params** (CPU, dispatch-bound per Study 1): all L=1 models cost
-93–103 s/game despite a 3× param range (v4d = 2.8× v2's params for +10% cost), while every L=2 model
+93–103 s/game despite a 3× param range (v4d = 2.7× v2's params for +10% cost), while every L=2 model
 steps to 116–128 s/game (+25–37%) — v3c has FEWER params than v4d yet costs ~18% more per game. A second
 layer doubles the count of sequential ops (each paying kernel dispatch); widening matrices barely moves a
 dispatch-bound kernel. Params correlate with cost only WITHIN a depth. The strength-per-cost frontier:
