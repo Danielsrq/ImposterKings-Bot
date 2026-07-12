@@ -13,7 +13,10 @@ source. See `DATASET.md`. Chunked joblib parallelism: each worker writes its own
 from __future__ import annotations
 
 import argparse
+import glob
+import json
 import os
+import re
 import time
 from typing import Dict, List, Tuple
 
@@ -91,13 +94,31 @@ def collect_game(spec: Spec, seed: int, temp_plies: int, base_seed: int,
     return rec
 
 
+def _existing_state(out_dir: str) -> Tuple[int, int, Dict]:
+    """Resume bookkeeping for a corpus dir: (games already generated, next free shard index, the newest
+    shard's ``gen`` header). Counts records by JSONL lines; shard index parsed from ``games_NNNNN.jsonl``."""
+    files = sorted(glob.glob(os.path.join(out_dir, "games_*.jsonl")))
+    if not files:
+        return 0, 0, {}
+    n = 0
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
+            n += sum(1 for line in fh if line.strip())
+    last_idx = max(int(re.search(r"games_(\d+)\.jsonl$", f).group(1)) for f in files)
+    with open(files[-1], encoding="utf-8") as fh:
+        first = json.loads(fh.readline())
+    return n, last_idx + 1, first.get("gen", {})
+
+
 def _chunk_task(spec: Spec, seeds: List[int], out_dir: str, shard_idx: int,
                 temp_plies: int, base_seed: int, value_ckpt=None) -> Dict:
     t0 = time.perf_counter()
     ev = None
     if value_ckpt:                                    # NN-MCTS self-play: build the evaluator once/worker
-        from ..machine_learning.evaluator import build_evaluator
-        ev = build_evaluator(value_ckpt)
+        import torch
+        torch.set_num_threads(1)                      # attention evals run torch; avoid oversubscription
+        from ..machine_learning.benchmark import _evaluator_for
+        ev = _evaluator_for(value_ckpt)               # checkpoint-type dispatch: MLP or attention
     recs = [collect_game(spec, s, temp_plies, base_seed, evaluator=ev, value_ckpt=value_ckpt)
             for s in seeds]
     path = os.path.join(out_dir, f"games_{shard_idx:05d}.jsonl")
@@ -106,13 +127,17 @@ def _chunk_task(spec: Spec, seeds: List[int], out_dir: str, shard_idx: int,
 
 
 def run(spec: Spec, games: int, workers: int, chunk: int, base_seed: int,
-        temp_plies: int, out_dir: str, value_ckpt=None) -> List[Dict]:
+        temp_plies: int, out_dir: str, value_ckpt=None,
+        seed_offset: int = 0, shard_offset: int = 0) -> List[Dict]:
+    """``seed_offset``/``shard_offset`` support resumable corpora: seeds continue at
+    ``base_seed + seed_offset`` and shard files at ``games_{shard_offset:05d}.jsonl`` (the recorded ``gen``
+    meta keeps the ORIGINAL base_seed so later resumes can verify against it)."""
     from joblib import Parallel, delayed
     from tqdm import tqdm
 
-    seeds = [base_seed + i for i in range(games)]
+    seeds = [base_seed + seed_offset + i for i in range(games)]
     chunks = [seeds[i:i + chunk] for i in range(0, games, chunk)]
-    jobs = [delayed(_chunk_task)(spec, ch, out_dir, idx, temp_plies, base_seed, value_ckpt)
+    jobs = [delayed(_chunk_task)(spec, ch, out_dir, shard_offset + idx, temp_plies, base_seed, value_ckpt)
             for idx, ch in enumerate(chunks)]
     return list(tqdm(Parallel(n_jobs=workers, return_as="generator")(jobs),
                      total=len(chunks), desc="shards", unit="shard"))
@@ -131,13 +156,30 @@ def main(argv=None) -> None:
                    help="sample the played move for the first N decisions/agent (0 = greedy self-play)")
     p.add_argument("--out-dir", default=os.path.join("datasets", "selfplay_k20l3"))
     p.add_argument("--force", action="store_true", help="write into a non-empty --out-dir")
+    p.add_argument("--resume", action="store_true",
+                   help="continue an existing corpus: seeds resume after the games already generated, "
+                        "shards continue at the next free index (flags must match the corpus)")
     p.add_argument("--value-checkpoint", default=None,
                    help="NN checkpoint -> NN-MCTS (PUCT) self-play instead of rollout MCTS")
     args = p.parse_args(argv)
 
     spec: Spec = ("fixed", args.k) if args.mode == "fixed" else (args.mode, args.k, args.l)
-    if os.path.isdir(args.out_dir) and any(os.scandir(args.out_dir)) and not args.force:
-        p.error(f"{args.out_dir} exists and is non-empty; use --force or a different --out-dir")
+    seed_offset = shard_offset = 0
+    if args.resume:
+        n0, shard_offset, prev = _existing_state(args.out_dir)
+        if n0 == 0:
+            p.error(f"--resume: no existing shards found in {args.out_dir}")
+        cur = _gen_meta(spec, args.temp_plies, args.base_seed, args.value_checkpoint)
+        for key in ("spec", "temp_plies", "base_seed", "value_ckpt"):
+            if prev.get(key) != cur[key]:
+                p.error(f"--resume mismatch on {key!r}: corpus has {prev.get(key)!r}, "
+                        f"flags give {cur[key]!r} -- refusing to mix engines/seeds in one corpus")
+        seed_offset = n0
+        print(f"resume: {n0} games exist -> seeds continue at {args.base_seed + n0}, "
+              f"shards at games_{shard_offset:05d}.jsonl")
+    elif os.path.isdir(args.out_dir) and any(os.scandir(args.out_dir)) and not args.force:
+        p.error(f"{args.out_dir} exists and is non-empty; use --resume to continue it, "
+                f"--force to mix, or a different --out-dir")
     os.makedirs(args.out_dir, exist_ok=True)
 
     n_shards = (args.games + args.chunk - 1) // args.chunk
@@ -148,7 +190,8 @@ def main(argv=None) -> None:
 
     t0 = time.perf_counter()
     results = run(spec, args.games, args.workers, args.chunk, args.base_seed,
-                  args.temp_plies, args.out_dir, value_ckpt=args.value_checkpoint)
+                  args.temp_plies, args.out_dir, value_ckpt=args.value_checkpoint,
+                  seed_offset=seed_offset, shard_offset=shard_offset)
     wall = time.perf_counter() - t0
 
     games = sum(r["count"] for r in results)

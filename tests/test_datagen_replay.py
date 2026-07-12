@@ -54,3 +54,40 @@ def test_jsonl_write_read_and_scripted_replay(tmp_path):
     moves = [record.dict_to_action(d["chosen"]) for d in r["decisions"]]
     traj = scripted_trajectory(st, moves, search=False)       # fast path: no re-search
     assert len(traj) == len(moves)
+
+
+def test_resume_continues_seeds_and_shards(tmp_path, capsys):
+    # batch 1: 2 games -> shards 00000-00001; --resume 2 more -> 00002-00003, seeds continue
+    out = str(tmp_path / "corpus")
+    base = ["--mode", "hybrid", "--k", "3", "--l", "3", "--workers", "1", "--chunk", "1",
+            "--base-seed", "500", "--out-dir", out]
+    datagen.main(["--games", "2"] + base)
+    datagen.main(["--games", "2", "--resume"] + base)
+
+    files = sorted(os.listdir(out))
+    assert files == [f"games_{i:05d}.jsonl" for i in range(4)]       # no clobbering, contiguous shards
+    seeds = []
+    for f in files:
+        recs = record.read_jsonl(os.path.join(out, f))
+        assert len(recs) == 1
+        seeds.append(recs[0]["deal_seed"])
+        assert recs[0]["gen"]["base_seed"] == 500                    # meta keeps the ORIGINAL base
+    assert seeds == [500, 501, 502, 503]                             # unique, continuing deal seeds
+
+
+def test_resume_guards(tmp_path):
+    import pytest
+    out = str(tmp_path / "corpus")
+    base = ["--mode", "hybrid", "--k", "3", "--l", "3", "--workers", "1", "--chunk", "1",
+            "--base-seed", "500", "--out-dir", out]
+    with pytest.raises(SystemExit):                                  # resume on an empty corpus
+        datagen.main(["--games", "1", "--resume"] + base)
+    datagen.main(["--games", "1"] + base)
+    with pytest.raises(SystemExit):                                  # non-empty dir without --resume/--force
+        datagen.main(["--games", "1"] + base)
+    with pytest.raises(SystemExit):                                  # mismatched base seed
+        datagen.main(["--games", "1", "--resume", "--mode", "hybrid", "--k", "3", "--l", "3",
+                      "--workers", "1", "--chunk", "1", "--base-seed", "999", "--out-dir", out])
+    with pytest.raises(SystemExit):                                  # mismatched spec (k)
+        datagen.main(["--games", "1", "--resume", "--mode", "hybrid", "--k", "4", "--l", "3",
+                      "--workers", "1", "--chunk", "1", "--base-seed", "500", "--out-dir", out])
