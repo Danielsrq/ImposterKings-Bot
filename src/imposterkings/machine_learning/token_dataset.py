@@ -37,13 +37,19 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
     offsets = [0]
     board, phase, action = [], [], []
     y, w, z, gid, did, chosen = [], [], [], [], [], []
-    n_games = dec_id = total_tokens = 0
+    n_games = n_skipped = dec_id = total_tokens = 0
     for f in files:
         for rec in read_jsonl(f):
             g = rec["deal_seed"]
             rewards = rec["rewards"]
             st = GameState.deal(np.random.default_rng(g))
+            mark = (len(cards_chunks), len(offsets), len(board), total_tokens, dec_id)
+            desynced = False
             for d in rec["decisions"]:
+                a = dict_to_action(d["chosen"])
+                if a not in st.legal_moves():
+                    desynced = True                    # corpus recorded under different rules -> drop game
+                    break
                 cands = d.get("candidates") or []
                 if cands:                              # a real (searched) decision
                     view = st.information_set(d["seat"])
@@ -56,12 +62,23 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
                         y.append(c["mean_q"]); w.append(c["visit_share"]); z.append(rewards[d["seat"]])
                         gid.append(g); did.append(dec_id); chosen.append(int(c["move"] == d["chosen"]))
                     dec_id += 1
-                st = st.apply(dict_to_action(d["chosen"]))
+                st = st.apply(a)
+            if desynced:                               # roll this game's rows back entirely
+                c0, o0, r0, t0, dec_id = mark
+                del cards_chunks[c0:]; del offsets[o0:]
+                for lst in (board, phase, action, y, w, z, gid, did, chosen):
+                    del lst[r0:]
+                total_tokens = t0
+                n_skipped += 1
+                continue
             n_games += 1
             if limit and n_games >= limit:
                 break
         if limit and n_games >= limit:
             break
+    if n_skipped:
+        print(f"  WARNING: skipped {n_skipped} game(s) whose recorded actions are no longer legal "
+              f"(corpus predates an engine rules change) -- rows rolled back, remaining games kept")
 
     cards = (np.concatenate(cards_chunks, axis=0).astype(np.float32) if cards_chunks
              else np.zeros((0, CARD_DIM), np.float32))
@@ -78,8 +95,8 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
     np.savez_compressed(out_path, **arrs)
     meta = {"card_dim": CARD_DIM, "board_dim": BOARD_DIM, "phase_dim": PHASE_DIM,
             "action_dim": ACTION_DIM, "target": "q", "n_rows": int(arrs["y"].shape[0]),
-            "n_games": n_games, "n_decisions": dec_id, "total_card_tokens": int(cards.shape[0]),
-            "source": data_dir}
+            "n_games": n_games, "n_skipped_desynced": n_skipped, "n_decisions": dec_id,
+            "total_card_tokens": int(cards.shape[0]), "source": data_dir}
     with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1)
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
