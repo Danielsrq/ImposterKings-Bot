@@ -35,7 +35,11 @@ def parse_spec(s: str) -> Spec:
 
 
 def parse_opponent(s: str) -> Spec:
-    """A `.pt` path -> ('nn', path) (an NN opponent, e.g. self-play); else an MCTS spec string."""
+    """'ckpt.pt@hybrid-k20-l3' -> ('nnmcts', path, budget_spec): the net AS AN MCTS eval/policy head at
+    that budget. A bare `.pt` path -> ('nn', path) (a GREEDY net, no search). Else an MCTS spec string."""
+    if "@" in s and s.split("@", 1)[0].endswith(".pt"):
+        path, budget = s.split("@", 1)
+        return ("nnmcts", path, parse_spec(budget))
     return ("nn", s) if s.endswith(".pt") else parse_spec(s)
 
 
@@ -43,6 +47,11 @@ def _make_agent(spec: Spec, evaluator=None):
     if spec[0] == "nn":
         from .agent import NNAgent
         return NNAgent.from_checkpoint(spec[1])
+    if spec[0] == "nnmcts":                            # NN-MCTS opponent: its own evaluator + budget
+        b = spec[2]
+        budget = None if b[0] == "fixed" else make_budget(b[0], k=b[1], l=b[2])
+        its = b[1] if b[0] == "fixed" else 1000
+        return MCTSAgent(iterations=its, budget=budget, evaluator=_evaluator_for(spec[1]))
     if spec[0] == "fixed":
         return MCTSAgent(iterations=spec[1], evaluator=evaluator)
     return MCTSAgent(budget=make_budget(spec[0], k=spec[1], l=spec[2]), evaluator=evaluator)

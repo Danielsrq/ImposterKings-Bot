@@ -59,3 +59,20 @@ def test_benchmark_smoke_endtoend(tmp_path):
                 nn_mcts="hybrid-k20-l3")
     assert res[0]["opponent"] == "vanilla" and res[0]["games"] == 4
     assert 0.0 <= res[0]["winrate"] <= 1.0
+
+
+def test_parse_opponent_nnmcts_spec():
+    assert B.parse_opponent("models/mlp_256.pt@hybrid-k20-l3") == \
+        ("nnmcts", "models/mlp_256.pt", ("hybrid", 20, 3))
+    assert B.parse_opponent("m.pt@fixed50") == ("nnmcts", "m.pt", ("fixed", 50))
+    assert B.parse_opponent("models/mlp_32.pt") == ("nn", "models/mlp_32.pt")   # bare .pt stays greedy
+    assert B.parse_opponent("hybrid-k20-l3") == ("hybrid", 20, 3)
+
+
+def test_benchmark_nnmcts_opponent_endtoend(tmp_path):
+    # the OPPONENT is itself an NN-MCTS (net as eval head in search) -- 1 deal, tiny budgets
+    ck = _ckpt(tmp_path)
+    res = B.run(ckpt=ck, opponents=[("nnmcts-opp", B.parse_opponent(f"{ck}@fixed30"))],
+                deals=1, chunk=1, workers=1, base_seed=0, independent_rng=True,
+                nn_mcts="fixed30")
+    assert res[0]["games"] == 2 and 0.0 <= res[0]["winrate"] <= 1.0

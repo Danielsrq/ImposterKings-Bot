@@ -118,6 +118,85 @@ card↔card attention rows causal (layer-1 → layer-2 CLS), so swapping to it l
 
 ---
 
+## Study 3 (v4) — d_model × heads sweep (FFN fixed 128), new MLP256-MCTS baseline
+
+Vary width (`d_model` 96/128) × heads (4/8) at L=1, FFN 128; then the top-2 by winrate retrained at L=2.
+Same dataset/hypers as Study 2. **NEW eval opponent: `MLP256-MCTS@k20-l3`** (the MLP-256 net as the MCTS
+leaf evaluator — comparable strength to vanilla-MCTS but ~20% faster games; MLP256 chosen over MLP32 after
+a speed check: 0.204 vs 0.119 ms/eval ≈ ~3% of game time, negligible). **Winrates below are NOT comparable
+to Studies 1–2** (different opponent) — the v2 anchor row calibrates the change: v2 scores 57.5% vs vanilla
+but 48.5% vs this opponent.
+
+| variant | config (d/h/L) | head_dim | params | train-time | epochs | val_mse | top1_bestq | recall@2 | spearman | **winrate (± 95% CI)** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **v2** (anchor) | 64 / 4 / 1 | 16 | 42,945 | 2018 s | 50 | 0.0647 | 51.3% | 75.8% | 0.434 | **48.5% (± 4.9%)** |
+| **v4a** | 96 / 4 / 1 | 24 | 79,329 | 768 s | 10 | 0.0722 | 49.7% | 75.4% | 0.415 | **51.0% (± 5.6%)** |
+| **v4b** | 96 / 8 / 1 | 12 | 79,329 | 1456 s | 17 | 0.0690 | 51.2% | 75.4% | 0.407 | **50.0% (± 5.7%)** |
+| **v4c** | 128 / 4 / 1 | 32 | 122,113 | 813 s | 9 | 0.0713 | 48.6% | 74.3% | 0.395 | **47.0% (± 6.0%)** |
+| **v4d** | 128 / 8 / 1 | 16 | 122,113 | 2343 s | 24 | 0.0634 | 52.5% | 76.8% | 0.440 | **52.5% (± 5.5%)** |
+| **v4d-L2** | 128 / 8 / **2** | 16 | 221,697 | 1379 s | 8 | 0.0692 | 51.2% | 75.9% | 0.427 | **48.0% (± 5.2%)** |
+| **v4a-L2** | 96 / 4 / **2** | 24 | 141,761 | 3207 s | 25 | **0.0603** | **53.7%** | **77.3%** | **0.465** | **50.5% (± 5.5%)** |
+| **v3c** (re-anchor) | 64 / 4 / 2, ffn**256** | 16 | 111,233 | 2088 s | 17 | 0.0628 | 51.2% | 76.6% | 0.422 | **50.0% (± 5.4%)** |
+| **v4e** | 128 / 8 / **2**, ffn**256** | 16 | 287,489 | 4719 s | 23 | **0.0581** | 53.6% | 77.0% | 0.458 | **54.0% (± 5.2%)** |
+
+Raw head-to-head detail + **inference cost** (vs `MLP256-MCTS@k20-l3`, 100 mirrored deals = 200 games,
+10 workers; the opponent is IDENTICAL in every match, so CPU-s/game differences across rows are the
+challenger's own eval cost — an empirical inference-cost column, sorted by winrate):
+
+| variant | config (d/h/L/ffn) | params | wins | winrate | ci95 | split% | **CPU s/game** | rel. cost vs v2 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **v4e** | 128/8/2/256 | 287,489 | 108/200 | **0.540** | ±0.052 | 72% | 138.1 | 1.48× |
+| v4d | 128/8/1/128 | 122,113 | 105/200 | 0.525 | ±0.055 | 69% | 102.6 | 1.10× |
+| v4a | 96/4/1/128 | 79,329 | 102/200 | 0.510 | ±0.056 | 68% | 95.5 | 1.02× |
+| v4a-L2 | 96/4/2/128 | 141,761 | 101/200 | 0.505 | ±0.055 | 69% | 116.4 | 1.25× |
+| v3c (re-anchor) | 64/4/2/256 | 111,233 | 100/200 | 0.500 | ±0.054 | 70% | 120.6 | 1.29× |
+| v4b | 96/8/1/128 | 79,329 | 100/200 | 0.500 | ±0.057 | 66% | 98.7 | 1.06× |
+| v2 (anchor) | 64/4/1/128 | 42,945 | 97/200 | 0.485 | ±0.049 | 75% | 93.5 | 1.00× |
+| v4d-L2 | 128/8/2/128 | 221,697 | 96/200 | 0.480 | ±0.052 | 72% | 128.1 | 1.37× |
+| v4c | 128/4/1/128 | 122,113 | 94/200 | 0.470 | ±0.060 | 62% | 98.6 | 1.05× |
+
+**Inference cost is driven by LAYERS, not params** (CPU, dispatch-bound per Study 1): all L=1 models cost
+93–103 s/game despite a 3× param range (v4d = 2.8× v2's params for +10% cost), while every L=2 model
+steps to 116–128 s/game (+25–37%) — v3c has FEWER params than v4d yet costs ~18% more per game. A second
+layer doubles the count of sequential ops (each paying kernel dispatch); widening matrices barely moves a
+dispatch-bound kernel. Params correlate with cost only WITHIN a depth. The strength-per-cost frontier:
+v4d (52.5% at 1.10×) vs v4e (54.0% at 1.48×) — v4e buys ~+1.5pp point-estimate for ~+35% inference cost.
+
+### Findings
+
+1. **More heads > fatter heads.** At both widths, 8 heads beat 4 on winrate and proxies where it matters:
+   d128/h8 (head_dim 16) is the study's best (52.5%); d128/h4 (head_dim 32) is its worst (47.0%). This
+   matches the head_dim≈16 sweet spot: capacity spent on MORE lenses pays; wider lenses don't.
+2. **Depth again fails to convert.** Retraining the top-2 at L=2 didn't help play: v4d 52.5%→48.0%,
+   v4a 51.0%→50.5% — echoing Study 2's v3a. v4a-L2 posts the study's BEST proxies (top1 53.7%, val_mse
+   0.0603, recall 77.3%) yet mid-pack winrate — the proxies≠strength gap, again, with the widest
+   train/val gap of the study (+0.0086, overfitting).
+3. **No variant clearly beats the new baseline.** Everything sits within ±6% of 50% with overlapping CIs;
+   v4d (d128/h8/L1) is the point-estimate winner and the natural deploy candidate if any switch is made,
+   but 200 games cannot separate it from v4a/v2 with confidence.
+4. **The MLP256-MCTS opponent is measurably harder than vanilla**: v2 drops 57.5% → 48.5% (its games are
+   also ~cheaper per the Study-1 numbers, which is why it was adopted).
+5. **v3c re-anchored at 50.0%** (2026-07-11) — read this carefully: winrate is opponent-relative, not
+   absolute. Calibration from the two models measured on BOTH scales: v2 57.5%→48.5% (−9pp),
+   v3c 62.0%→50.0% (−12pp). By that offset, v4d's 52.5% here maps to roughly **~61–65% vs vanilla** —
+   likely at or above v3c's 62%. And 50% against a search guided by a 57%-vs-vanilla net IS strength
+   (parity with that agent), not failure. What the re-anchor establishes is only relative: on the shared
+   scale v3c does not stand above v4d (ranking: v4d 52.5 > v4a 51.0 > v4a-L2 50.5 > v3c = v4b 50.0 >
+   v2 48.5 ≈ v4d-L2 48.0 > v4c 47.0, all CIs overlapping). The 3pp difference in the two models' drops is
+   well within noise — this cannot distinguish "v3c's Study-2 lead was noise" from "v3c and v4d are both
+   strong and flip order within noise". A decisive crowning needs a bigger direct match (300–500 mirrored
+   deals, v4d vs v3c head-to-head).
+6. **v4e (d128/h8/L2/ffn256, 2026-07-12): the depth×width interaction REPLICATES — 54.0% (±5.2), the
+   study's best winrate AND best proxies** (val_mse 0.0581 = program record, top1 53.6%). The pattern now
+   holds on two bases and two opponent scales: L2 with ffn128 hurts (v4d 52.5→v4d-L2 48.0), L2 with
+   ffn256 helps (v3b→v3c on d64 vs vanilla; v4d→v4e here). Reading: a second layer only pays if its FFN
+   is wide enough to use the extra mixing. First study where the proxy leader and the winrate leader are
+   the SAME model. Costs: largest model (287k params, 1.48× v2 inference, +25% eval time) and the widest
+   overfit gap yet (+0.0109). v4e vs v2 is +5.5pp with CIs [48.8, 59.2] vs [43.6, 53.4] — still not a
+   statistically clean separation; the decisive test remains a big direct match (v4e vs v2/v4d).
+
+---
+
 ## Metric glossary
 
 - **winrate** — fraction of games the challenger wins vs vanilla-MCTS@k20 (mirrored; 200 games). ± is the
@@ -331,3 +410,14 @@ And the bra-ket analogy is genuinely apt, not just vibes: with c_j = ⟨u|v_j⟩
 $$\langle u | o_0\rangle = \Big\langle u \Big| \sum_j A_j, v_j \Big\rangle = \sum_j A_j ,\langle u | v_j\rangle$$
 
 — a linear functional distributing over a superposition, exactly the manipulation you'd do expanding a state in components and evaluating an overlap term-by-term. ⟨u| is the fixed "measurement" (the readout direction), the |v_j⟩ are the components, A_j the mixture weights, and the attribution is just reading the expectation before collapsing the sum. The place the analogy (and the method) hard-stops is the same place linearity stops: the softmax that made A and the FFN/tanh are nonlinear, so no bra-ket games survive passing through them — which is precisely why the attribution is scoped to "attention path, last layer, pre-tanh."
+
+# Beliefs
+When the opponent takes action a:
+
+
+$$b'(w) \propto b(w)\times\underbrace{\mathbb{1}\left[a \in \text{legal}(w)\right]}_{\text{deduction: 0 or 1}}\times \underbrace{\pi_{opp}\left(a \mid I_{opp}(w)\right)}_{\text{likelihood}}$$
+
+then renormalize (and mechanically transition each world: x moves from hand to stack). Two components:
+
+- Deduction (free, exact): worlds where they couldn't have done a → probability 0. This is card-counting — what our hand_has/hand_lacks already does as hard logic.
+- Likelihood (the new part): among the surviving worlds, weight by how probable that action was in each world.
