@@ -151,3 +151,11 @@ def test_kingshand_removed_cards_leave_the_determinization_pool():
                       | {x for x in d.hidden if x is not None}
                       | {x for x in d.setup_discard if x is not None})
             assert not (gone & placed)
+
+
+def test_muted_assassin_cannot_react_to_king_flip():
+    from imposterkings.actions import FLIP_KING, REVEAL_ASSASSIN as _RA
+    st = mainstate(hand0=(cid("Fool"),), hand1=(cid("Assassin"),), stack=(sc("Queen"),),
+                   hidden=(cid("Zealot"), None), muted={2})          # value 2 muted -> reaction stripped
+    st = run(st, FLIP_KING)
+    assert _RA not in st.legal_moves()                               # only the decline formality remains

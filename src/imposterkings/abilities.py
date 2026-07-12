@@ -74,12 +74,20 @@ def _know_drop(knowledge, seat: int, name: str):
 
 # --- legality (shared by generate.py and the win check) --------------------------------
 
+def _is_muted(state: GameState, card: int) -> bool:
+    """Mystic muting strips abilities AND tags: a muted card is a bare value-3 card everywhere --
+    no play overrides, no on-play triggers, no reactions (the reaction gate lives in generate)."""
+    return cards.card_value(card) in state.muted_values
+
+
 def _can_play(state: GameState, card: int, player: int,
               v_top: Optional[int], lead, lead_royalty: bool) -> bool:
     if v_top is None:
         return True  # empty stack: first/fresh play is unrestricted
     if state.effective_hand_value(card) >= v_top:
         return True
+    if _is_muted(state, card):
+        return False  # muted: bare value-3 card -- no ability overrides below
     ability = cards.card_ability(card)
     if ability == Ability.OATHBOUND and v_top > 6 and len(state.hands[player]) >= 2:
         return True  # disgrace the beaten card; Oathbound sits at 6, then play any card (needs a 2nd)
@@ -116,9 +124,10 @@ def _land(state: GameState, card: int, actor: int, *, ascended: bool, v_top: Opt
     stays live at value 6, and the substep is the free follow-up play. An ASCENDED Oathbound (from the
     antechamber) does NOT trigger this -- ascension already let it beat the card -- so it just lands at
     6 with no ability. Otherwise the card lands (Warlord at 9 if royalty present) and optional abilities
-    yield an ABILITY_MAY substep; Queen disgraces beneath immediately.
+    yield an ABILITY_MAY substep; Queen disgraces beneath immediately. A MUTED card triggers nothing --
+    it lands as a bare value-3 card (no override, no guess, no ability window).
     """
-    ability = cards.card_ability(card)
+    ability = None if _is_muted(state, card) else cards.card_ability(card)
 
     if (not ascended) and ability == Ability.OATHBOUND and v_top is not None and v_top > 6:
         new_hand = _without(state.hands[actor], card)

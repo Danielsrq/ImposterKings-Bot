@@ -221,3 +221,65 @@ def test_princess_no_window_when_opponent_hand_empty():
     st = run(st, _play(cid("Princess")))
     assert st.pending and st.pending[-1].kind != StepKind.ABILITY_MAY   # no window; opponent to move
     assert cid("Fool") in st.hands[0]                              # nothing traded
+
+
+# --- Mystic muting strips abilities EVERYWHERE (not just reactions) ---------------------------------
+
+def test_muted_oathbound_loses_its_override():
+    # muted 6s: the Oathbound is a bare value-3 card -- it must NOT play over a bigger card.
+    st = mainstate(hand0=(cid("Oathbound"), cid("Fool")), hand1=(cid("Soldier"),),
+                   stack=(sc("Warlord"),), muted={6})           # lead 7 > 3, no override
+    plays = [a.card for a in st.legal_moves() if a.kind == ActionKind.PLAY_CARD]
+    assert cid("Oathbound") not in plays
+    # positive control: unmuted, the override applies (hand >= 2)
+    st2 = mainstate(hand0=(cid("Oathbound"), cid("Fool")), hand1=(cid("Soldier"),),
+                    stack=(sc("Warlord"),))
+    assert cid("Oathbound") in [a.card for a in st2.legal_moves() if a.kind == ActionKind.PLAY_CARD]
+
+
+def test_muted_elder_cannot_play_over_royalty():
+    st = mainstate(hand0=(cid("Elder"), cid("Fool")), hand1=(cid("Soldier"),),
+                   stack=(sc("Queen"),), muted={3})
+    assert cid("Elder") not in [a.card for a in st.legal_moves() if a.kind == ActionKind.PLAY_CARD]
+
+
+def test_muted_zealot_cannot_play_over_nonroyalty():
+    st = mainstate(hand0=(cid("Zealot"), cid("Fool")), hand1=(cid("Soldier"),),
+                   stack=(sc("Warlord"),), kings=(True, False), muted={3})
+    assert cid("Zealot") not in [a.card for a in st.legal_moves() if a.kind == ActionKind.PLAY_CARD]
+
+
+def test_muted_soldier_lands_without_guess():
+    # muted 5s: Soldier plays as a bare 3 (legal over an Elder lead) and triggers NO guess step.
+    st = mainstate(hand0=(cid("Soldier"), cid("Fool")), hand1=(cid("Judge"),),
+                   stack=(sc("Elder"),), muted={5})
+    st = run(st, _play(cid("Soldier")))
+    assert st.pending and st.pending[-1].kind == StepKind.MAIN and st.to_play == 1   # turn just passes
+
+
+def test_every_muted_card_lands_silently_and_at_value_3():
+    # Systematic sweep: EVERY mutable card (base <= 8; 9s can never be muted), played while muted, must
+    # land as a bare value-3 card -- no guess, no ability window, no override/follow-up, no value buff
+    # (royalty sits beneath so a Warlord WOULD land buffed if muting failed to strip it).
+    mutable = [n for n in cards.CARD_NAMES if cards.card_value(cid(n)) <= 8]
+    for name in mutable:
+        base = cards.card_value(cid(name))
+        lead = sc("Zealot") if name == "Fool" else sc("Fool")        # a lead the muted 3 can beat
+        filler = cid("Elder", 1) if name == "Elder" else cid("Elder")
+        st = mainstate(hand0=(cid(name), filler), hand1=(cid("Judge"),),
+                       stack=(sc("Queen"), lead), muted={base})
+        st = run(st, _play(cid(name)))
+        assert st.pending and st.pending[-1].kind == StepKind.MAIN and st.to_play == 1, \
+            f"{name}: muted play must end the turn silently (got {st.pending[-1].kind})"
+        assert st.leading_value() == 3, f"{name}: muted card must lead at 3 (got {st.leading_value()})"
+
+
+def test_muted_card_ascends_silently():
+    # A muted Soldier queued in the antechamber: the forced ascension must not trigger the guess.
+    st = mainstate(hand0=(cid("Fool"),), hand1=(cid("Elder"),), stack=(sc("Zealot"),),
+                   antechambers=((cid("Soldier"),), ()), muted={5}, to_play=1)
+    st = run(st, _play(cid("Elder")))                                # P1 plays; P0's turn -> forced ASCEND
+    assert st.pending and st.pending[-1].kind == StepKind.ASCEND
+    st = run(st, st.legal_moves()[0])
+    assert st.pending[-1].kind == StepKind.MAIN and st.to_play == 1  # landed silent; P1 to move
+    assert st.leading_value() == 3                                   # ascended muted Soldier leads at 3
