@@ -197,6 +197,159 @@ v4d (52.5% at 1.10×) vs v4e (54.0% at 1.48×) — v4e buys ~+1.5pp point-estima
 
 ---
 
+## Featurization v2.2 — design record (pinned 2026-07-12, pre-implementation)
+
+Redesign of the token encoding, co-designed in discussion; to be implemented as a parallel featurizer
+(`features2.py`) and A/B'd against v1 on the gen-1 corpus (same logs, same v3c architecture).
+
+### Motivation
+
+1. **Attendable absence.** v1 tokenizes only visible things: attention cannot attend to what *doesn't*
+   exist — "the fear of the unseen Assassin" has no token, while the Assassin's holder can attend to it
+   directly. Absence must become an ordinary, attendable state, not a hole in the input.
+2. **Stable axes.** v1's variable-length token set reshuffles every ply, so the drawer's heatmap axes
+   jump around. A fixed token universe gives every card a permanent row/column for the whole game.
+3. **Entity ontology.** Muting, committed sub-decision context (which ability is resolving, what was
+   guessed), and the kings are properties OF entities; v1 encodes them as global flags/one-hots.
+4. Design notes settled on the way: a ghost that differs from a live token by ONE boolean is fragile —
+   presence/absence should be a whole ZONE block, not a bit; redundant duplicated dims only buy
+   *initialization salience* (~sqrt-k effective weight scale), never expressiveness — prefer structure
+   (blocks/zones) over width; per-name ghost tokens were superseded by the cleaner fixed-instance design.
+
+### Sequence layout — S = 24, FIXED (no padding, no mask)
+
+    [ CLS | 18 x card(46) | 2 x king(4) | board(4) | phase(15) | action(51) ]
+
+The token set IS the deck: 18 instance tokens, one per physical card, present from deal to game over.
+
+### Card instance token — 46 dims
+
+| block | dims | fill rule |
+|---|---:|---|
+| name one-hot | 14 | identity; constant all game |
+| power / 9 | 1 | EFFECTIVE value (mute -> 3/9; Warlord buff / Soldier +2 on-board) |
+| base / 9 | 1 | immutable printed value (mute-independent) |
+| mechanic signature | 8 | `royalty, reaction, optional_onplay, guess_info, heavy, stack_target, mutes_others, followup` — **all zeroed while muted** ("mute-as-deletion": the featurizer mirrors the engine rule of commit bcf59ff; a muted Assassin's reaction bit is 0 and the fear goes cold) |
+| state flags | 10 | `is_muted` (kept explicit), `disgraced`, `is_leading`, `stack_depth` (scaled), `is_legal_now`, `is_candidate_action`, `pending_selected`, `pending_source`, `pending_guess_target`, `pending_mute_target` |
+| **zone posterior** | 12 | probability over `[my_hand, my_hidden, my_setup, their_hand, their_hidden, their_setup, my_ante, their_ante, stack, discard, faceup, facedown]` — **delta if seen; hypergeometric (slot-proportional) spread over the hidden zones if unseen**, reshaped by `hand_has`/`hand_lacks`; always sums to 1 |
+
+Zone-posterior properties: observer-relative (one net, both seats); computed from counts + knowledge only
+(**determinization-invariant** — the tokenize-once guarantees carry over); "unknown" is not a zone but
+*entropy in the block*; this slot is the **belief-net socket** (uniform counting now, learned marginals
+later, schema unchanged). Example (7 unseen cards; their slots = hand 4 / hidden 1 / setup 1 / facedown 1):
+unseen Assassin -> `their_hand .571, their_hidden .143, their_setup .143, facedown .143`; a WRONG
+Soldier-guess on "Assassin" zeroes `their_hand` -> `1/3, 1/3, 1/3` over the rest; a reveal collapses to
+the `discard` delta. The fear of the Assassin = reaction bit hot x posterior mass in their hidden zones.
+
+**Canonical duplicate rule** (exchangeability): hidden copies of 2-copy names are indistinguishable from
+the infoset — known locations deterministically fill the LOWER instance slot. Same infoset -> same
+encoding; no fabricated instance information.
+
+### King tokens — 2 x 4 dims
+
+`[owner mine/theirs (2) | flipped | flip_legal_now]` — kings are the players' lives, promoted to
+entities. Payoff: the game-deciding **Assassin <-> king attention edge** ("can't flip safely while the
+Assassin is unseen") becomes visible and dq-creditable.
+
+### Board token — 4 dims (was 14)
+
+`own_hand_size/8, opp_hand_size/7, is_my_turn, is_reaction_window`. The muted-values multi-hot is
+DROPPED — in v2 it is fully derivable (all 18 cards always carry their mute state); in v1 it was needed
+precisely because unseen muted cards had no tokens. Kings moved out to their own tokens.
+
+### Phase token — 15 dims (was 53): step-kind only
+
+The committed sub-decision context migrates onto the entities it concerns, as **transient chain-scoped
+flags** (all-zero outside their windows; invariant: at most one `pending_source` at any time):
+
+| v1 phase field | v2 home |
+|---|---|
+| ability source (14) | `pending_source` on the resolving card |
+| declared guess (14) | `pending_guess_target` on the guessed name's instances |
+| declared number (8) | `pending_mute_target` on every instance of that base value |
+| `limit`, `chosen` (2) | derivable: `pending_selected` flags + source identity |
+| step-kind (15) | **stays** — the only truly global phase fact |
+
+Rationale: phase context is *committed* state of the current chain (mine or the opponent's), distinct
+from the *candidate* action being scored (the action token, unchanged prong-B 51 dims). Worked example —
+the King's-Hand window after "Soldier guesses Warlord": Soldier carries `pending_source`, the threatened
+Warlord `pending_guess_target`, the defender's KH is the candidate — the decision is the attention
+triangle between three stable heatmap positions.
+
+### Deferred (with re-open triggers)
+
+- **Ability tokens (Stage B)** — cards as nouns / abilities as verbs. Dropped for now: zero new
+  information at 14 fixed names (ability = f(name), already learned), ~4x attention-cell cost, and the
+  activation-parameter fields belong to the action token. Salvaged in feature form: the mechanic
+  signature stays on the card, and muting ZEROES it (the deletion elegance without the tokens).
+  Re-open if: the card pool grows (variant rulesets), a LISA-style supervised combo-head experiment
+  wants typed verb tokens, or a diagnosed ability-interaction misplay resists feature-level fixes.
+- Phase-token slimming beyond step-kind: done by the migration above (Stage C absorbed).
+
+### Expected costs
+
+Attention cells ~13^2 -> 24^2 (~+50-70% per-leaf eval; partially offset by dropping the mask and ragged
+storage). Fixed shapes should SPEED training (the GPU DataLoader/collate was the measured bottleneck).
+Dataset rebuild + retrain: minutes (same JSONL logs — featurization never touches the corpus).
+
+---
+
+## Study 4 (gen-1) — AlphaZero-style bootstrap of v3c + featurization v2.2 A/B (2026-07-12)
+
+**Corpus (gen-1):** 2,000 self-play games by `v3c-MCTS@hybrid-k20-l3` (the gen-0 v3c checkpoint as leaf
+evaluator/policy prior), seeds 10,000,000–10,001,999, temp_plies 6, generated in two resumable 1,000-game
+batches on the **mute-fixed engine** (bcf59ff) — no merge with the gen-0 corpus (recorded pre-fix).
+Replayed once, featurized twice (log-once/derive-many): **236,647 rows / 41,807 decisions, 0 desync
+skips**, identical row sets for both featurizations — the A/B differs ONLY in encoding. Same arch
+everywhere: v3c = d64/h4/L2/ffn256. GPU training (RTX 3060 Ti), same hypers as Studies 2–3.
+
+| model | feat | params | train-time | epochs | val_mse | top1_bestq | recall@2 | spearman | **anchor winrate** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| gen1-v1feat | v1 | 111,233 | 167 s | 19 | 0.0435 | **53.8%** | 77.4% | 0.448 | **54.5% (± 5.4%)** |
+| gen1-v2feat | v2.2 | 108,737 | **69 s** | 17 | **0.0355** | 53.1% | **79.7%** | **0.469** | **52.5% (± 6.1%)** |
+
+(val_mse is NOT comparable to Studies 2–3 — different corpus, different label distribution. Anchor =
+`MLP256-MCTS@k20-l3`, same 100 mirrored deals/base-seed as Study 3, where gen-0 v3c scored 50.0%.)
+
+Direct head-to-heads (100 mirrored deals = 200 games, hybrid-k20-l3 both sides):
+
+| match | wins | winrate | ci95 | split% |
+|---|---:|---:|---:|---:|
+| gen1-v1feat vs **gen0-v3c** | 97/200 | **48.5%** | ±4.9% | 75% |
+| gen1-v2feat vs **gen1-v1feat** | 100/200 | **50.0%** | ±5.0% | 74% |
+
+### Findings
+
+1. **The bootstrap did not produce a measurable strength gain.** The anchor read (+4.5pp, 54.5 vs
+   gen-0's 50.0) flatters it, but the direct match is the sharper instrument and says parity: 48.5%
+   (±4.9) with 75% of deals split. Verdict: gen-1 ≈ gen-0 within noise after one generation at the same
+   search budget. Caveat both ways: gen-1's labels came from a v3c-guided search (stronger searcher than
+   gen-0's corpus generator), but one generation of 2,000 games at k20-l3 is a small step — AlphaZero-style
+   loops typically need several generations and/or bigger search budgets per label to climb. Note the
+   **confound**: gen-1 also trains on post-mute-fix rules, so any gain/loss mixes "bootstrap" with
+   "corrected mute knowledge" (rare states; chosen deliberately — no gen-0 merge).
+2. **Featurization v2.2 = v1 on strength, better on everything else.** Exact parity head-to-head
+   (100/200) and overlapping anchors — but on IDENTICAL training rows v2.2 posts **−18% val_mse**
+   (0.0355 vs 0.0435), **+2.3pp recall@2**, **+0.021 spearman**, with ~2% fewer params, **2.15× faster
+   GPU epochs** (4.1 vs 8.8 s — the fixed shapes removed the ragged-collate bottleneck, as predicted in
+   the design record) and per-leaf inference parity (10.9 vs 10.9 ms/leaf measured under contention;
+   S=24 costs what the mask/ragged removal saves). Adoption case for v2.2 is therefore NOT winrate: it is
+   fit quality + training speed + the explainability properties it was designed for (fixed axes, zone
+   posteriors as attendable beliefs, kings as entities, belief-net socket).
+3. **Timing footnote (affects earlier absolute numbers):** during this study we found Windows 11 had been
+   E-core-throttling all background-launched runs (10 workers confined to 4 E-cores). De-throttled,
+   datagen runs 42.3 s/game (9.7× parallel speedup) and anchor evals ~25 s/game. Study-3's CPU-s/game
+   column was measured throttled — its RELATIVE comparisons stand (uniform conditions), absolutes are
+   inflated. NN-vs-NN direct matches cost ~2× an anchor eval (~48 s/game, both sides pay NN dispatch).
+   **Clean unthrottled per-agent costs** (symmetric self-play, 40 games, same deals, greedy k20-l3):
+   vanilla 13.0 s/game (6.5/side) · MLP256-MCTS 8.6 (4.3/side — CHEAPER than vanilla; the 0.2 ms numpy
+   eval undercuts l=3 rollouts, replicating Study 1) · v3c-MCTS(v2feat) 44.1 (22.0/side ≈ 5× MLP —
+   ~20k leaf evals/side at ~1.1 ms; torch dispatch). Additive decomposition from MIXED pairings fails
+   (solves to negative vanilla cost): game length varies by matchup (MLP+vanilla totals 7.1 s/game <
+   vanilla self-play's 13.0) — use symmetric matches for per-agent cost.
+
+---
+
 ## Metric glossary
 
 - **winrate** — fraction of games the challenger wins vs vanilla-MCTS@k20 (mirrored; 200 games). ± is the

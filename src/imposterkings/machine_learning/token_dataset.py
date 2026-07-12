@@ -25,7 +25,11 @@ from ..state import GameState
 from .features import ACTION_DIM, BOARD_DIM, CARD_DIM, PHASE_DIM, tokenize
 
 
-def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
+def build(data_dir: str, out_path: str, limit: Optional[int] = None, feat: str = "v1") -> Dict:
+    """``feat="v2"`` builds FIXED-shape rows via ``features2.tokenize`` (cards [n,18,46] + kings
+    [n,2,4], no ragged offsets); "v1" is the original variable-length path, byte-identical."""
+    if feat == "v2":
+        return _build_v2(data_dir, out_path, limit)
     files = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
     try:
         from tqdm import tqdm
@@ -102,12 +106,87 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
 
 
+def _build_v2(data_dir: str, out_path: str, limit: Optional[int]) -> Dict:
+    """The v2 (fixed-18) build: same replay/skip-on-desync logic, fixed-shape output arrays."""
+    from .features2 import tokenize as tokenize2
+    files = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
+    try:
+        from tqdm import tqdm
+        files = tqdm(files, desc="shards", unit="shard")
+    except Exception:
+        pass
+
+    cards, kings, board, phase, action = [], [], [], [], []
+    y, w, z, gid, did, chosen = [], [], [], [], [], []
+    n_games = n_skipped = dec_id = 0
+    for f in files:
+        for rec in read_jsonl(f):
+            g = rec["deal_seed"]
+            rewards = rec["rewards"]
+            st = GameState.deal(np.random.default_rng(g))
+            mark = (len(cards), dec_id)
+            desynced = False
+            for d in rec["decisions"]:
+                a = dict_to_action(d["chosen"])
+                if a not in st.legal_moves():
+                    desynced = True
+                    break
+                cands = d.get("candidates") or []
+                if cands:
+                    view = st.information_set(d["seat"])
+                    for c in cands:
+                        t = tokenize2(view, dict_to_action(c["move"]))
+                        cards.append(t.cards); kings.append(t.kings)
+                        board.append(t.board); phase.append(t.phase); action.append(t.action)
+                        y.append(c["mean_q"]); w.append(c["visit_share"]); z.append(rewards[d["seat"]])
+                        gid.append(g); did.append(dec_id); chosen.append(int(c["move"] == d["chosen"]))
+                    dec_id += 1
+                st = st.apply(a)
+            if desynced:
+                r0, dec_id = mark
+                for lst in (cards, kings, board, phase, action, y, w, z, gid, did, chosen):
+                    del lst[r0:]
+                n_skipped += 1
+                continue
+            n_games += 1
+            if limit and n_games >= limit:
+                break
+        if limit and n_games >= limit:
+            break
+    if n_skipped:
+        print(f"  WARNING: skipped {n_skipped} desynced game(s) (corpus predates a rules change)")
+
+    from .features2 import ACTION_DIM as AD2, BOARD_DIM as BD2, CARD_DIM as CD2, PHASE_DIM as PD2
+    arrs = dict(
+        cards=(np.stack(cards) if cards else np.zeros((0, 18, CD2), np.float32)).astype(np.float32),
+        kings=(np.stack(kings) if kings else np.zeros((0, 2, 4), np.float32)).astype(np.float32),
+        board=np.asarray(board, np.float32).reshape(-1, BD2),
+        phase=np.asarray(phase, np.float32).reshape(-1, PD2),
+        action=np.asarray(action, np.float32).reshape(-1, AD2),
+        y=np.asarray(y, np.float32), w=np.asarray(w, np.float32), z=np.asarray(z, np.float32),
+        game_id=np.asarray(gid, np.int64), decision_id=np.asarray(did, np.int64),
+        is_chosen=np.asarray(chosen, np.int8),
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    np.savez_compressed(out_path, **arrs)
+    meta = {"feat": "v2", "card_dim": CD2, "board_dim": BD2, "phase_dim": PD2, "action_dim": AD2,
+            "target": "q", "n_rows": int(arrs["y"].shape[0]), "n_games": n_games,
+            "n_skipped_desynced": n_skipped, "n_decisions": dec_id,
+            "total_card_tokens": int(arrs["y"].shape[0]) * 18, "source": data_dir}
+    with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=1)
+    return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
+
+
 class TokenRows:
-    """A loaded token dataset: ragged card tokens (CSR offsets) + fixed board/phase/action + labels."""
+    """A loaded token dataset. v1: ragged card tokens (CSR offsets); v2 (``feat == "v2"``): fixed-shape
+    ``cards [n,18,46]`` + ``kings [n,2,4]`` (detected by the presence of the ``kings`` array)."""
 
     def __init__(self, arrs: Dict[str, np.ndarray]):
-        self.cards = arrs["cards"]                      # [T, 44]
-        self.card_offsets = arrs["card_offsets"]        # [n_rows+1]
+        self.feat = "v2" if "kings" in arrs else "v1"
+        self.cards = arrs["cards"]                      # v1: [T, 44] ragged; v2: [n, 18, 46]
+        self.kings = arrs.get("kings")                  # v2 only: [n, 2, 4]
+        self.card_offsets = arrs.get("card_offsets")    # v1 only: [n_rows+1]
         self.board, self.phase, self.action = arrs["board"], arrs["phase"], arrs["action"]
         self.y, self.w, self.z = arrs["y"], arrs["w"], arrs["z"]
         self.game_id, self.decision_id, self.is_chosen = (
@@ -116,8 +195,11 @@ class TokenRows:
     def __len__(self) -> int:
         return int(self.y.shape[0])
 
-    def tokens(self, i: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Row i's token set: (cards[Nᵢ,44], board[14], phase[53], action[23])."""
+    def tokens(self, i: int) -> Tuple[np.ndarray, ...]:
+        """Row i's token set. v1: (cards[Nᵢ,44], board, phase, action); v2: (cards[18,46], kings[2,4],
+        board, phase, action)."""
+        if self.feat == "v2":
+            return self.cards[i], self.kings[i], self.board[i], self.phase[i], self.action[i]
         a, b = int(self.card_offsets[i]), int(self.card_offsets[i + 1])
         return self.cards[a:b], self.board[i], self.phase[i], self.action[i]
 
@@ -132,11 +214,13 @@ def main(argv=None) -> None:
     p.add_argument("--data", default=os.path.join("datasets", "selfplay_k20l3"))
     p.add_argument("--out", default=os.path.join("datasets", "tensors", "k20l3_tokens.npz"))
     p.add_argument("--limit", type=int, default=None, help="only process the first N games (smoke)")
+    p.add_argument("--feat", default="v1", choices=["v1", "v2"],
+                   help="featurization version (v2 = fixed-18 instance tokens + zone posteriors)")
     args = p.parse_args(argv)
 
-    print(f"building token tensors from {args.data} -> {args.out}"
+    print(f"building token tensors ({args.feat}) from {args.data} -> {args.out}"
           + (f" (limit {args.limit})" if args.limit else ""))
-    s = build(args.data, args.out, args.limit)
+    s = build(args.data, args.out, args.limit, feat=args.feat)
     print(f"  {s['n_rows']} rows ({s['n_decisions']} decisions, {s['n_games']} games), "
           f"{s['total_card_tokens']} card tokens  ->  {args.out}(+.meta.json)")
 

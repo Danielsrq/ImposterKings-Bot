@@ -16,6 +16,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -32,21 +33,35 @@ class AttnConfig:
     ffn_hidden: int = 128         # per-token FFN hidden width
     dropout: float = 0.0
     bounded: bool = True          # Tanh on the value head (q in [-1, 1], matching mlp.py)
+    feat: str = "v1"              # featurization version: "v1" (variable tokens) | "v2" (fixed-18 + kings)
 
     def __post_init__(self):
         if self.d_model % self.n_heads != 0:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
+        if self.feat not in ("v1", "v2"):
+            raise ValueError(f"unknown feat version {self.feat!r}")
 
 
 class TokenEmbed(nn.Module):
-    """Per-type Linear(native -> d) + LayerNorm for each token kind (the W_card/W_board/... projections)."""
+    """Per-type Linear(native -> d) + LayerNorm for each token kind (the W_card/W_board/... projections).
+    Dims follow the config's featurization version; v2 adds a king projection."""
 
-    def __init__(self, d_model: int):
+    def __init__(self, cfg: "AttnConfig"):
         super().__init__()
-        self.card = nn.Sequential(nn.Linear(CARD_DIM, d_model), nn.LayerNorm(d_model))
-        self.board = nn.Sequential(nn.Linear(BOARD_DIM, d_model), nn.LayerNorm(d_model))
-        self.phase = nn.Sequential(nn.Linear(PHASE_DIM, d_model), nn.LayerNorm(d_model))
-        self.action = nn.Sequential(nn.Linear(ACTION_DIM, d_model), nn.LayerNorm(d_model))
+        d_model = cfg.d_model if isinstance(cfg, AttnConfig) else int(cfg)   # legacy: TokenEmbed(d)
+        feat = cfg.feat if isinstance(cfg, AttnConfig) else "v1"
+
+        def proj(in_dim):
+            return nn.Sequential(nn.Linear(in_dim, d_model), nn.LayerNorm(d_model))
+
+        if feat == "v2":
+            from . import features2 as F2
+            self.card, self.board = proj(F2.CARD_DIM), proj(F2.BOARD_DIM)
+            self.phase, self.action = proj(F2.PHASE_DIM), proj(F2.ACTION_DIM)
+            self.king = proj(F2.KING_DIM)
+        else:
+            self.card, self.board = proj(CARD_DIM), proj(BOARD_DIM)
+            self.phase, self.action = proj(PHASE_DIM), proj(ACTION_DIM)
 
     def forward(self, cards, board, phase, action):
         return self.card(cards), self.board(board), self.phase(phase), self.action(action)
@@ -112,20 +127,26 @@ class AttentionModel(nn.Module):
     def __init__(self, cfg: AttnConfig = AttnConfig()):
         super().__init__()
         self.cfg = cfg
-        self.embed = TokenEmbed(cfg.d_model)
+        self.embed = TokenEmbed(cfg)
         self.cls = nn.Parameter(torch.zeros(cfg.d_model))          # learned readout token (no projection)
         self.layers = nn.ModuleList([EncoderLayer(cfg) for _ in range(cfg.n_layers)])
         self.head = nn.Linear(cfg.d_model, 1)
 
-    def forward_layers(self, cards, board, phase, action, card_mask=None, need_values=False):
+    def forward_layers(self, cards, board, phase, action, card_mask=None, need_values=False, kings=None):
         """Same encode as :meth:`forward` but returns EVERY layer's attention.
         Returns (q [B], attns) where attns is a list of per-layer [B, heads, S, S] (len == n_layers), or
         (q, attns, values) with per-layer value vectors [B, heads, S, dh] when ``need_values`` (for the
-        value-weighted attribution in `explain`). ``forward`` is exactly ``q, attns[-1]``."""
+        value-weighted attribution in `explain`). ``forward`` is exactly ``q, attns[-1]``.
+        ``kings`` [B,2,4] is required at feat="v2" (sequence [CLS, 18 cards, 2 kings, board, phase,
+        action], S=24, no mask)."""
         b, n = cards.shape[0], cards.shape[1]
         hc, hb, hp, ha = self.embed(cards, board, phase, action)
         cls = self.cls.view(1, 1, -1).expand(b, 1, -1)
-        seq = torch.cat([cls, hc, hb.unsqueeze(1), hp.unsqueeze(1), ha.unsqueeze(1)], dim=1)   # [B,S,d]
+        if self.cfg.feat == "v2":
+            hk = self.embed.king(kings)                            # [B,2,d]
+            seq = torch.cat([cls, hc, hk, hb.unsqueeze(1), hp.unsqueeze(1), ha.unsqueeze(1)], dim=1)
+        else:
+            seq = torch.cat([cls, hc, hb.unsqueeze(1), hp.unsqueeze(1), ha.unsqueeze(1)], dim=1)  # [B,S,d]
         s = seq.shape[1]
 
         add_mask = None
@@ -150,11 +171,12 @@ class AttentionModel(nn.Module):
             return q, attns, values
         return q, attns
 
-    def forward(self, cards, board, phase, action, card_mask=None):
+    def forward(self, cards, board, phase, action, card_mask=None, kings=None):
         """cards [B,N,44], board [B,14], phase [B,53], action [B,23], card_mask [B,N] bool (True=real).
         Returns (q [B], attn [B, heads, S, S]) with S = N + 4 ([CLS] + N cards + board + phase + action).
-        ``attn`` is the LAST layer (the CLS readout layer); use :meth:`forward_layers` for all layers."""
-        q, attns = self.forward_layers(cards, board, phase, action, card_mask)
+        ``attn`` is the LAST layer (the CLS readout layer); use :meth:`forward_layers` for all layers.
+        At feat="v2": cards [B,18,46], kings [B,2,4] required, no mask, S = 24."""
+        q, attns = self.forward_layers(cards, board, phase, action, card_mask, kings=kings)
         return q, attns[-1]                                         # attn = last layer, [B, heads, S, S]
 
     def param_count(self) -> int:
@@ -184,6 +206,17 @@ def collate(toks: List[Tokens]) -> dict:
         labels.append(t.labels)
     return {"cards": cards, "board": board, "phase": phase, "action": action,
             "card_mask": card_mask, "labels": labels}
+
+
+def collate2(toks) -> dict:
+    """Batch v2 (fixed-shape) token sets: cards [B,18,46], kings [B,2,4], board/phase/action [B,·].
+    No padding, no mask (every token is real)."""
+    return {"cards": torch.from_numpy(np.stack([t.cards for t in toks])),
+            "kings": torch.from_numpy(np.stack([t.kings for t in toks])),
+            "board": torch.from_numpy(np.stack([t.board for t in toks])),
+            "phase": torch.from_numpy(np.stack([t.phase for t in toks])),
+            "action": torch.from_numpy(np.stack([t.action for t in toks])),
+            "card_mask": None, "labels": [t.labels for t in toks]}
 
 
 def cls_importance(attn: torch.Tensor, labels: List[List[str]], include_cls: bool = False,
@@ -243,7 +276,29 @@ def evaluator_from_model(model: AttentionModel):
     """`state -> ([per-seat value], {move: prior})` from an ALREADY-LOADED model. Value = max_a Q
     (mover-relative, zero-sum negated for the opponent), priors = softmax(Q) over the mover's legal moves.
     Factored out so a caller (e.g. the UI) can share one model instance between the leaf evaluator and the
-    `explain` readout instead of loading the checkpoint twice."""
+    `explain` readout instead of loading the checkpoint twice. Dispatches on the model's featurization
+    version (v1 variable tokens / v2 fixed-18 + kings)."""
+    if model.cfg.feat == "v2":
+        from .features2 import tokenize_state as ts2, with_action as wa2
+
+        @torch.no_grad()
+        def evaluate(state):
+            mover = state.to_play
+            view = state.information_set(mover)
+            moves = state.legal_moves()
+            st = ts2(view, legal_moves=moves)             # featurize the state ONCE (no re-determinize)
+            batch = collate2([wa2(st, m) for m in moves])
+            q = model(batch["cards"], batch["board"], batch["phase"], batch["action"],
+                      kings=batch["kings"])[0]
+            v = float(q.max())
+            value = [0.0] * NUM_PLAYERS
+            value[mover] = v
+            value[1 - mover] = -v
+            priors = {m: float(p) for m, p in zip(moves, torch.softmax(q, dim=0).tolist())}
+            return value, priors
+
+        return evaluate
+
     @torch.no_grad()
     def evaluate(state):
         mover = state.to_play

@@ -40,15 +40,20 @@ class TokenTorchDataset(Dataset):
 
     def __getitem__(self, k):
         i = int(self.idx[k])
-        c, b, p, a = self.rows.tokens(i)
-        return c, b, p, a, float(self.rows.y[i]), float(self.rows.w[i])
+        return (*self.rows.tokens(i), float(self.rows.y[i]), float(self.rows.w[i]))
 
 
 def collate_fn(batch):
-    """Pad a list of rows into model tensors (reuses attention_model.collate) + stack (y, w)."""
-    packed = collate([Tokens(c, b, p, a, []) for (c, b, p, a, _, _) in batch])
-    y = torch.tensor([r[4] for r in batch], dtype=torch.float32)
-    w = torch.tensor([r[5] for r in batch], dtype=torch.float32)
+    """Batch rows into model tensors + stack (y, w). Dispatches by tuple arity: v1 (padded, reuses
+    attention_model.collate) vs v2 (fixed shapes, collate2 -- cards[18,46] + kings[2,4], no mask)."""
+    if len(batch[0]) == 7:                             # v2: (cards, kings, board, phase, action, y, w)
+        from .attention_model import collate2
+        from .features2 import Tokens2
+        packed = collate2([Tokens2(c, k, b, p, a, []) for (c, k, b, p, a, _, _) in batch])
+    else:                                              # v1: (cards, board, phase, action, y, w)
+        packed = collate([Tokens(c, b, p, a, []) for (c, b, p, a, _, _) in batch])
+    y = torch.tensor([r[-2] for r in batch], dtype=torch.float32)
+    w = torch.tensor([r[-1] for r in batch], dtype=torch.float32)
     return packed, y, w
 
 
@@ -65,7 +70,8 @@ def _to_device(packed, device):
 
 
 def _forward(model, packed):
-    q, _ = model(packed["cards"], packed["board"], packed["phase"], packed["action"], packed["card_mask"])
+    q, _ = model(packed["cards"], packed["board"], packed["phase"], packed["action"],
+                 packed["card_mask"], kings=packed.get("kings"))
     return q
 
 
@@ -149,7 +155,8 @@ def main(argv=None) -> None:
 
     rows = load_tokens(args.npz)
     cfg = AttnConfig(d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads,
-                     ffn_hidden=args.ffn_hidden, dropout=args.dropout)
+                     ffn_hidden=args.ffn_hidden, dropout=args.dropout,
+                     feat=rows.feat)                    # featurization follows the dataset (v1/v2)
     hp = {k: getattr(args, k) for k in ("epochs", "batch", "lr", "patience", "val_frac", "seed", "device")}
     print(f"loaded {len(rows)} rows; cfg={cfg}; target=q; device={resolve_device(args.device)}", flush=True)
 

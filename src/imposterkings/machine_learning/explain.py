@@ -63,6 +63,10 @@ def explain(view, action, model: AttentionModel, *, all_layers: bool = False,
     (for L>=2 card-row routing); otherwise only the last (readout) layer. With ``attribution`` it also
     computes the signed value-weighted contribution of each token to the q-logit (``row0_signed`` /
     ``attribution``). Deterministic (eval, no dropout)."""
+    if getattr(model.cfg, "feat", "v1") != "v1":
+        raise NotImplementedError(
+            "explain() UI support for featurization v2 is deferred (plan step 6) -- the v2 evaluator "
+            "plays fine; only the drawer payload is v1-only for now")
     model.eval()
     tok = tokenize(view, action)
     batch = collate([tok])
