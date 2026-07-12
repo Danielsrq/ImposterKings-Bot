@@ -125,23 +125,46 @@ def _axis_tile(surface, payload, k: int, x: int, y: int, size: int) -> None:
         surface.blit(t, (x + (size - t.get_width()) // 2, y + (size - t.get_height()) // 2))
 
 
+def routed_attention(payload, view: str = "causal") -> Tuple[np.ndarray, bool, bool]:
+    """The DISPLAY matrix for a given ``view``. Returns (matrix [heads,S,S], routed?, dead_card_rows?).
+
+    - "causal" (default): at L=1 the only layer; at L>=2 row 0 from the LAST layer (the CLS readout that
+      dq decomposes) + rows 1..N from LAYER 1 (the card<->card mixing that feeds it) -- every displayed
+      row is causal.
+    - "l1": layer 1 in full (card rows causal; its CLS row feeds forward via the residual).
+    - "l2": the last layer in full -- its card rows are computed-but-discarded, so ``dead_card_rows`` is
+      True and the renderer de-emphasizes them (same honesty rule as an L=1 model's card rows)."""
+    per_layer = getattr(payload, "per_layer", None)
+    if not per_layer or len(per_layer) < 2:
+        return payload.attn, False, True                 # single layer: card rows are the dead ones
+    if view == "l1":
+        return per_layer[0], True, False
+    if view == "l2":
+        return payload.attn, True, True
+    m = payload.attn.copy()                              # causal composite: row 0 = last layer (readout)
+    m[:, 1:, :] = per_layer[0][:, 1:, :]                 # card rows = layer 1 (causal mixing)
+    return m, True, False
+
+
 def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
                    mode: str = "absolute", emphasize_rows: Tuple[int, ...] = (0,),
                    candidate_index: Optional[int] = None,
                    hover: Optional[Tuple[int, int, int]] = None,
-                   exclude_indices: Tuple[int, ...] = ()) -> List[AttnHit]:
+                   exclude_indices: Tuple[int, ...] = (),
+                   layer_view: str = "causal") -> List[AttnHit]:
     """Draw the per-head heatmap grid into ``rect`` and return per-cell hitboxes.
 
     ``mode``: "absolute" (global max over shown heads), "row_norm" (each query row by its own max), or
     "signed" (row 0 colored by the value-weighted signed contribution, diverging). ``emphasize_rows`` +
-    ``candidate_index``: full-color/framed rows & the candidate row+column; other rows are blended toward
-    the background (computed-but-discarded at L=1). ``hover`` = (i,j,head) draws the crosshair.
-    ``exclude_indices`` drops those seq positions from the display and RENORMALIZES each remaining
-    attention row to sum to 1 (the conditional distribution over the remaining tokens); signed values are
-    dropped but NOT renormalized (additive logit shares, not a distribution). Hits carry ORIGINAL seq
-    indices so tooltips/hover always read the true payload arrays."""
+    ``candidate_index``: full-color/framed rows & the candidate row+column. At L=1 the other rows are
+    blended toward the background (computed-but-discarded); at L>=2 the display is CAUSALLY ROUTED via
+    :func:`routed_attention` (card rows = layer 1, row 0 = last layer) and card rows render full-color.
+    ``hover`` = (i,j,head) draws the crosshair. ``exclude_indices`` drops those seq positions from the
+    display and RENORMALIZES each remaining attention row to sum to 1 (the conditional distribution over
+    the remaining tokens); signed values are dropped but NOT renormalized (additive logit shares, not a
+    distribution). Hits carry ORIGINAL seq indices so tooltips/hover always read the true payload arrays."""
     rx, ry, rw, rh = rect
-    attn = payload.attn                                   # [heads, S, S], readout layer
+    attn, routed, dead_rows = routed_attention(payload, layer_view)   # [heads, S, S]
     heads = attn.shape[0]
     rows, cols = _grid_shape(heads)
     idx = [k for k in range(attn.shape[1]) if k not in exclude_indices]   # displayed original indices
@@ -163,8 +186,9 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
     oy = ry + max(0, (rh - grid_h) // 2)
 
     # "signed" mode colors ROW 0 by the value-weighted signed contribution (diverging); falls back to the
-    # attention view if attribution wasn't computed.
-    signed = getattr(payload, "row0_signed", None) if mode == "signed" else None
+    # attention view if attribution wasn't computed. Only meaningful when the DISPLAYED row 0 is the
+    # readout row (causal/l2 views) -- in the "l1" view row 0 is layer-1's, so dq coloring would lie.
+    signed = getattr(payload, "row0_signed", None) if (mode == "signed" and layer_view != "l1") else None
     smax = float(np.abs(signed).max()) if signed is not None else 1.0
     gmax = float(sub.max()) or 1.0
     emph_disp = {disp[i] for i in emphasize_rows if i in disp}
@@ -181,13 +205,14 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
             denom = (float(row_max[i]) or 1.0) if row_max is not None else gmax
             primary_row = (i in emph_disp) or (i == cand_disp)
             for j in range(s):
-                if signed is not None:
-                    col = (_heat_div(float(signed[h, idx[j]]), smax) if i == 0
-                           else _blend((60, 64, 74), BG, 0.5))   # only row 0 is load-bearing here
+                if signed is not None and i == 0:
+                    col = _heat_div(float(signed[h, idx[j]]), smax)   # dq lives on the readout row
+                elif signed is not None and dead_rows:
+                    col = _blend((60, 64, 74), BG, 0.5)    # signed + dead card rows: flat (no dq story)
                 else:
                     col = _heat(math.sqrt(max(0.0, float(sub[h, i, j])) / denom))
-                    if not (primary_row or j == cand_disp):
-                        col = _blend(col, BG, 0.45)        # de-emphasize non-load-bearing cells
+                    if dead_rows and not (primary_row or j == cand_disp):
+                        col = _blend(col, BG, 0.45)        # computed-but-discarded rows stay honest
                 r = pygame.Rect(bx + j * cell, by + i * cell, cell, cell)
                 pygame.draw.rect(surface, col, r)
                 hits.append(AttnHit(r, idx[i], idx[j], h))     # ORIGINAL indices
@@ -238,17 +263,26 @@ def attn_cell_at(hits: List[AttnHit], pos) -> Optional[AttnHit]:
     return None
 
 
-def draw_tooltip(surface, fonts, payload, hit: AttnHit, pos) -> None:
+def draw_tooltip(surface, fonts, payload, hit: AttnHit, pos, layer_view: str = "causal") -> None:
     """Floating 2dp tooltip: ``<label i> -> <label j> = 0.24`` near the mouse. On row-0 cells also the
     hovered head's signed contribution and the head-summed total for the column token (the bridge between
     a single head's cell and the Top-contributors ranking -- heads can cancel)."""
     small = fonts["small"]
-    v = float(payload.attn[hit.head, hit.i, hit.j])
+    m, routed, _dead = routed_attention(payload, layer_view)   # same routing as the display
+    v = float(m[hit.head, hit.i, hit.j])
+    layer_tag = ""
+    if routed:
+        if layer_view == "l1":
+            layer_tag = "   [L1]"
+        elif layer_view == "l2":
+            layer_tag = "   [L-last]"
+        else:
+            layer_tag = "   [L-last readout]" if hit.i == 0 else "   [L1 mixing]"
     lines = [f"{payload.seq_labels[hit.i]} -> {payload.seq_labels[hit.j]}",
-             f"head {hit.head}   weight {v:.2f}"]
+             f"head {hit.head}   weight {v:.2f}{layer_tag}"]
     rs = getattr(payload, "row0_signed", None)
     att = getattr(payload, "attribution", None)
-    if hit.i == 0 and rs is not None:                          # signed contribution to q (row-0 readout)
+    if hit.i == 0 and rs is not None and layer_view != "l1":   # signed contribution to q (readout row)
         lines.append(f"Δq (head {hit.head}) {float(rs[hit.head, hit.j]):+.3f}")
     if att is not None:                                        # head-summed total for the column token
         lines.append(f"Σheads Δq {float(att[hit.j]):+.3f}")

@@ -684,6 +684,7 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
     # Attention drawer state: entries are explained lazily per (ckpt, turn-start, seat) and memoized --
     # the forward pass is deterministic, so first view pays one pass per entry, revisits are instant.
     show_attn, attn_mode, attn_hide_board = False, "absolute", False
+    attn_layer_view = "causal"                  # L>=2: causal composite | l1 | l2
     attn_sel, attn_hover, attn_hits, attn_turn = 0, None, [], None
     attn_seat = None                            # None -> follow the current turn's owner
     attn_model = {"tried": False, "model": None, "id": ""}
@@ -727,7 +728,7 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
                         screen, fonts, entries, mouse, mode=attn_mode, hover=attn_hover,
                         selected=attn_sel, hide_board=attn_hide_board,
                         result=_seat_result(traj[start], owner, seat),
-                        seat_labels=("P0", "P1"), seat_selected=seat)
+                        seat_labels=("P0", "P1"), seat_selected=seat, layer_view=attn_layer_view)
                     attn_hits = attn_ctrl["hits"]
                 else:                                     # nothing to explain for this (turn, seat)
                     box = pygame.Rect(W - 360, 8, 352, 30)
@@ -789,15 +790,20 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
                 elif attn_ctrl["board_toggle"].collidepoint(pos):
                     attn_hide_board = not attn_hide_board
                 else:
-                    for i, r in enumerate(attn_ctrl["rec_pills"]):
+                    for lk, r in attn_ctrl["layer_pills"].items():
                         if r.collidepoint(pos):
-                            attn_sel = i                  # switch which rec the heatmap explains
+                            attn_layer_view = lk          # causal | l1 | l2 view
                             break
                     else:
-                        for i, r in enumerate(attn_ctrl["seat_pills"]):
-                            if r.collidepoint(pos):       # explain the other player's read
-                                attn_seat, attn_sel, attn_hover = i, 0, None
+                        for i, r in enumerate(attn_ctrl["rec_pills"]):
+                            if r.collidepoint(pos):
+                                attn_sel = i              # switch which rec the heatmap explains
                                 break
+                        else:
+                            for i, r in enumerate(attn_ctrl["seat_pills"]):
+                                if r.collidepoint(pos):   # explain the other player's read
+                                    attn_seat, attn_sel, attn_hover = i, 0, None
+                                    break
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 pos = e.pos
                 if btns["prev"].collidepoint(pos):

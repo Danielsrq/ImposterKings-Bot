@@ -139,6 +139,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     settings_open, dragging = False, None      # dragging = the active slider key ("N"/"k"/"l") or None
     show_attn, attn_mode, attn_hover = False, "absolute", None      # attention-drawer state
     attn_sel, attn_hide_board = 0, False                            # selected rec pill / board-token toggle
+    attn_layer_view = "causal"                                      # L>=2: causal composite | l1 | l2
     attn_cache: dict = {"state": None, "entries": [], "result": None, "hits": []}
     analysis_rng = np.random.default_rng(1234567)   # dedicated so analysis never perturbs the game rng
     # Per-state dual analysis: BOTH seats' read of the current position (keyed by state identity), so the
@@ -285,7 +286,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         if show_attn and not settings_open and attn_cache["entries"]:
             attn_ctrl = draw_attention_drawer(screen, fonts, attn_cache["entries"], mouse,
                                               mode=attn_mode, hover=attn_hover, selected=attn_sel,
-                                              hide_board=attn_hide_board, result=attn_cache["result"])
+                                              hide_board=attn_hide_board, result=attn_cache["result"],
+                                              layer_view=attn_layer_view)
             attn_cache["hits"] = attn_ctrl["hits"]
         pygame.display.flip()
 
@@ -355,10 +357,15 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     elif attn_ctrl["board_toggle"].collidepoint(pos):
                         attn_hide_board = not attn_hide_board   # re-render only, no recompute
                     else:
-                        for i, r in enumerate(attn_ctrl["rec_pills"]):
+                        for key, r in attn_ctrl["layer_pills"].items():
                             if r.collidepoint(pos):
-                                attn_sel = i                    # switch which rec the heatmap explains
+                                attn_layer_view = key           # causal | l1 | l2 view
                                 break
+                        else:
+                            for i, r in enumerate(attn_ctrl["rec_pills"]):
+                                if r.collidepoint(pos):
+                                    attn_sel = i                # switch which rec the heatmap explains
+                                    break
                 elif frame.attn_toggle and frame.attn_toggle.collidepoint(pos):
                     show_attn = True                            # open the analysis drawer
                     attn_cache["state"] = None

@@ -102,3 +102,63 @@ def test_signed_mode_diverging():
     cp, cn = surf.get_at(pos.rect.center), surf.get_at(neg.rect.center)
     assert cp[:3] != cn[:3]                                          # opposite signs -> distinct colors
     assert cp[1] > cp[0] and cn[0] > cn[1]                           # positive greener, negative redder
+
+
+def _payload_l2(heads=4):
+    # L2 payload: last layer (attn) uniform; layer 1 carries a distinctive hot card->card cell.
+    p = _payload(heads)
+    s = len(p.seq_labels)
+    l1 = np.full((heads, s, s), 1.0 / s, np.float32)
+    l1[0, 2, 1] = 0.9                                                # hot L1 card-row cell
+    p.per_layer = [l1, p.attn.copy()]
+    return p
+
+
+def test_routed_attention_composites_layers():
+    p = _payload_l2()
+    m, routed, dead = av.routed_attention(p)
+    assert routed and not dead                                       # composite: every row causal
+    assert np.array_equal(m[:, 0, :], p.attn[:, 0, :])               # row 0 = last layer (readout)
+    assert np.array_equal(m[:, 1:, :], p.per_layer[0][:, 1:, :])     # card rows = layer 1 (causal)
+    assert m[0, 2, 1] == np.float32(0.9)
+    # L1 payload: no routing, card rows are the dead ones
+    p1 = _payload()
+    m1, routed1, dead1 = av.routed_attention(p1)
+    assert not routed1 and dead1 and np.array_equal(m1, p1.attn)
+
+
+def test_l2_render_and_tooltip_use_routed_rows():
+    surf = pygame.Surface((1000, 900))
+    p = _payload_l2()
+    hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820), candidate_index=1)
+    s = len(p.seq_labels)
+    assert len(hits) == p.n_heads * s * s
+    # the hot L1 cell must render brighter than its uniform neighbor (card rows come from layer 1)
+    hot = next(h for h in hits if h.head == 0 and h.i == 2 and h.j == 1)
+    cold = next(h for h in hits if h.head == 0 and h.i == 2 and h.j == 2)
+    assert sum(surf.get_at(hot.rect.center)[:3]) > sum(surf.get_at(cold.rect.center)[:3])
+    av.draw_tooltip(surf, _fonts(), p, hot, (500, 400))              # layer-tagged tooltip renders
+    # signed mode at L2: row 0 diverging, card rows still the (viridis) L1 view -- no crash
+    p.row0_signed = np.zeros((p.n_heads, s), np.float32)
+    p.attribution = np.zeros(s, np.float32)
+    av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820), mode="signed")
+
+
+def test_layer_view_pills_select_matrices():
+    p = _payload_l2()
+    m_causal, r1, d1 = av.routed_attention(p, "causal")
+    m_l1, r2, d2 = av.routed_attention(p, "l1")
+    m_l2, r3, d3 = av.routed_attention(p, "l2")
+    assert r1 and r2 and r3
+    assert not d1 and not d2 and d3                                  # only the L2 view has dead card rows
+    assert np.array_equal(m_l1, p.per_layer[0])
+    assert np.array_equal(m_l2, p.attn)
+    assert np.array_equal(m_causal[:, 0, :], p.attn[:, 0, :])
+    assert np.array_equal(m_causal[:, 1:, :], p.per_layer[0][:, 1:, :])
+    # all three views render + tooltip; signed coloring is suppressed in the l1 view (row 0 isn't readout)
+    surf = pygame.Surface((1000, 900))
+    p.row0_signed = np.zeros((p.n_heads, len(p.seq_labels)), np.float32)
+    p.attribution = np.zeros(len(p.seq_labels), np.float32)
+    for view in ("causal", "l1", "l2"):
+        hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820), mode="signed", layer_view=view)
+        av.draw_tooltip(surf, _fonts(), p, hits[0], (500, 400), layer_view=view)

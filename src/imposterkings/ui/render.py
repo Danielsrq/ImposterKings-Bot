@@ -468,7 +468,7 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True):
 
 def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", hover=None,
                           selected=0, hide_board=False, result=None, depth=5,
-                          seat_labels=None, seat_selected=0):
+                          seat_labels=None, seat_selected=0, layer_view="causal"):
     """Right-side "analysis mode" drawer over a dim scrim. ``entries`` = the top recommendations as
     ``[(move, payload), ...]`` (payload = an AttentionExplanation); ``selected`` picks which entry the
     heatmap shows (clickable rec pills switch). ``hide_board`` drops the board token from the heatmap and
@@ -531,20 +531,33 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
             sx = r.right + 6
 
     move, payload = entries[selected]
+    layer_pills = {}
+    if getattr(payload, "per_layer", None) and len(payload.per_layer) >= 2:   # L>=2: layer view pills
+        _text(surface, small, "view:", (dx + pad, 106), MUTE)
+        lx = dx + pad + 44
+        for key, lab in (("causal", "causal (L1 cards + L2 CLS)"), ("l1", "L1"), ("l2", "L2")):
+            r = pygame.Rect(lx, 103, small.size(lab)[0] + 18, 22)
+            pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=11)
+            if key == layer_view:
+                pygame.draw.rect(surface, GOLD, r, 2, border_radius=11)
+            _text(surface, small, lab, (r.x + 9, r.y + 3), GOLD if key == layer_view else INK)
+            layer_pills[key] = r
+            lx = r.right + 8
     exclude = ()
     if hide_board and "board" in payload.seq_labels:
         exclude = (payload.seq_labels.index("board"),)
 
     pv_h = 128
-    heat_rect = (dx + pad, 112, dw - 2 * pad, H - 112 - pv_h)
+    heat_top = 132 if layer_pills else 112
+    heat_rect = (dx + pad, heat_top, dw - 2 * pad, H - heat_top - pv_h)
     hits = attention_view.draw_attention(surface, fonts, payload, heat_rect, mode=mode,
                                          emphasize_rows=(0,),
                                          candidate_index=payload.candidate_seq_index, hover=hover,
-                                         exclude_indices=exclude)
+                                         exclude_indices=exclude, layer_view=layer_view)
     if hover is not None:
         hit = next((h for h in hits if (h.i, h.j, h.head) == hover), None)
         if hit is not None:
-            attention_view.draw_tooltip(surface, fonts, payload, hit, mouse)
+            attention_view.draw_tooltip(surface, fonts, payload, hit, mouse, layer_view=layer_view)
 
     pv_y = H - pv_h + 6
     pygame.draw.line(surface, DIVIDER, (dx + pad, pv_y - 6), (dx + dw - pad, pv_y - 6))
@@ -582,7 +595,7 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
                     xx += t.get_width() + 8
                 yy += 20
     return {"close": close, "mode_toggle": mode_toggle, "board_toggle": board_toggle,
-            "rec_pills": rec_pills, "seat_pills": seat_pills, "hits": hits}
+            "rec_pills": rec_pills, "seat_pills": seat_pills, "layer_pills": layer_pills, "hits": hits}
 
 
 def make_fonts():
