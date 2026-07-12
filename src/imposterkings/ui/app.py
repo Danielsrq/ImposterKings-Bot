@@ -19,8 +19,8 @@ from ..actions import ActionKind, StepKind
 from ..agents import MCTSAgent, RandomAgent
 from ..explain import format_action
 from ..state import GameState
-from .render import (BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_attention_drawer, draw_settings_overlay,
-                     make_fonts, render_frame)
+from .render import (BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_attention_drawer, draw_card_preview,
+                     draw_settings_overlay, make_fonts, render_frame)
 from .review import PlyRecord, annotate_dual_evals, budget_iters, run_review, _result_eval, _search_from
 from .scenario_setup import run_setup
 
@@ -28,9 +28,21 @@ from .scenario_setup import run_setup
 _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
 
 # Attention-drawer checkpoints, best first: the v2 (featurization 2.2) net gives the drawer fixed 18-card
-# axes, attendable unseen cards and zone posteriors; the v1 net is the fallback.
-DEFAULT_ATTN_CKPTS = (os.path.join("models", "gen1_v3c_v2feat", "attn_d64_L2.pt"),
-                      os.path.join("models", "attn_d64_L1.pt"))
+# axes, attendable unseen cards and zone posteriors; the v1 net is the fallback. Forward slashes throughout
+# (os.path.exists accepts them on Windows) so these compare equal to discover_ckpts()' normalized paths.
+DEFAULT_ATTN_CKPTS = ("models/gen1_v3c_v2feat/attn_d64_L2.pt", "models/attn_d64_L1.pt")
+# NN+MCTS default (Settings can swap it for any other discovered checkpoint, attention nets included).
+DEFAULT_NN_CKPTS = ("models/mlp_32.pt", "models/mlp_256.pt")
+
+
+def discover_ckpts(root: str = "models"):
+    """Every ``*.pt`` under ``models/`` (attention nets first, then MLPs; each group name-sorted) -- the
+    menu of nets the NN+MCTS mode can be pointed at."""
+    import glob
+    found = sorted(p.replace("\\", "/") for p in glob.glob(os.path.join(root, "**", "*.pt"),
+                                                           recursive=True))
+    attn = [p for p in found if "attn" in os.path.basename(p)]
+    return attn + [p for p in found if p not in attn]
 
 
 def _engine_budget(engine: dict):
@@ -54,11 +66,10 @@ def _make_bot(random_bot: bool, engine: dict, nn_agent=None, evaluator=None):
 
 
 def _hover_index(mouse, n_legal: int):
-    mx, my = mouse
-    if mx < PANEL_X + 12:
-        return None
-    idx = (my - BTN_TOP) // BTN_H
-    return idx if 0 <= idx < n_legal else None
+    """Which action row is under the mouse -- hit-tested against the SAME rects render_frame draws
+    (they shrink/reflow with the option count), so the highlight can never point at the wrong row."""
+    from .render import action_rects
+    return next((i for i, r in enumerate(action_rects(n_legal)) if r.collidepoint(mouse)), None)
 
 
 def _describe(seat: int, view, move, human_seat: int, state) -> str:
@@ -80,23 +91,41 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     import os
     import pygame  # local import so the engine/tests never require pygame
 
-    # Resolve the NN checkpoint for the "NN+MCTS" mode: an explicit --nn, else the default if it exists.
-    nn_ckpt = nn if nn else ("models/mlp_32.pt" if os.path.exists("models/mlp_32.pt") else None)
-    nncfg = {"ckpt": nn_ckpt, "ev": None}           # ev is built lazily the first time NN mode is used
-    nn_available = nn_ckpt is not None
+    # Checkpoints for the "NN+MCTS" mode: every models/**/*.pt, so the Settings overlay can swap the net
+    # driving the search (MLP *or* attention -- the evaluator dispatches on the checkpoint's model_type).
+    nn_ckpts = discover_ckpts()
+    nn_ckpt = nn if nn else next((p for p in DEFAULT_NN_CKPTS if os.path.exists(p)), None)
+    if nn_ckpt and nn_ckpt not in nn_ckpts:         # an explicit --nn outside models/ still selectable
+        nn_ckpts.insert(0, nn_ckpt)
+    nncfg = {"ix": nn_ckpts.index(nn_ckpt) if nn_ckpt in nn_ckpts else 0,
+             "ckpts": nn_ckpts, "ev": None}         # ev is built lazily the first time NN mode is used
+    nn_available = bool(nn_ckpts)
+
+    def nn_ckpt_path():
+        return nncfg["ckpts"][nncfg["ix"]] if nncfg["ckpts"] else None
+
+    def select_nn_ckpt(step: int):
+        """Cycle the NN+MCTS checkpoint (Settings < / > ) and drop the cached evaluator."""
+        if not nncfg["ckpts"]:
+            return
+        nncfg["ix"] = (nncfg["ix"] + step) % len(nncfg["ckpts"])
+        nncfg["ev"] = None
 
     def nn_evaluator():
-        """Lazily build (and cache) the NN eval/policy head; None if no ckpt or the load fails."""
-        if nncfg["ckpt"] is None:
+        """Lazily build (and cache) the NN eval/policy head; None if no ckpt or the load fails.
+        Uses the checkpoint-type dispatch, so an ATTENTION net can drive NN+MCTS too."""
+        path = nn_ckpt_path()
+        if path is None:
             return None
         if nncfg["ev"] is None:
             try:                                    # torch is optional -> a load failure just disables NN
-                from ..machine_learning.evaluator import build_evaluator
-                nncfg["ev"] = build_evaluator(nncfg["ckpt"])
-                print(f"NN-MCTS head loaded from {nncfg['ckpt']}")
+                from ..machine_learning.benchmark import _evaluator_for
+                nncfg["ev"] = _evaluator_for(path)
+                print(f"NN-MCTS head loaded from {path}")
             except Exception as e:                  # noqa: BLE001 -- report + degrade to plain MCTS
-                print(f"NN head unavailable ({e}); NN+MCTS disabled")
-                nncfg["ckpt"] = None
+                print(f"NN head unavailable ({e}); this checkpoint is skipped")
+                nncfg["ckpts"] = [p for p in nncfg["ckpts"] if p != path]
+                nncfg["ix"] = 0
         return nncfg["ev"]
 
     # Attention explainability head: an explicit --attn, else the best deployed checkpoint present. The
@@ -144,6 +173,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     random_bot = (p1 == "random")
     engine_budget = _engine_budget(engine)          # rebuilt by apply_engine() on any settings change
     settings_open, dragging = False, None      # dragging = the active slider key ("N"/"k"/"l") or None
+    preview = None                          # right-click card zoom: (assets/ filename, upside_down) or None
     show_attn, attn_mode, attn_hover = False, "absolute", None      # attention-drawer state
     attn_sel, attn_hide_board = 0, False                            # selected rec pill / board-token toggle
     attn_layer_view = "causal"                                      # L>=2: causal composite | l1 | l2
@@ -285,9 +315,11 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                              hint_result=hint_res, show_hint=show_hint,
                              knowledge=knowledge_cache["val"],
                              bot_eval=bot_eval, hint_eval=hint_eval,
-                             attn_available=attncfg["ckpt"] is not None)
+                             attn_available=attncfg["ckpt"] is not None,
+                             mouse=(mouse if human_turn else None))   # hover-highlight playable cards
         controls = (draw_settings_overlay(screen, fonts, engine, mouse,
-                                          nn_available=nncfg["ckpt"] is not None)
+                                          nn_available=bool(nncfg["ckpts"]),
+                                          nn_ckpts=nncfg["ckpts"], nn_ckpt_ix=nncfg["ix"])
                     if settings_open else None)
         attn_ctrl = None
         if show_attn and not settings_open and attn_cache["entries"]:
@@ -296,6 +328,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                                               hide_board=attn_hide_board, result=attn_cache["result"],
                                               layer_view=attn_layer_view)
             attn_cache["hits"] = attn_ctrl["hits"]
+        if preview is not None:                        # right-click zoom sits on top of everything
+            draw_card_preview(screen, fonts, preview[0], flipped=preview[1])
         pygame.display.flip()
 
         def _slider_at(pos):                        # the modal slider whose (padded) track contains pos
@@ -316,7 +350,9 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                if settings_open:
+                if preview is not None:
+                    preview = None                      # Esc closes the card zoom first
+                elif settings_open:
                     settings_open = False
                 elif show_attn:
                     show_attn = False
@@ -333,6 +369,15 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 from .attention_view import attn_cell_at
                 hit = attn_cell_at(attn_cache["hits"], event.pos)
                 attn_hover = (hit.i, hit.j, hit.head) if hit else None
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                # right-click a face-up card -> zoom it (near-native art). Ignored inside the modals.
+                if preview is None and not settings_open and not show_attn:
+                    preview = next(((a, up) for r, a, up in frame.previews
+                                    if r.collidepoint(event.pos)), None)
+                else:
+                    preview = None
+            elif preview is not None and event.type == pygame.MOUSEBUTTONDOWN:
+                preview = None                      # zoom is modal: any click dismisses it
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if dragging is not None:            # end of a slider drag -> apply the new value
                     dragging = None
@@ -346,10 +391,16 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     elif sl is not None:
                         dragging = sl[3]
                         _slider_set(dragging, pos[0])
+                    elif controls["ckpt_prev"] and controls["ckpt_prev"].collidepoint(pos):
+                        select_nn_ckpt(-1)                      # swap the net driving NN+MCTS
+                        apply_engine()
+                    elif controls["ckpt_next"] and controls["ckpt_next"].collidepoint(pos):
+                        select_nn_ckpt(+1)
+                        apply_engine()
                     else:
                         for mode, r in controls["pills"].items():
                             if r.collidepoint(pos):
-                                if mode == "nn" and nncfg["ckpt"] is None:
+                                if mode == "nn" and not nncfg["ckpts"]:
                                     break                       # NN pill disabled (no checkpoint)
                                 engine["mode"], random_bot = mode, False
                                 apply_engine()

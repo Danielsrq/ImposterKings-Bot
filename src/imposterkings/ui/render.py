@@ -46,9 +46,10 @@ ROW_MAX_X = KNOW_X - 12     # right edge of the play area (before the knowledge 
 DIVIDER = (60, 62, 70)
 
 # The side panel stacks four sections: ACTIONS, LOG, (bot) REASONING, (your) HINT.
-BTN_TOP = 88        # y of the first action button (kept in sync with app's hover hit-test)
-BTN_H = 28
-ACT_BOTTOM = 490    # action buttons capped above this -> fits all 14 guess names (88 + 14*28 = 480)
+BTN_TOP = 88        # y of the first action button
+BTN_H = 28          # preferred row height; action_rects() shrinks it when a decision has more options
+BTN_MIN_H = 20      # floor before spilling into a second column
+ACT_BOTTOM = 490    # action buttons must fit in [BTN_TOP, ACT_BOTTOM) -- see action_rects()
 LOG_TOP = 505       # "Log" section header
 LOG_LINES = 7       # recent log lines shown
 REASON_TOP = 690    # "Bot reasoning" section header (+ toggle)
@@ -64,7 +65,9 @@ class Frame(NamedTuple):
     review: Optional["pygame.Rect"]        # "Review game" button, shown only at game over
     settings: "pygame.Rect"                # opens the engine-settings modal
     scenario: "pygame.Rect"                # opens the scenario-setup screen
-    attn_toggle: Optional["pygame.Rect"] = None   # "Analysis" button (attention drawer); None if no ckpt
+    attn_toggle: Optional["pygame.Rect"] = None   # "Attention" button (attention drawer); None if no ckpt
+    # Right-click zoom targets: every face-up card on screen -> (rect, assets/ filename, upside_down).
+    previews: Tuple[Tuple["pygame.Rect", str, bool], ...] = ()
 
 # Friendly labels for the decision header (the raw StepKind names are long/cryptic).
 DECISION_LABELS = {
@@ -85,8 +88,53 @@ _ABILITY_MAY_LABEL = {
 }
 
 
+def action_rects(n: int) -> List["pygame.Rect"]:
+    """Hit-boxes for ``n`` action buttons, guaranteed to FIT the panel band [BTN_TOP, ACT_BOTTOM).
+
+    Every legal move must be clickable -- there is no CLI to fall back to. So rows shrink toward
+    ``BTN_MIN_H`` as the option count grows (the worst real decision is Inquisitor's flattened
+    ABILITY_MAY: 14 card names + decline = 15), and only if even that will not fit do we spill into a
+    second column. Shared by ``render_frame`` and the app's hover hit-test so the two can never disagree."""
+    if n <= 0:
+        return []
+    avail = ACT_BOTTOM - BTN_TOP
+    cols, rows, h = 1, n, BTN_H
+    if n * BTN_H > avail:
+        h = avail // n
+        if h < BTN_MIN_H:                                  # too many to stack -> two columns
+            cols, rows = 2, (n + 1) // 2
+            h = min(BTN_H, avail // rows)
+    w = (PANEL_W - (cols - 1) * 8) // cols
+    px = PANEL_X + 12
+    out = []
+    for i in range(n):
+        c, r = divmod(i, rows)
+        out.append(pygame.Rect(px + c * (w + 8), BTN_TOP + r * h, w, max(12, h - 4)))
+    return out
+
+
+# The panel's top-right buttons (Attention | Settings) -- the decision header must stop before them.
+_SETTINGS_X = WINDOW[0] - 12 - 84
+_ATTN_X = _SETTINGS_X - 8 - 92
+HDR_MAX_X = _ATTN_X - 8
+
+
 def _text(surf, font, s, pos, color=INK):
     surf.blit(font.render(s, True, color), pos)
+
+
+def _text_fit(surf, fonts, s, pos, max_w: int, color=INK) -> None:
+    """Draw ``s`` at ``pos`` without ever running past ``max_w``: try the medium font, drop to small, then
+    ellipsize. (The decision header sits beside the Attention/Settings buttons; long ability prompts like
+    "Interrogate: name a card (or decline)" would otherwise render underneath them.)"""
+    for font in (fonts["med"], fonts["small"]):
+        if font.size(s)[0] <= max_w:
+            _text(surf, font, s, pos, color)
+            return
+    font = fonts["small"]
+    while s and font.size(s + "...")[0] > max_w:
+        s = s[:-1]
+    _text(surf, font, s.rstrip() + "...", pos, color)
 
 
 def _row_x(x0: int, count: int, gap: int, card_w: int, x_max: int = ROW_MAX_X) -> List[int]:
@@ -107,6 +155,62 @@ def _draw_card(surf, image, pos, *, highlight=False, dim=False, size=CARD):
     surf.blit(image, pos)
     pygame.draw.rect(surf, GOLD if highlight else (10, 10, 10), rect, 3 if highlight else 1)
     return rect
+
+
+KING = (int(CARD[0] * 1.1), int(CARD[1] * 1.1))    # the king reads as a LIFE -- bigger than a hand card
+_LIFE_GAP = 8
+LIFE_W = SMALL[0] + _LIFE_GAP + KING[0]            # hidden-card slot, then the king (king nearest the
+LIFE_X = ROW_MAX_X - LIFE_W                        # knowledge column); right-aligned strip
+KING_X = LIFE_X + SMALL[0] + _LIFE_GAP
+ROW_MAX_X_CARDS = LIFE_X - 16                      # card rows stop here so they never run under a life
+
+
+def _draw_life(surface, fonts, y: int, *, true_king: bool, flipped: bool, has_hidden: bool,
+               hidden_card=None, label: str = "", highlight: bool = False):
+    """One seat's life: the king (TrueKing = the player who started the game, King = the other) sits nearest
+    the knowledge column, with the face-down hidden card to its LEFT. A FLIPPED (used) king is drawn as an
+    upside-down card back -- the life is spent. A taken hidden card is simply absent.
+
+    Returns ``(king_rect, king_asset)`` so the caller can make the king clickable (flip-king) and
+    right-click previewable."""
+    small = fonts["small"]
+    asset = (cards.CARD_BACK_ASSET if flipped else
+             (cards.TRUE_KING_ASSET if true_king else cards.KING_ASSET))
+    if flipped:                                                   # spent life -> upside-down back
+        img = pygame.transform.rotate(assets.back_surface(KING), 180)
+    else:
+        img = assets.king_surface(KING, true_king=true_king)
+    rect = _draw_card(surface, img, (KING_X, y), size=KING, dim=flipped, highlight=highlight)
+    if label:
+        _text(surface, small, label, (LIFE_X, y - 20), MUTE)
+    if has_hidden:                                                # the set-aside card, still face-down
+        hy = y + (KING[1] - SMALL[1]) // 2
+        _draw_card(surface, assets.back_surface(SMALL), (LIFE_X, hy), size=SMALL)
+        name = cards.card_name(hidden_card) if hidden_card is not None else "hidden"
+        _text(surface, small, name, (LIFE_X, hy + SMALL[1] + 2), MUTE)
+    return rect, asset
+
+
+_PREVIEW_H = 900                                     # art is natively 700x955 -> 900px tall stays UNDER
+_PREVIEW = (int(_PREVIEW_H * 700 / 955), _PREVIEW_H)  # native res (no upscaling blur), aspect preserved
+
+
+def draw_card_preview(surface, fonts, asset: str, flipped: bool = False) -> None:
+    """Right-click zoom: the card's art, near-native size, centered over a dim scrim. ``asset`` is an
+    ``assets/`` filename (``render_frame`` hands them out in ``Frame.previews``)."""
+    W, H = WINDOW
+    scrim = pygame.Surface(WINDOW, pygame.SRCALPHA)
+    scrim.fill((0, 0, 0, 190))
+    surface.blit(scrim, (0, 0))
+    img = assets.image(asset, _PREVIEW)
+    if flipped:
+        img = pygame.transform.rotate(img, 180)
+    x, y = (W - _PREVIEW[0]) // 2, (H - _PREVIEW[1]) // 2
+    surface.blit(img, (x, y))
+    pygame.draw.rect(surface, GOLD, (x, y, *_PREVIEW), 2)
+    hint = "click anywhere / Esc to close"
+    _text(surface, fonts["small"], hint,
+          ((W - fonts["small"].size(hint)[0]) // 2, y + _PREVIEW[1] + 8), MUTE)
 
 
 _REACTION_KINDS = (StepKind.REACTION_KINGSHAND, StepKind.REACTION_ASSASSIN,
@@ -267,18 +371,35 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                  hover: Optional[int] = None, status: str = "", log: Optional[List[str]] = None,
                  bot_result=None, show_reasoning: bool = True, seed=None,
                  hint_result=None, show_hint: bool = False, knowledge=None,
-                 bot_eval=None, hint_eval=None, attn_available: bool = False) -> Frame:
+                 bot_eval=None, hint_eval=None, attn_available: bool = False,
+                 mouse: Optional[Tuple[int, int]] = None) -> Frame:
     surface.fill(BG)
     big, med, small = fonts["big"], fonts["med"], fonts["small"]
     opp = 1 - view.observer
 
     # --- opponent (top): face-down backs + info -----------------------------------------
-    _text(surface, med, f"Opponent (seat {opp})  -  {view.opp_hand_count} cards   "
-                        f"king: {'USED' if view.kings[opp] else 'up'}"
-                        f"{'   (has hidden)' if view.opp_has_hidden else ''}", (24, 16))
+    _text(surface, med, f"Opponent (seat {opp})  -  {view.opp_hand_count} cards", (24, 16))
     back = assets.back_surface(SMALL)
-    for i, x in enumerate(_row_x(24, view.opp_hand_count, 34, SMALL[0])):
+    for i, x in enumerate(_row_x(24, view.opp_hand_count, 34, SMALL[0], ROW_MAX_X_CARDS)):
         surface.blit(back, (x, 46))
+
+    # --- lives: a king per seat (+ its face-down hidden card), left of the knowledge column ------
+    previews: List[Tuple[pygame.Rect, str, bool]] = []
+    card_buttons: List[Tuple[pygame.Rect, Action]] = []
+    flip = next((m for m in legal_moves if m.kind == ActionKind.FLIP_KING), None)
+
+    r, a = _draw_life(surface, fonts, 78, true_king=(opp == view.starting_player),  # clear of top buttons
+                      flipped=view.kings[opp], has_hidden=view.opp_has_hidden, label=f"P{opp} life")
+    previews.append((r, a, view.kings[opp]))
+    me = view.observer
+    king_hot = flip is not None and mouse is not None
+    r, a = _draw_life(surface, fonts, 826, true_king=(me == view.starting_player),
+                      flipped=view.kings[me], has_hidden=view.own_hidden is not None,
+                      hidden_card=view.own_hidden, label=f"P{me} life (you)",
+                      highlight=bool(king_hot and pygame.Rect((KING_X, 826), KING).collidepoint(mouse)))
+    previews.append((r, a, view.kings[me]))
+    if flip is not None:                                  # your king is a BUTTON when it can be flipped
+        card_buttons.append((r, flip))
 
     # --- New Game button (top-right of the play area, left of the panel) -----------------
     new_game = pygame.Rect(ROW_MAX_X - 120, 12, 120, 30)
@@ -299,14 +420,18 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
         seed_s = f"seed {seed}"
         _text(surface, small, seed_s, (left_anchor - 12 - small.size(seed_s)[0], new_game.y + 7), MUTE)
 
-    # --- antechambers -------------------------------------------------------------------
-    y = 150
-    for seat, ante in enumerate(view.antechambers):
-        if ante:
-            _text(surface, small, f"antechamber[{seat}] (ascends next turn):", (24, y))
-            for c, x in zip(ante, _row_x(360, len(ante), 70, SMALL[0])):
-                _draw_card(surface, assets.card_surface(c, SMALL), (x, y - 8))
-            y += 84
+    # --- antechambers: each on ITS OWN side of the stack (opponent's up top, yours down by your hand) ---
+    def _draw_ante(seat: int, y: int) -> None:
+        ante = view.antechambers[seat]
+        if not ante:
+            return
+        _text(surface, small, f"antechamber[{seat}] (ascends next turn):", (24, y))
+        for c, x in zip(ante, _row_x(360, len(ante), 70, SMALL[0], ROW_MAX_X_CARDS)):
+            r = _draw_card(surface, assets.card_surface(c, SMALL), (x, y - 8), size=SMALL)
+            previews.append((r, cards.asset_path(c), False))
+
+    _draw_ante(opp, 150)                                  # above the stack -- theirs
+    _draw_ante(view.observer, 706)                        # between the stack and your hand -- yours
 
     # --- face-up leftover (known to both from the start; info only, NOT the leading card) -----
     # Sits in the free band above the stack (which fills top-y 466 rightward on a dense stack) and left
@@ -314,18 +439,20 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     if view.leftover_faceup is not None and 0 <= view.leftover_faceup < cards.DECK_SIZE:
         lx = ROW_MAX_X - SMALL[0] - 16
         _text(surface, small, "leftover (face-up, info):", (lx - 130, 342), MUTE)
-        _draw_card(surface, assets.card_surface(view.leftover_faceup, SMALL), (lx, 360), size=SMALL)
+        r = _draw_card(surface, assets.card_surface(view.leftover_faceup, SMALL), (lx, 360), size=SMALL)
+        previews.append((r, cards.asset_path(view.leftover_faceup), False))
 
     # --- stack (center) -----------------------------------------------------------------
     _text(surface, med, "Throne / stack:", (24, 430))
     if not view.stack:
         _text(surface, small, "(empty)", (200, 432), MUTE)
     from ..explain import _stack_value
-    xs = _row_x(24, len(view.stack), 70, CARD[0])
+    xs = _row_x(24, len(view.stack), 70, CARD[0], ROW_MAX_X_CARDS)
     for i, (sc, x) in enumerate(zip(view.stack, xs)):
         lead = (i == len(view.stack) - 1)
         img = assets.card_surface(sc.card, CARD)
-        _draw_card(surface, img, (x, 466), highlight=lead, dim=sc.disgraced)
+        r = _draw_card(surface, img, (x, 466), highlight=lead, dim=sc.disgraced)
+        previews.append((r, cards.asset_path(sc.card), False))
         # Compact value label (the card art already shows the name); avoids overlap on dense stacks.
         val = _stack_value(view, sc)
         label = "x0" if sc.disgraced else f"={val}"
@@ -333,13 +460,23 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
         if lead:
             _text(surface, small, "lead", (x + 4, 450), GOLD)
 
-    # --- your hand (bottom) -------------------------------------------------------------
-    _text(surface, med, f"Your hand (seat {view.observer})   "
-                        f"king: {'USED' if view.kings[view.observer] else 'up'}"
-                        f"{'   hidden: ' + cards.card_name(view.own_hidden) if view.own_hidden is not None else ''}",
-          (24, 800))
-    for c, x in zip(view.own_hand, _row_x(24, len(view.own_hand), 104, CARD[0])):
-        _draw_card(surface, assets.card_surface(c, CARD), (x, 832))
+    # --- your hand (bottom): each card is a BUTTON when exactly one legal move plays it -----------
+    # (a card with several legal moves stays panel-only -- clicking it could not say WHICH move you meant)
+    _text(surface, med, f"Your hand (seat {view.observer})", (24, 800))
+    by_card: dict = {}
+    for m in legal_moves:
+        if m.card is not None:
+            by_card.setdefault(m.card, []).append(m)
+    for c, x in zip(view.own_hand, _row_x(24, len(view.own_hand), 104, CARD[0], ROW_MAX_X_CARDS)):
+        moves = by_card.get(c, ())
+        playable = len(moves) == 1
+        r = pygame.Rect((x, 832), CARD)
+        hot = playable and mouse is not None and r.collidepoint(mouse)
+        _draw_card(surface, assets.card_surface(c, CARD), (x, 832), highlight=hot,
+                   dim=(not playable and bool(legal_moves)))
+        previews.append((r, cards.asset_path(c), False))
+        if playable:
+            card_buttons.append((r, moves[0]))
     if view.muted_values:
         _text(surface, small, f"muted values -> 3: {sorted(view.muted_values)}", (24, 976), MUTE)
 
@@ -352,7 +489,7 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     decision = DECISION_LABELS.get(kind, "GAME OVER") if kind is not None else "GAME OVER"
     if kind == StepKind.ABILITY_MAY and view.pending[-1].source is not None:
         decision = _ABILITY_MAY_LABEL.get(cards.card_ability(view.pending[-1].source), decision)
-    _text(surface, med, decision, (px, 14))
+    _text_fit(surface, fonts, decision, (px, 14), HDR_MAX_X - px)
     if status:
         _text(surface, small, status, (px, 42), GOLD)
     ctx = _reaction_context(view)
@@ -360,15 +497,15 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
         _text(surface, small, ctx, (px, 60), INK)
 
     buttons: List[Tuple[pygame.Rect, Action]] = []
-    max_rows = max(1, (ACT_BOTTOM - BTN_TOP) // BTN_H)
-    for i, move in enumerate(legal_moves[:max_rows]):
-        rect = pygame.Rect(px, BTN_TOP + i * BTN_H, PANEL_W, BTN_H - 4)
+    rects = action_rects(len(legal_moves))           # always fits: every legal move stays clickable
+    for i, (move, rect) in enumerate(zip(legal_moves, rects)):
         pygame.draw.rect(surface, BTN_HOVER if hover == i else BTN, rect, border_radius=4)
-        _text(surface, small, f"{i + 1}. {format_action(move, view)}", (rect.x + 8, rect.y + 5))
+        label = f"{i + 1}. {format_action(move, view)}"
+        while label and small.size(label)[0] > rect.w - 12:      # narrow (2-col) rows: clip, never overflow
+            label = label[:-1]
+        _text(surface, small, label, (rect.x + 8, rect.y + (rect.h - small.get_height()) // 2))
         buttons.append((rect, move))
-    if len(legal_moves) > max_rows:
-        _text(surface, small, f"... +{len(legal_moves) - max_rows} more (use CLI)",
-              (px, BTN_TOP + max_rows * BTN_H), MUTE)
+    buttons += card_buttons                          # clicking a hand card plays it (same click routing)
 
     # LOG
     pygame.draw.line(surface, DIVIDER, (PANEL_X + 8, LOG_TOP - 12), (WINDOW[0] - 8, LOG_TOP - 12))
@@ -390,9 +527,9 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     _text(surface, small, "Settings", (settings.x + 10, settings.y + 4))
     analysis = pygame.Rect(settings.x - 8 - 92, 12, 92, 24)   # attention-drawer toggle (left of Settings)
     pygame.draw.rect(surface, BTN if attn_available else DIVIDER, analysis, border_radius=4)
-    _text(surface, small, "Analysis", (analysis.x + 12, analysis.y + 4), INK if attn_available else MUTE)
+    _text(surface, small, "Attention", (analysis.x + 10, analysis.y + 4), INK if attn_available else MUTE)
     return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review, settings, scenario,
-                 attn_toggle=(analysis if attn_available else None))
+                 attn_toggle=(analysis if attn_available else None), previews=tuple(previews))
 
 
 # The engine (bot + analysis) modes, in pill order: (mode key, label). ``nn`` = NN-MCTS (hybrid-only).
@@ -402,20 +539,32 @@ ENGINE_PILLS = [("mcts", "Fixed N"), ("branching", "Branch"), ("hybrid", "Hybrid
 _SLIDER_RANGES = {"N": (25, 1024), "k": (10, 100), "l": (1, 8)}
 
 
-def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True):
+def _ckpt_label(path: str) -> str:
+    """``models/gen1_v3c_v2feat/attn_d64_L2.pt`` -> ``gen1_v3c_v2feat/attn_d64_L2`` (drop models/ + .pt)."""
+    p = path.replace("\\", "/")
+    p = p[len("models/"):] if p.startswith("models/") else p
+    return p[:-3] if p.endswith(".pt") else p
+
+
+def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True,
+                          nn_ckpts=None, nn_ckpt_ix=0):
     """Draw the engine-settings modal over the board and return its clickable controls:
-    ``{"pills": {mode: rect}, "sliders": [(track_rect, lo, hi, key), ...], "close": rect}``.
+    ``{"pills": {mode: rect}, "sliders": [...], "close": rect, "ckpt_prev": rect|None,
+    "ckpt_next": rect|None}``.
 
     ``engine`` = ``{"mode", "N", "k", "l"}``. Fixed mode shows one ``N`` slider; branch/hybrid/nn show ``k``
     and ``l`` (l = effective legal-moves for a sub-decision card at selection). ``nn`` (NN+MCTS) is
-    hybrid-only; when ``nn_available`` is False that pill is drawn disabled and its click is ignored."""
+    hybrid-only; when ``nn_available`` is False that pill is drawn disabled and its click is ignored.
+    In ``nn`` mode a checkpoint cycler picks WHICH net drives the search -- ``nn_ckpts`` (paths) selected
+    by ``nn_ckpt_ix``; both MLP and attention checkpoints are offered."""
     med, small = fonts["med"], fonts["small"]
     W, H = WINDOW
     dim = pygame.Surface((W, H), pygame.SRCALPHA)
     dim.fill((0, 0, 0, 160))
     surface.blit(dim, (0, 0))
     is_fixed = engine["mode"] == "mcts"
-    bw, bh = 680, (250 if is_fixed else 320)
+    show_ckpt = engine["mode"] == "nn" and bool(nn_ckpts)
+    bw, bh = 680, (250 if is_fixed else (376 if show_ckpt else 320))
     bx, by = (W - bw) // 2, (H - bh) // 2
     pygame.draw.rect(surface, PANEL, (bx, by, bw, bh), border_radius=8)
     pygame.draw.rect(surface, GOLD, (bx, by, bw, bh), 2, border_radius=8)
@@ -447,6 +596,7 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True):
         pygame.draw.circle(surface, GOLD, (kx, track.centery), 10)
         return (track, lo, hi, key)
 
+    ckpt_prev = ckpt_next = None
     if is_fixed:
         sliders = [slider_row(by + 140, "N")]
         preview = f"~ {engine['N']} simulations / decision"
@@ -458,12 +608,29 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True):
             preview = "clamp(k * eff_n(l) * (1 + opp_cards), 64, 4096)"
         else:
             preview = "clamp(k * eff_n(l), 64, 4096)"
+    if show_ckpt:                                     # WHICH net drives NN+MCTS (MLP or attention)
+        cy = by + 246
+        _text(surface, small, "NN checkpoint:", (bx + 20, cy - 22), GOLD)
+        ckpt_prev = pygame.Rect(bx + 20, cy, 30, 28)
+        ckpt_next = pygame.Rect(bx + bw - 20 - 30, cy, 30, 28)
+        for r, glyph in ((ckpt_prev, "<"), (ckpt_next, ">")):
+            pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=4)
+            _text(surface, small, glyph, (r.centerx - small.size(glyph)[0] // 2, r.y + 5), INK)
+        ix = nn_ckpt_ix % len(nn_ckpts)
+        name = _ckpt_label(nn_ckpts[ix])
+        box = pygame.Rect(ckpt_prev.right + 8, cy, ckpt_next.x - ckpt_prev.right - 16, 28)
+        pygame.draw.rect(surface, BG, box, border_radius=4)
+        tw = small.size(name)[0]
+        _text(surface, small, name, (box.centerx - tw // 2, box.y + 5), INK)
+        _text(surface, small, f"{ix + 1}/{len(nn_ckpts)}",
+              (box.right - 44, box.y + 5), MUTE)
     _text(surface, small, preview, (bx + 20, by + bh - 72), MUTE)
 
     close = pygame.Rect(bx + bw - 20 - 78, by + bh - 44, 78, 28)
     pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
     _text(surface, small, "Close", (close.x + 18, close.y + 5), INK)
-    return {"pills": pills, "sliders": sliders, "close": close}
+    return {"pills": pills, "sliders": sliders, "close": close,
+            "ckpt_prev": ckpt_prev, "ckpt_next": ckpt_next}
 
 
 def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", hover=None,
