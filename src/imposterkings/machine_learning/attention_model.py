@@ -20,7 +20,8 @@ import torch
 import torch.nn as nn
 
 from ..rules import NUM_PLAYERS
-from .features import ACTION_DIM, BOARD_DIM, CARD_DIM, PHASE_DIM, InformationSet, Tokens, tokenize
+from .features import (ACTION_DIM, BOARD_DIM, CARD_DIM, PHASE_DIM, InformationSet, Tokens, tokenize,
+                       tokenize_state, with_action)
 
 
 @dataclass(frozen=True)
@@ -248,7 +249,8 @@ def evaluator_from_model(model: AttentionModel):
         mover = state.to_play
         view = state.information_set(mover)
         moves = state.legal_moves()
-        batch = collate([tokenize(view, m) for m in moves])
+        st = tokenize_state(view, legal_moves=moves)      # featurize the state ONCE (no re-determinize)
+        batch = collate([with_action(st, m) for m in moves])
         q = model(batch["cards"], batch["board"], batch["phase"], batch["action"], batch["card_mask"])[0]
         v = float(q.max())
         value = [0.0] * NUM_PLAYERS

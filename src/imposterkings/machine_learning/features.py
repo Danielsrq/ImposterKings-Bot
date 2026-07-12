@@ -314,10 +314,14 @@ def _action_vec(action: Optional[Action]) -> np.ndarray:
     return v
 
 
-def tokenize(view: InformationSet, action: Optional[Action] = None) -> Tokens:
-    """The attention-model adapter: the acting seat's InfoSet -> card tokens + singleton board / phase
-    / action tokens + per-card labels. ``action`` (a candidate move) marks ``is_candidate_action`` and
-    fills the action token for "action-in" scoring ``f(state, action) -> q``."""
+def tokenize_state(view: InformationSet, legal_moves=None) -> Tokens:
+    """The ACTION-INDEPENDENT part of :func:`tokenize`: card tokens + board/phase + labels, with a
+    zero action vector. Compute this ONCE per position and stamp candidates per move via
+    :func:`with_action` -- the evaluator's per-leaf hot path (avoids re-featurizing the state and
+    re-running ``legal_moves -> determinize`` for every candidate move).
+
+    ``legal_moves``: the position's legal moves, if the caller already has them (skips the internal
+    ``view.legal_moves()`` call and its determinization)."""
     obs = view.observer
     muted = view.muted_values
     toks: List[np.ndarray] = []
@@ -328,10 +332,11 @@ def tokenize(view: InformationSet, action: Optional[Action] = None) -> Tokens:
         labels.append(f"{zone}:{_NAMES[tix] if tix is not None else '?'}")
 
     legal_types = set()
-    if view.to_play == obs:                                       # legal_moves() needs the actor's seat
-        for a in view.legal_moves():
-            if a.kind == ActionKind.PLAY_CARD and a.card is not None:
-                legal_types.add(_type_ix(a.card))
+    if legal_moves is None and view.to_play == obs:               # legal_moves() needs the actor's seat
+        legal_moves = view.legal_moves()
+    for a in (legal_moves or ()):
+        if a.kind == ActionKind.PLAY_CARD and a.card is not None:
+            legal_types.add(_type_ix(a.card))
 
     # stack positions already committed to a pending disgrace (not yet flagged disgraced) -> by type
     selected_types = set()
@@ -381,22 +386,27 @@ def tokenize(view: InformationSet, action: Optional[Action] = None) -> Tokens:
         t = _type_ix(view.leftover_faceup)
         add(t, "leftover", _eff_by_type(t, muted), is_muted=muted_of(t))
 
-    if action is not None:
-        _mark_candidate(toks, labels, action)
-
     cards_arr = np.stack(toks) if toks else np.zeros((0, CARD_DIM), np.float32)
-    return Tokens(cards_arr, _board_token(view), _phase_token(view), _action_vec(action), labels)
+    return Tokens(cards_arr, _board_token(view), _phase_token(view), _action_vec(None), labels)
 
 
-def _mark_candidate(toks: List[np.ndarray], labels: List[str], action: Action) -> None:
-    """Point ``is_candidate_action`` at the involved token; append a transient ``*`` choice token if
-    none matches (a guess claims the opponent holds ``name``; an unmatched card play)."""
+def with_action(tok: Tokens, action: Optional[Action]) -> Tokens:
+    """Stamp a candidate ``action`` onto precomputed state tokens (copy-on-write; ``tok`` is never
+    mutated): point ``is_candidate_action`` at the involved token -- appending a transient ``*`` choice
+    token if none matches (a guess claiming a card the opponent isn't known to hold; an unmatched
+    play) -- and fill the action vector."""
+    if action is None:
+        return tok
+    cards = tok.cards.copy()
+    labels = list(tok.labels)
+    extra: List[np.ndarray] = []
+
     def flag(label: str, tix: int, zone: str):
-        for i, lb in enumerate(labels):
+        for i, lb in enumerate(tok.labels):
             if lb == label:
-                toks[i][_CAND_IX] = 1.0
+                cards[i, _CAND_IX] = 1.0
                 return
-        toks.append(_card_token(tix, zone, float(_TYPE_BASE[tix]), is_candidate=1.0))
+        extra.append(_card_token(tix, zone, float(_TYPE_BASE[tix]), is_candidate=1.0))
         labels.append(label + "*")
 
     if action.card is not None:
@@ -405,6 +415,19 @@ def _mark_candidate(toks: List[np.ndarray], labels: List[str], action: Action) -
     if action.name is not None:
         tix = _TYPE_IX[action.name]
         flag(f"opp_known:{_NAMES[tix]}", tix, "opp_known")
+    if extra:
+        cards = np.concatenate([cards, np.stack(extra)]) if cards.size else np.stack(extra)
+    return Tokens(cards, tok.board, tok.phase, _action_vec(action), labels)
+
+
+def tokenize(view: InformationSet, action: Optional[Action] = None) -> Tokens:
+    """The attention-model adapter: the acting seat's InfoSet -> card tokens + singleton board / phase
+    / action tokens + per-card labels. ``action`` (a candidate move) marks ``is_candidate_action`` and
+    fills the action token for "action-in" scoring ``f(state, action) -> q``.
+
+    Equivalent to ``with_action(tokenize_state(view), action)`` -- use that split directly when scoring
+    MANY candidate actions of one position (the state half is computed once)."""
+    return with_action(tokenize_state(view), action)
 
 
 # --- interpretability: one label per dim of each token kind (mirrors feature_names()) --------------

@@ -240,3 +240,80 @@ def test_fuzz_invariants_over_random_games():
             steps += 1
             plies += 1
     assert plies > 500                                                    # actually exercised many states
+
+
+# --- tokenize_state / with_action split (the evaluator's tokenize-once hot path) --------------------
+
+def test_split_equals_monolithic_tokenize():
+    # with_action(tokenize_state(view), a) must equal tokenize(view, a) for EVERY legal move, and the
+    # shared state tokens must never be mutated by the stamping (copy-on-write).
+    rng = np.random.default_rng(7)
+    for g in range(6):
+        s = GameState.deal(np.random.default_rng(g))
+        steps = 0
+        while not s.is_terminal() and steps < 40:
+            view = InformationSet.from_state(s, s.to_play)
+            legal = view.legal_moves()
+            st = F.tokenize_state(view, legal_moves=legal)
+            base = st.cards.copy()
+            for a in legal:
+                got, want = F.with_action(st, a), F.tokenize(view, a)
+                assert np.array_equal(got.cards, want.cards)
+                assert np.array_equal(got.action, want.action)
+                assert got.labels == want.labels
+                assert np.array_equal(got.board, want.board) and np.array_equal(got.phase, want.phase)
+            assert np.array_equal(st.cards, base)                     # base tokens untouched
+            assert (st.cards[:, F._CAND_IX] == 0.0).all()             # no candidate leaked into the base
+            s = s.apply(legal[rng.integers(len(legal))])
+            steps += 1
+
+
+def test_evaluator_determinizes_once_per_leaf(tmp_path):
+    # The attention evaluator must not re-run view.legal_moves() (-> determinize) per candidate move.
+    torch = pytest.importorskip("torch")
+    from imposterkings.machine_learning.attention_model import AttentionModel, AttnConfig
+    from imposterkings.machine_learning.attention_model import evaluator_from_model, save
+
+    torch.manual_seed(0)
+    ev = evaluator_from_model(AttentionModel(AttnConfig(d_model=32)).eval())
+    calls = {"n": 0}
+    orig = InformationSet.legal_moves
+
+    def counting(self, *a, **kw):
+        calls["n"] += 1
+        return orig(self, *a, **kw)
+
+    InformationSet.legal_moves = counting
+    try:
+        s = GameState.deal(np.random.default_rng(3))
+        while len(s.legal_moves()) < 3:                                # a leaf with several candidates
+            s = s.apply(s.legal_moves()[0])
+        calls["n"] = 0
+        ev(s)
+        assert calls["n"] == 0                                         # legal moves passed in, never recomputed
+    finally:
+        InformationSet.legal_moves = orig
+
+
+def test_state_legal_moves_equal_view_legal_moves_for_tokenize():
+    # The evaluator passes state.legal_moves() (TRUE state) where tokenize used view.legal_moves()
+    # (a determinized sample). The featurizer only extracts PLAY_CARD legality, which depends solely on
+    # observer-known info -- so the tokens must be IDENTICAL under either source, for any determinization.
+    rng = np.random.default_rng(11)
+    checked = 0
+    for g in range(8):
+        s = GameState.deal(np.random.default_rng(100 + g))
+        steps = 0
+        while not s.is_terminal() and steps < 40:
+            view = InformationSet.from_state(s, s.to_play)
+            via_state = F.tokenize_state(view, legal_moves=s.legal_moves())
+            via_view = F.tokenize_state(view, legal_moves=view.legal_moves())   # fresh determinization
+            internal = F.tokenize_state(view)                                   # another determinization
+            assert np.array_equal(via_state.cards, via_view.cards)
+            assert np.array_equal(via_state.cards, internal.cards)
+            assert via_state.labels == internal.labels
+            checked += 1
+            legal = s.legal_moves()
+            s = s.apply(legal[rng.integers(len(legal))])
+            steps += 1
+    assert checked > 200
