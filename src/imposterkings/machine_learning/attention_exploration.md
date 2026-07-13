@@ -405,8 +405,8 @@ Direct head-to-heads (100 mirrored deals = 200 games, hybrid-k20-l3 both sides):
    - **Attention is more selective than it first appeared.** Averaged over the last layer the heads look
      diffuse (83–86% of uniform entropy) — but that average is dominated by the last layer's CARD rows,
      which are *computed and discarded* and therefore never receive gradient. Measured causally, **layer 1 is
-     genuinely selective** (0.64–0.67, having moved ~0.25 from init); only the final readout row (0.79) is
-     fuzzy. This validates the Phase-7 causal routing the drawer already uses.
+     genuinely selective** (64–67% of uniform, having moved ~25 points from init); only the final readout
+     row (79%) is fuzzy. This validates the Phase-7 causal routing the drawer already uses.
 3. **Timing footnote (affects earlier absolute numbers):** during this study we found Windows 11 had been
    E-core-throttling all background-launched runs (10 workers confined to 4 E-cores). De-throttled,
    datagen runs 42.3 s/game (9.7× parallel speedup) and anchor evals ~25 s/game. Study-3's CPU-s/game
