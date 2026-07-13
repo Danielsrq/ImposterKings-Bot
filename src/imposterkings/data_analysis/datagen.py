@@ -23,6 +23,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from ..arena import play_game
+from ..machine_learning.benchmark import parse_spec   # 'fixed500' / 'hybrid-k20-l3' -> a Spec tuple
 from ..record import DecisionRecord, GameRecord, write_jsonl
 from .budget_scaling import make_agent, spec_label
 
@@ -63,29 +64,61 @@ class _TemperatureAgent:
         return move
 
 
-def _gen_meta(spec: Spec, temp_plies: int, base_seed: int, value_ckpt=None) -> Dict:
-    return {"spec": spec_label(spec), "mode": spec[0], "k": spec[1],
-            "l": spec[2] if len(spec) > 2 else None,
-            "temp_plies": temp_plies, "self_play": True, "base_seed": base_seed,
-            "value_ckpt": value_ckpt}
+def _gen_meta(spec: Spec, temp_plies: int, base_seed: int, value_ckpt=None,
+              opp_spec: Spec = None, opp_ckpt=None, primary_seat: int = None) -> Dict:
+    m = {"spec": spec_label(spec), "mode": spec[0], "k": spec[1],
+         "l": spec[2] if len(spec) > 2 else None,
+         "temp_plies": temp_plies, "self_play": opp_spec is None, "base_seed": base_seed,
+         "value_ckpt": value_ckpt,
+         "opponent_spec": spec_label(opp_spec) if opp_spec else None, "opponent_ckpt": opp_ckpt}
+    if opp_spec is not None:                          # asymmetric: only the PRIMARY seat is labelled
+        m["primary_seat"], m["record"] = primary_seat, "primary"
+    return m
+
+
+def primary_seat_for(seed: int) -> int:
+    """Which seat the primary (labelled) agent takes. Alternates with the seed -- seeds are consecutive,
+    so seats mirror across the corpus: deterministic, replayable, and free of seat bias."""
+    return seed % 2
 
 
 def collect_game(spec: Spec, seed: int, temp_plies: int, base_seed: int,
-                 evaluator=None, value_ckpt=None) -> GameRecord:
-    """Play one self-play game from deal ``seed``; return a replayable, target-carrying GameRecord.
+                 evaluator=None, value_ckpt=None,
+                 opp_spec: Spec = None, opp_evaluator=None, opp_ckpt=None) -> GameRecord:
+    """Play one game from deal ``seed``; return a replayable, target-carrying GameRecord.
 
-    ``evaluator`` (from a checkpoint) turns the self-play agents into NN-MCTS (PUCT); ``value_ckpt`` is
-    its path, recorded in the gen meta for provenance."""
-    def mk():
-        a = make_agent(spec, evaluator=evaluator)
+    Self-play by default (both seats = ``spec``). With ``opp_spec`` the game is **asymmetric**: the primary
+    agent (``spec``, seat :func:`primary_seat_for`) faces a different opponent -- used to reach positions
+    self-play never visits.
+
+    In an asymmetric game only the PRIMARY's decisions carry candidates (its ``mean_q`` is the training
+    target). The opponent's moves are still recorded -- ``chosen`` is what makes the game replayable -- but
+    with NO candidates, so ``token_dataset`` replays them and builds no rows from them (its guard is
+    ``if cands:``). Passing ``agent=None`` to ``DecisionRecord.build`` is what strips them: it reads
+    ``agent.last_result``. So we harvest the opponent's *positions* without ever learning its (rollout-noise)
+    *values*.
+
+    ``evaluator`` (from a checkpoint) turns an agent into NN-MCTS (PUCT); ``value_ckpt`` is its path,
+    recorded in the gen meta for provenance."""
+    def mk(sp, ev):
+        a = make_agent(sp, evaluator=ev)
         return _TemperatureAgent(a, temp_plies) if temp_plies > 0 else a
 
-    rec = GameRecord(gen=_gen_meta(spec, temp_plies, base_seed, value_ckpt), deal_seed=seed)
+    seat = primary_seat_for(seed) if opp_spec is not None else 0
+    rec = GameRecord(gen=_gen_meta(spec, temp_plies, base_seed, value_ckpt, opp_spec, opp_ckpt, seat),
+                     deal_seed=seed)
+    if opp_spec is None:
+        agents = [mk(spec, evaluator), mk(spec, evaluator)]
+    else:
+        agents = [None, None]
+        agents[seat] = mk(spec, evaluator)
+        agents[1 - seat] = mk(opp_spec, opp_evaluator)
 
-    def collect(seat, view, move, agent, state):
-        rec.decisions.append(DecisionRecord.build(seat, view, move, agent))
+    def collect(s, view, move, agent, state):
+        labelled = (opp_spec is None) or (s == seat)          # opponent: replayed, but UNLABELLED
+        rec.decisions.append(DecisionRecord.build(s, view, move, agent if labelled else None))
 
-    winner, rewards, term = play_game([mk(), mk()], np.random.default_rng(seed), on_decision=collect)
+    winner, rewards, term = play_game(agents, np.random.default_rng(seed), on_decision=collect)
     rec.winner = winner
     rec.rewards = list(rewards)
     rec.starting_player = term.starting_player
@@ -111,15 +144,18 @@ def _existing_state(out_dir: str) -> Tuple[int, int, Dict]:
 
 
 def _chunk_task(spec: Spec, seeds: List[int], out_dir: str, shard_idx: int,
-                temp_plies: int, base_seed: int, value_ckpt=None) -> Dict:
+                temp_plies: int, base_seed: int, value_ckpt=None,
+                opp_spec: Spec = None, opp_ckpt=None) -> Dict:
     t0 = time.perf_counter()
-    ev = None
-    if value_ckpt:                                    # NN-MCTS self-play: build the evaluator once/worker
+    ev = opp_ev = None
+    if value_ckpt or opp_ckpt:                        # NN-MCTS: build each evaluator ONCE per worker
         import torch
         torch.set_num_threads(1)                      # attention evals run torch; avoid oversubscription
         from ..machine_learning.benchmark import _evaluator_for
-        ev = _evaluator_for(value_ckpt)               # checkpoint-type dispatch: MLP or attention
-    recs = [collect_game(spec, s, temp_plies, base_seed, evaluator=ev, value_ckpt=value_ckpt)
+        ev = _evaluator_for(value_ckpt) if value_ckpt else None      # ckpt-type dispatch: MLP|attention
+        opp_ev = _evaluator_for(opp_ckpt) if opp_ckpt else None      # None -> vanilla rollout MCTS
+    recs = [collect_game(spec, s, temp_plies, base_seed, evaluator=ev, value_ckpt=value_ckpt,
+                         opp_spec=opp_spec, opp_evaluator=opp_ev, opp_ckpt=opp_ckpt)
             for s in seeds]
     path = os.path.join(out_dir, f"games_{shard_idx:05d}.jsonl")
     write_jsonl(path, recs)
@@ -128,16 +164,19 @@ def _chunk_task(spec: Spec, seeds: List[int], out_dir: str, shard_idx: int,
 
 def run(spec: Spec, games: int, workers: int, chunk: int, base_seed: int,
         temp_plies: int, out_dir: str, value_ckpt=None,
-        seed_offset: int = 0, shard_offset: int = 0) -> List[Dict]:
+        seed_offset: int = 0, shard_offset: int = 0,
+        opp_spec: Spec = None, opp_ckpt=None) -> List[Dict]:
     """``seed_offset``/``shard_offset`` support resumable corpora: seeds continue at
     ``base_seed + seed_offset`` and shard files at ``games_{shard_offset:05d}.jsonl`` (the recorded ``gen``
-    meta keeps the ORIGINAL base_seed so later resumes can verify against it)."""
+    meta keeps the ORIGINAL base_seed so later resumes can verify against it). ``opp_spec`` switches from
+    self-play to an asymmetric primary-vs-opponent corpus (see :func:`collect_game`)."""
     from joblib import Parallel, delayed
     from tqdm import tqdm
 
     seeds = [base_seed + seed_offset + i for i in range(games)]
     chunks = [seeds[i:i + chunk] for i in range(0, games, chunk)]
-    jobs = [delayed(_chunk_task)(spec, ch, out_dir, shard_offset + idx, temp_plies, base_seed, value_ckpt)
+    jobs = [delayed(_chunk_task)(spec, ch, out_dir, shard_offset + idx, temp_plies, base_seed, value_ckpt,
+                                 opp_spec, opp_ckpt)
             for idx, ch in enumerate(chunks)]
     return list(tqdm(Parallel(n_jobs=workers, return_as="generator")(jobs),
                      total=len(chunks), desc="shards", unit="shard"))
@@ -161,16 +200,28 @@ def main(argv=None) -> None:
                         "shards continue at the next free index (flags must match the corpus)")
     p.add_argument("--value-checkpoint", default=None,
                    help="NN checkpoint -> NN-MCTS (PUCT) self-play instead of rollout MCTS")
+    p.add_argument("--opponent", default=None,
+                   help="ASYMMETRIC corpus: play the primary agent against this opponent spec "
+                        "('fixed500' | 'hybrid-k20-l3' | ...) instead of self-play. Only the primary's "
+                        "decisions are labelled; the opponent's are recorded (so games still replay) but "
+                        "carry no candidates -- we harvest its POSITIONS, never its values.")
+    p.add_argument("--opponent-checkpoint", default=None,
+                   help="NN checkpoint for --opponent (default: none -> vanilla rollout MCTS)")
     args = p.parse_args(argv)
 
     spec: Spec = ("fixed", args.k) if args.mode == "fixed" else (args.mode, args.k, args.l)
+    opp_spec: Spec = parse_spec(args.opponent) if args.opponent else None
+    if args.opponent_checkpoint and not args.opponent:
+        p.error("--opponent-checkpoint requires --opponent (the budget the net searches at)")
     seed_offset = shard_offset = 0
     if args.resume:
         n0, shard_offset, prev = _existing_state(args.out_dir)
         if n0 == 0:
             p.error(f"--resume: no existing shards found in {args.out_dir}")
-        cur = _gen_meta(spec, args.temp_plies, args.base_seed, args.value_checkpoint)
-        for key in ("spec", "temp_plies", "base_seed", "value_ckpt"):
+        cur = _gen_meta(spec, args.temp_plies, args.base_seed, args.value_checkpoint,
+                        opp_spec, args.opponent_checkpoint)
+        for key in ("spec", "temp_plies", "base_seed", "value_ckpt",   # NOT primary_seat: it is per-game
+                    "opponent_spec", "opponent_ckpt"):
             if prev.get(key) != cur[key]:
                 p.error(f"--resume mismatch on {key!r}: corpus has {prev.get(key)!r}, "
                         f"flags give {cur[key]!r} -- refusing to mix engines/seeds in one corpus")
@@ -184,14 +235,21 @@ def main(argv=None) -> None:
 
     n_shards = (args.games + args.chunk - 1) // args.chunk
     engine = f"NN-MCTS(PUCT) <- {args.value_checkpoint}" if args.value_checkpoint else "rollout MCTS"
+    if opp_spec is None:
+        matchup = "SELF-PLAY (both seats labelled)"
+    else:
+        opp_eng = f"NN-MCTS <- {args.opponent_checkpoint}" if args.opponent_checkpoint else "rollout MCTS"
+        matchup = (f"ASYMMETRIC vs {spec_label(opp_spec)} [{opp_eng}]  "
+                   f"-- only the primary's decisions are labelled (seats mirror by seed)")
     print(f"datagen  spec={spec_label(spec)}  engine={engine}  games={args.games}  "
           f"temp_plies={args.temp_plies}  chunk={args.chunk} -> {n_shards} shards  "
-          f"workers={args.workers}  base_seed={args.base_seed}\n  -> {args.out_dir}")
+          f"workers={args.workers}  base_seed={args.base_seed}\n  {matchup}\n  -> {args.out_dir}")
 
     t0 = time.perf_counter()
     results = run(spec, args.games, args.workers, args.chunk, args.base_seed,
                   args.temp_plies, args.out_dir, value_ckpt=args.value_checkpoint,
-                  seed_offset=seed_offset, shard_offset=shard_offset)
+                  seed_offset=seed_offset, shard_offset=shard_offset,
+                  opp_spec=opp_spec, opp_ckpt=args.opponent_checkpoint)
     wall = time.perf_counter() - t0
 
     games = sum(r["count"] for r in results)

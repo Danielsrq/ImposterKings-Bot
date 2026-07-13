@@ -324,13 +324,14 @@ Replayed once, featurized twice (log-once/derive-many): **236,647 rows / 41,807 
 skips**, identical row sets for both featurizations — the A/B differs ONLY in encoding. Same arch
 everywhere: v3c = d64/h4/L2/ffn256. GPU training (RTX 3060 Ti), same hypers as Studies 2–3.
 
-| model | feat | params | train-time | epochs | val_mse | top1_bestq | recall@2 | spearman | **anchor winrate** |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| gen1-v1feat | v1 | 111,233 | 167 s | 19 | 0.0435 | **53.8%** | 77.4% | 0.448 | **54.5% (± 5.4%)** |
-| gen1-v2feat | v2.2 | 108,737 | **69 s** | 17 | **0.0355** | 53.1% | **79.7%** | **0.469** | **52.5% (± 6.1%)** |
+| model | feat | params | train-time | epochs | train_mse | val_mse | gap | top1_bestq | recall@2 | spearman | **anchor winrate** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| gen1-v1feat | v1 | 111,233 | 167 s | 19 | 0.0351 | 0.0435 | +0.0084 | **53.8%** | 77.4% | 0.448 | **54.5% (± 5.4%)** |
+| gen1-v2feat | v2.2 | 108,737 | **69 s** | 17 | **0.0300** | **0.0355** | **+0.0055** | 53.1% | **79.7%** | **0.469** | **52.5% (± 6.1%)** |
 
 (val_mse is NOT comparable to Studies 2–3 — different corpus, different label distribution. Anchor =
-`MLP256-MCTS@k20-l3`, same 100 mirrored deals/base-seed as Study 3, where gen-0 v3c scored 50.0%.)
+`MLP256-MCTS@k20-l3`, same 100 mirrored deals/base-seed as Study 3, where gen-0 v3c scored 50.0%.
+Predict-the-mean baseline = 0.2081 for both, so variance explained is 79.1% (v1) vs **82.9%** (v2.2).)
 
 Direct head-to-heads (100 mirrored deals = 200 games, hybrid-k20-l3 both sides):
 
@@ -349,14 +350,63 @@ Direct head-to-heads (100 mirrored deals = 200 games, hybrid-k20-l3 both sides):
    loops typically need several generations and/or bigger search budgets per label to climb. Note the
    **confound**: gen-1 also trains on post-mute-fix rules, so any gain/loss mixes "bootstrap" with
    "corrected mute knowledge" (rare states; chosen deliberately — no gen-0 merge).
-2. **Featurization v2.2 = v1 on strength, better on everything else.** Exact parity head-to-head
-   (100/200) and overlapping anchors — but on IDENTICAL training rows v2.2 posts **−18% val_mse**
-   (0.0355 vs 0.0435), **+2.3pp recall@2**, **+0.021 spearman**, with ~2% fewer params, **2.15× faster
-   GPU epochs** (4.1 vs 8.8 s — the fixed shapes removed the ragged-collate bottleneck, as predicted in
-   the design record) and per-leaf inference parity (10.9 vs 10.9 ms/leaf measured under contention;
-   S=24 costs what the mask/ragged removal saves). Adoption case for v2.2 is therefore NOT winrate: it is
-   fit quality + training speed + the explainability properties it was designed for (fixed axes, zone
-   posteriors as attendable beliefs, kings as entities, belief-net socket).
+2. **Featurization v2.2 = v1 on strength, better on everything else — but the headline was inflated.**
+   Exact parity head-to-head (100/200) and overlapping anchors. On IDENTICAL training rows v2.2 posts
+   **+2.3pp recall@2**, **+0.021 spearman**, ~2% fewer params, **2.15× faster GPU epochs** (4.1 vs 8.8 s —
+   the fixed shapes removed the ragged-collate bottleneck, as predicted in the design record) and per-leaf
+   inference parity (10.9 vs 10.9 ms/leaf; S=24 costs what the mask/ragged removal saves).
+   ⚠️ **CORRECTION (see finding 4): the "−18% val_mse" originally recorded here is a MAX-OF-NOISE artifact.**
+   We reported `val_mse` as the MIN over epochs of a curve that bounces ±0.008 epoch-to-epoch — the same
+   size as the effect being measured — so it cherry-picks whichever run got the luckiest epoch. Under any
+   robust estimator the gap is **≈ −10%**, not −18%:
+
+   | estimator | v1 | v2.2 | gap |
+   |---|---:|---:|---:|
+   | min (what we reported) | 0.0435 | 0.0355 | −18% |
+   | mean of best 3 epochs | 0.0442 | 0.0388 | −12% |
+   | mean of best 5 epochs | 0.0452 | 0.0400 | −11% |
+   | median of last 10 epochs | 0.0478 | 0.0441 | −8% |
+
+   The DIRECTION is robust (v2.2 wins under every estimator), and the train/val gap says the fit is real
+   rather than memorized: v2.2 is lower on BOTH train (0.0300 vs 0.0351) and val, AND has the SMALLER gap
+   (+0.0055 vs +0.0084; relative overfit 18% vs 24%) — a featurization that merely eased memorization would
+   show a lower train_mse bought with a WIDER gap (cf. v4e's +0.0109, the program's widest). So the
+   adoption case for v2.2 stands, but on fit quality + training speed + explainability, not on a −18% that
+   was mostly luck.
+4. **The plateau is NOT a noise floor — 86% of our val error is MODEL error** (measured 2026-07-13).
+   Re-searching 200 fixed positions 6× each with different RNG seeds gives the irreducible variance of the
+   `mean_q` label:
+
+       val_mse = model_error + label_noise
+       0.0435  =    0.0376   +   0.0059          (k20 labels; k50 = 0.0056, only −5% weighted)
+
+   A perfect model would score **0.0059** — typical error could shrink ~2.7× (RMSE 0.209 → 0.077; variance
+   explained 79% → 97%). So "every architecture change improves the proxies and none move the winrate"
+   cannot be blamed on irreducible label noise; there is real headroom being left on the table.
+   Two corollaries: (a) **k50's cleaner labels are nearly worthless** — the visit-share weighting concentrates
+   on the high-visit moves, which are the *close calls* and therefore the NOISIEST (var 0.0069 vs 0.0053 for
+   low-visit), so the weighted floor barely moves. The k50 corpus's value is 2,000 more games of coverage,
+   not better labels. (b) Comparing val_mse across corpora with different search budgets is invalid — a
+   cleaner-label corpus raises the achievable R² even if the model is unchanged.
+5. **Training-procedure defects found by an activation audit** (`inspect_activations.py`):
+   - **The LR never decayed.** Adam ran at a constant 1e-3 for all 3,971 steps, so the optimizer was still
+     taking full-size steps at the last epoch — the val curve did not converge, it *bounced* (see the
+     correction in finding 2). Adding **warmup + cosine decay** fixes it: last-5-epoch std 0.012 → **0.0014**,
+     and the ranking metrics jump — **top1 48.4% → 55.7%, spearman 0.400 → 0.494, recall@2 75.7 → 79.8**
+     (clean single-variable A/B, 40 epochs, same corpus/arch/seed). Those are the metrics that pick the move.
+   - **Init was confidently wrong**: an untrained net scored 0.2662 vs a 0.2020 predict-the-mean baseline
+     (32% worse than predicting nothing), emitting a constant q = −0.246 while the label mean is −0.011.
+     Cause: the head's random bias with no final LayerNorm on the residual stream.
+   - **Rejected after measuring** (recorded so we do not redo them): a **final LayerNorm** made things WORSE
+     (top1 55.7 → 54.1) — normalizing the CLS vector discards its magnitude; **tanh saturation is a non-issue**
+     (0.03% of rows; the model hedges under noisy labels, which *protects* it); **GELU has 0/256 dead units**;
+     **Kaiming init is inert** (LayerNorm provably erases trunk init scale; residual growth at L=2 is 1.07×);
+     clamping the 1% of ±1.0 labels is worth ~0.2% of loss. Only the **cosine schedule** survived.
+   - **Attention is more selective than it first appeared.** Averaged over the last layer the heads look
+     diffuse (83–86% of uniform entropy) — but that average is dominated by the last layer's CARD rows,
+     which are *computed and discarded* and therefore never receive gradient. Measured causally, **layer 1 is
+     genuinely selective** (0.64–0.67, having moved ~0.25 from init); only the final readout row (0.79) is
+     fuzzy. This validates the Phase-7 causal routing the drawer already uses.
 3. **Timing footnote (affects earlier absolute numbers):** during this study we found Windows 11 had been
    E-core-throttling all background-launched runs (10 workers confined to 4 E-cores). De-throttled,
    datagen runs 42.3 s/game (9.7× parallel speedup) and anchor evals ~25 s/game. Study-3's CPU-s/game

@@ -16,7 +16,7 @@ import argparse
 import glob
 import json
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -25,12 +25,34 @@ from ..state import GameState
 from .features import ACTION_DIM, BOARD_DIM, CARD_DIM, PHASE_DIM, tokenize
 
 
-def build(data_dir: str, out_path: str, limit: Optional[int] = None, feat: str = "v1") -> Dict:
-    """``feat="v2"`` builds FIXED-shape rows via ``features2.tokenize`` (cards [n,18,46] + kings
-    [n,2,4], no ragged offsets); "v1" is the original variable-length path, byte-identical."""
+def _guard_seed(seed: int, seen: set, shard: str) -> None:
+    """``game_id == deal_seed`` and train/val split BY GAME -- so two corpora sharing a seed would fuse two
+    DIFFERENT games under one id and leak rows across the split. Fail loudly rather than corrupt silently."""
+    if seed in seen:
+        raise ValueError(
+            f"duplicate deal_seed {seed} (again in {shard}). Pooled corpora must use DISJOINT --base-seed "
+            f"ranges: game_id == deal_seed, and the train/val split is by game_id, so a collision fuses two "
+            f"different games and leaks them across the split.")
+    seen.add(seed)
+
+
+def _shards(data_dir) -> List[str]:
+    """Every shard across one or MORE corpus dirs (pooling gen-1 + k50 + mixed without copying shards).
+
+    Pooling is only sound when the corpora use DISJOINT deal-seed ranges: ``game_id == deal_seed`` and
+    ``train_tokens`` splits train/val by game_id, so colliding seeds would fuse different games under one
+    id (and leak across the split). ``build`` asserts this."""
+    dirs = [data_dir] if isinstance(data_dir, str) else list(data_dir)
+    return sorted(f for d in dirs for f in glob.glob(os.path.join(d, "*.jsonl")))
+
+
+def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1") -> Dict:
+    """``data_dir`` is one corpus dir or a LIST of them (pooled). ``feat="v2"`` builds FIXED-shape rows via
+    ``features2.tokenize`` (cards [n,18,46] + kings [n,2,4], no ragged offsets); "v1" is the original
+    variable-length path, byte-identical."""
     if feat == "v2":
         return _build_v2(data_dir, out_path, limit)
-    files = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
+    files = _shards(data_dir)
     try:
         from tqdm import tqdm
         files = tqdm(files, desc="shards", unit="shard")
@@ -42,9 +64,11 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None, feat: str =
     board, phase, action = [], [], []
     y, w, z, gid, did, chosen = [], [], [], [], [], []
     n_games = n_skipped = dec_id = total_tokens = 0
+    seen: set = set()
     for f in files:
         for rec in read_jsonl(f):
             g = rec["deal_seed"]
+            _guard_seed(g, seen, f)
             rewards = rec["rewards"]
             st = GameState.deal(np.random.default_rng(g))
             mark = (len(cards_chunks), len(offsets), len(board), total_tokens, dec_id)
@@ -100,16 +124,17 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None, feat: str =
     meta = {"card_dim": CARD_DIM, "board_dim": BOARD_DIM, "phase_dim": PHASE_DIM,
             "action_dim": ACTION_DIM, "target": "q", "n_rows": int(arrs["y"].shape[0]),
             "n_games": n_games, "n_skipped_desynced": n_skipped, "n_decisions": dec_id,
-            "total_card_tokens": int(cards.shape[0]), "source": data_dir}
+            "total_card_tokens": int(cards.shape[0]),
+            "source": data_dir if isinstance(data_dir, str) else list(data_dir)}
     with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1)
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
 
 
-def _build_v2(data_dir: str, out_path: str, limit: Optional[int]) -> Dict:
+def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
     """The v2 (fixed-18) build: same replay/skip-on-desync logic, fixed-shape output arrays."""
     from .features2 import tokenize as tokenize2
-    files = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
+    files = _shards(data_dir)
     try:
         from tqdm import tqdm
         files = tqdm(files, desc="shards", unit="shard")
@@ -119,9 +144,11 @@ def _build_v2(data_dir: str, out_path: str, limit: Optional[int]) -> Dict:
     cards, kings, board, phase, action = [], [], [], [], []
     y, w, z, gid, did, chosen = [], [], [], [], [], []
     n_games = n_skipped = dec_id = 0
+    seen: set = set()
     for f in files:
         for rec in read_jsonl(f):
             g = rec["deal_seed"]
+            _guard_seed(g, seen, f)
             rewards = rec["rewards"]
             st = GameState.deal(np.random.default_rng(g))
             mark = (len(cards), dec_id)
@@ -172,7 +199,8 @@ def _build_v2(data_dir: str, out_path: str, limit: Optional[int]) -> Dict:
     meta = {"feat": "v2", "card_dim": CD2, "board_dim": BD2, "phase_dim": PD2, "action_dim": AD2,
             "target": "q", "n_rows": int(arrs["y"].shape[0]), "n_games": n_games,
             "n_skipped_desynced": n_skipped, "n_decisions": dec_id,
-            "total_card_tokens": int(arrs["y"].shape[0]) * 18, "source": data_dir}
+            "total_card_tokens": int(arrs["y"].shape[0]) * 18,
+            "source": data_dir if isinstance(data_dir, str) else list(data_dir)}
     with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1)
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
@@ -211,16 +239,19 @@ def load(path: str) -> TokenRows:
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Build token training tensors from a self-play corpus.")
-    p.add_argument("--data", default=os.path.join("datasets", "selfplay_k20l3"))
+    p.add_argument("--data", nargs="+", default=[os.path.join("datasets", "selfplay_k20l3")],
+                   help="one or MORE corpus dirs; several are POOLED into one dataset (they must use "
+                        "disjoint --base-seed ranges -- game_id == deal_seed and the split is by game)")
     p.add_argument("--out", default=os.path.join("datasets", "tensors", "k20l3_tokens.npz"))
     p.add_argument("--limit", type=int, default=None, help="only process the first N games (smoke)")
     p.add_argument("--feat", default="v1", choices=["v1", "v2"],
                    help="featurization version (v2 = fixed-18 instance tokens + zone posteriors)")
     args = p.parse_args(argv)
 
-    print(f"building token tensors ({args.feat}) from {args.data} -> {args.out}"
+    src = args.data if len(args.data) > 1 else args.data[0]
+    print(f"building token tensors ({args.feat}) from {src} -> {args.out}"
           + (f" (limit {args.limit})" if args.limit else ""))
-    s = build(args.data, args.out, args.limit, feat=args.feat)
+    s = build(src, args.out, args.limit, feat=args.feat)
     print(f"  {s['n_rows']} rows ({s['n_decisions']} decisions, {s['n_games']} games), "
           f"{s['total_card_tokens']} card tokens  ->  {args.out}(+.meta.json)")
 

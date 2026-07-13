@@ -34,6 +34,35 @@ def test_smoke_train(tmp_path):
         assert k in r
 
 
+def test_lr_schedule_warms_up_then_cosines_to_zero():
+    T, W = 1000, 100
+    assert TT.lr_lambda(0, T, W) == pytest.approx(1 / W, abs=1e-6)      # warmup starts near 0
+    assert TT.lr_lambda(W - 1, T, W) == pytest.approx(1.0)              # ...and reaches the peak
+    assert TT.lr_lambda(W, T, W) == pytest.approx(1.0)
+    mid = TT.lr_lambda((T + W) // 2, T, W)
+    assert 0.45 < mid < 0.55                                            # half-way: half the peak
+    assert TT.lr_lambda(T - 1, T, W) < 1e-4                             # ends at ~0 -> the model SETTLES
+    assert TT.lr_lambda(T + 50, T, W) == pytest.approx(0.0, abs=1e-9)   # never goes negative
+
+
+def test_history_is_recorded_and_survives_the_checkpoint(tmp_path):
+    rows = _rows(tmp_path, 10)
+    hp = {"epochs": 2, "batch": 64, "lr": 1e-3, "patience": 5, "val_frac": 0.2, "seed": 0,
+          "schedule": "cosine", "warmup_frac": 0.1}
+    r = TT.run(rows, AttnConfig(d_model=32, n_heads=4, ffn_hidden=64), hp)
+    h = r["history"]
+    assert len(h["step"]) == r["total_steps"] > 0                   # one entry per OPTIMIZER STEP
+    assert len(h["train_loss"]) == len(h["lr"]) == len(h["step"])
+    assert len(h["epoch"]) == len(h["epoch_val_mse"]) == len(h["epoch_train_mse"]) == 2
+    assert max(h["lr"]) <= hp["lr"] + 1e-9 and h["lr"][-1] < h["lr"][int(0.5 * len(h["lr"]))]  # decayed
+    for k in ("final_val_mse", "best_val_mse", "tail3_val_mse"):
+        assert np.isfinite(r[k])
+    p = str(tmp_path / "h.pt")
+    save(p, r["model"], meta={"history": h})
+    _, meta = load(p)
+    assert len(meta["history"]["step"]) == len(h["step"])            # the curve travels WITH the model
+
+
 def test_checkpoint_roundtrip(tmp_path):
     torch.manual_seed(0)
     m = AttentionModel(AttnConfig(d_model=32)).eval()
