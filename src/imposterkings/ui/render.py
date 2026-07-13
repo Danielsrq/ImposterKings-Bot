@@ -10,7 +10,7 @@ from typing import List, NamedTuple, Optional, Tuple
 
 import pygame
 
-from .. import cards
+from .. import card_text, cards
 from ..actions import Action, ActionKind, StepKind
 from ..explain import format_action
 from . import assets
@@ -68,6 +68,7 @@ class Frame(NamedTuple):
     attn_toggle: Optional["pygame.Rect"] = None   # "Attention" button (attention drawer); None if no ckpt
     # Right-click zoom targets: every face-up card on screen -> (rect, assets/ filename, upside_down).
     previews: Tuple[Tuple["pygame.Rect", str, bool], ...] = ()
+    how_to: Optional["pygame.Rect"] = None        # "How to play" button (rules + card reference)
 
 # Friendly labels for the decision header (the raw StepKind names are long/cryptic).
 DECISION_LABELS = {
@@ -121,6 +122,35 @@ HDR_MAX_X = _ATTN_X - 8
 
 def _text(surf, font, s, pos, color=INK):
     surf.blit(font.render(s, True, color), pos)
+
+
+def _button(surf, font, rect, label, mouse, *, base=BTN, color=INK, pad=None) -> "pygame.Rect":
+    """A chrome button that LIGHTS UP under the cursor -- the same tactile feedback the action buttons and
+    the modal Close buttons already give. ``mouse`` may be None (bot's turn / headless), in which case it
+    simply never highlights. Centers ``label`` unless ``pad`` gives an explicit left inset."""
+    hot = mouse is not None and rect.collidepoint(mouse)
+    pygame.draw.rect(surf, BTN_HOVER if hot else base, rect, border_radius=4)
+    if hot:
+        pygame.draw.rect(surf, GOLD, rect, 1, border_radius=4)      # a thin gold rim on hover
+    tx = rect.x + pad if pad is not None else rect.centerx - font.size(label)[0] // 2
+    _text(surf, font, label, (tx, rect.centery - font.get_height() // 2), color)
+    return rect
+
+
+def _wrap(font, s: str, max_w: int) -> List[str]:
+    """Greedy word-wrap ``s`` to lines no wider than ``max_w`` px (pygame has no wrapping of its own)."""
+    lines: List[str] = []
+    line = ""
+    for word in s.split():
+        probe = f"{line} {word}".strip()
+        if line and font.size(probe)[0] > max_w:
+            lines.append(line)
+            line = word
+        else:
+            line = probe
+    if line:
+        lines.append(line)
+    return lines
 
 
 def _text_fit(surf, fonts, s, pos, max_w: int, color=INK) -> None:
@@ -213,6 +243,108 @@ def draw_card_preview(surface, fonts, asset: str, flipped: bool = False) -> None
           ((W - fonts["small"].size(hint)[0]) // 2, y + _PREVIEW[1] + 8), MUTE)
 
 
+_HTP = (0.90, 0.94)            # "How to play" modal, as a fraction of the window
+_HTP_THUMB = (58, 79)          # card art thumbnail in the reference list
+
+
+def how_to_play_height(fonts) -> int:
+    """Total pixel height of the panel's scrollable body -- so the caller can clamp its scroll offset."""
+    small = fonts["small"]
+    lh = small.get_linesize()
+    w = int(_HTP[0] * WINDOW[0]) - 2 * 24
+    rules_h = sum(len(_wrap(small, prose, w - 130)) * lh + 6 for _, prose in card_text.RULES)
+    col_w = (w - 30) // 2
+    txt_w = col_w - _HTP_THUMB[0] - 12
+    rows = card_text.deck_entries()
+    heights = [max(_HTP_THUMB[1], 22 + len(_wrap(small, t, txt_w)) * lh) + 6
+               for _, _, _, t in rows]
+    half = (len(heights) + 1) // 2                      # 2 columns -> only the taller column matters
+    cards_h = max(sum(heights[:half]), sum(heights[half:]))
+    return rules_h + cards_h + 110                      # + the two section headings and their gaps
+
+
+def draw_how_to_play(surface, fonts, mouse, scroll: int = 0) -> dict:
+    """The "How to play" modal: a short rules summary + every card's art and ability.
+
+    Content comes from ``card_text`` (pure data, engine-side) -- the wording lives in exactly one place and
+    its numbers are interpolated from ``rules.py``, so this panel cannot drift from the engine. Body is
+    clipped and offset by ``scroll`` (px) so the list can never spill out of the box."""
+    big, med, small = fonts["big"], fonts["med"], fonts["small"]
+    W, H = WINDOW
+    dim = pygame.Surface((W, H), pygame.SRCALPHA)
+    dim.fill((0, 0, 0, 175))
+    surface.blit(dim, (0, 0))
+    bw, bh = int(_HTP[0] * W), int(_HTP[1] * H)
+    bx, by = (W - bw) // 2, (H - bh) // 2
+    pygame.draw.rect(surface, PANEL, (bx, by, bw, bh), border_radius=8)
+    pygame.draw.rect(surface, GOLD, (bx, by, bw, bh), 2, border_radius=8)
+
+    pad = 24
+    _text(surface, big, "ImposterKings", (bx + pad, by + 16), GOLD)
+    close = pygame.Rect(bx + bw - pad - 84, by + 18, 84, 28)
+    pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
+    _text(surface, small, "Close [H]", (close.x + 9, close.y + 6), INK)
+
+    body = pygame.Rect(bx + pad, by + 60, bw - 2 * pad, bh - 60 - 16)
+    total = how_to_play_height(fonts)
+    scroll = max(0, min(scroll, max(0, total - body.h)))
+    prev_clip = surface.get_clip()
+    surface.set_clip(body)                              # nothing may render outside the body
+    x0, y = body.x, body.y - scroll
+    lh = small.get_linesize()
+
+    _text(surface, med, "RULES", (x0, y), GOLD)
+    y += 30
+    for label, prose in card_text.RULES:
+        _text(surface, small, label, (x0, y), INK)
+        for i, line in enumerate(_wrap(small, prose, body.w - 130)):
+            _text(surface, small, line, (x0 + 120, y + i * lh), MUTE)
+        y += max(lh, len(_wrap(small, prose, body.w - 130)) * lh) + 6
+
+    y += 14
+    _text(surface, med, "CARDS", (x0, y), GOLD)
+    hint = "right-click any card in play to zoom it"
+    _text(surface, small, hint, (body.right - small.size(hint)[0], y + 4), MUTE)
+    y += 32
+
+    col_w = (body.w - 30) // 2
+    txt_w = col_w - _HTP_THUMB[0] - 12
+    rows = card_text.deck_entries()
+    half = (len(rows) + 1) // 2
+    for col, chunk in enumerate((rows[:half], rows[half:])):
+        cx, cy = x0 + col * (col_w + 30), y
+        for name, value, copies, text in chunk:
+            lines = _wrap(small, text, txt_w)
+            rh = max(_HTP_THUMB[1], 22 + len(lines) * lh) + 6
+            if cy + rh > body.y - 40 and cy < body.bottom + 40:      # cheap cull for scrolled-away rows
+                try:
+                    surface.blit(assets.card_surface(cards.card_ids_for_name(name)[0], _HTP_THUMB),
+                                 (cx, cy))
+                except Exception:                                    # noqa: BLE001 -- art is decoration
+                    pygame.draw.rect(surface, MUTE, (cx, cy, *_HTP_THUMB))
+                pygame.draw.rect(surface, CARD_COLORS.get(name, NEUTRAL),
+                                 (cx, cy, *_HTP_THUMB), 1)
+                tx = cx + _HTP_THUMB[0] + 12
+                head = f"{name}  {value}" + (f"   x{copies}" if copies > 1 else "")
+                tags = [t.name.lower() for t in cards.card_def(cards.card_ids_for_name(name)[0]).tags]
+                _text(surface, small, head, (tx, cy), CARD_COLORS.get(name, INK))
+                if tags:
+                    _text(surface, small, "  ".join(tags),
+                          (tx + small.size(head)[0] + 14, cy), MUTE)
+                for i, line in enumerate(lines):
+                    _text(surface, small, line, (tx, cy + 22 + i * lh), INK)
+            cy += rh
+
+    surface.set_clip(prev_clip)
+    if total > body.h:                                  # scrollbar: only when there IS more to see
+        track = pygame.Rect(bx + bw - 10, body.y, 4, body.h)
+        pygame.draw.rect(surface, DIVIDER, track, border_radius=2)
+        kh = max(24, int(body.h * body.h / total))
+        ky = body.y + int((body.h - kh) * scroll / max(1, total - body.h))
+        pygame.draw.rect(surface, GOLD, (track.x, ky, 4, kh), border_radius=2)
+    return {"close": close, "body": body, "total": total, "scroll": scroll}
+
+
 _REACTION_KINDS = (StepKind.REACTION_KINGSHAND, StepKind.REACTION_ASSASSIN,
                    StepKind.REACTION_KH_VS_ASSASSIN)
 
@@ -302,16 +434,15 @@ def _draw_explain(surface, fonts, result, top: int, depth: int = 5, own_eval=Non
 
 
 def _draw_reasoning_section(surface, fonts, top, title, result, shown, placeholder,
-                            own_eval=None, seat=None):
+                            own_eval=None, seat=None, mouse=None):
     """Header + [hide]/[show] toggle at ``top``; render the PV lines when ``shown``. Returns the toggle
     Rect. Shared by the bot-reasoning and human-hint panels."""
     small = fonts["small"]
     px = PANEL_X + 12
     pygame.draw.line(surface, DIVIDER, (PANEL_X + 8, top - 12), (WINDOW[0] - 8, top - 12))
     _text(surface, small, title, (px, top), GOLD)
-    toggle = pygame.Rect(WINDOW[0] - 12 - 64, top - 3, 64, 22)
-    pygame.draw.rect(surface, BTN, toggle, border_radius=4)
-    _text(surface, small, "[hide]" if shown else "[show]", (toggle.x + 7, toggle.y + 3))
+    toggle = _button(surface, small, pygame.Rect(WINDOW[0] - 12 - 64, top - 3, 64, 22),
+                     "[hide]" if shown else "[show]", mouse)
     if shown:
         if result is not None:
             _draw_explain(surface, fonts, result, top + 26, own_eval=own_eval, seat=seat)
@@ -401,20 +532,18 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     if flip is not None:                                  # your king is a BUTTON when it can be flipped
         card_buttons.append((r, flip))
 
-    # --- New Game button (top-right of the play area, left of the panel) -----------------
-    new_game = pygame.Rect(ROW_MAX_X - 120, 12, 120, 30)
-    pygame.draw.rect(surface, BTN, new_game, border_radius=4)
-    _text(surface, small, "New Game", (new_game.x + 16, new_game.y + 7))
-    scenario = pygame.Rect(new_game.x - 12 - 100, 12, 100, 30)      # build a custom position (S key)
-    pygame.draw.rect(surface, BTN, scenario, border_radius=4)
-    _text(surface, small, "Scenario", (scenario.x + 14, scenario.y + 7))
+    # --- top-right of the play area: How to play | New Game (+ Review game at game over) --------
+    # Scenario lives at the FOOT of the knowledge column instead -- it is a setup tool, not a play control.
+    new_game = _button(surface, small, pygame.Rect(ROW_MAX_X - 120, 12, 120, 30), "New Game", mouse)
+    how_to = _button(surface, small, pygame.Rect(new_game.x - 12 - 132, 12, 132, 30), "How to play", mouse)
+    scenario = _button(surface, small, pygame.Rect(KNOW_X + 10, WINDOW[1] - 44, PANEL_X - KNOW_X - 20, 32),
+                       "Scenario  [S]", mouse)
     # "Review game" appears only at game over (no pending decision -> terminal).
     review = None
-    left_anchor = scenario.x
+    left_anchor = how_to.x                              # the chain grows leftward; seed follows the last one
     if not view.pending:
-        review = pygame.Rect(scenario.x - 12 - 128, 12, 128, 30)
-        pygame.draw.rect(surface, BTN_HOVER, review, border_radius=4)
-        _text(surface, small, "Review game", (review.x + 14, review.y + 7))
+        review = _button(surface, small, pygame.Rect(how_to.x - 12 - 128, 12, 128, 30), "Review game",
+                         mouse, base=BTN_HOVER)
         left_anchor = review.x
     if seed is not None:
         seed_s = f"seed {seed}"
@@ -516,20 +645,22 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     # REASONING (bot) + HINT (you) -- two PV sections, each with its own show/hide toggle.
     reasoning_toggle = _draw_reasoning_section(surface, fonts, REASON_TOP, f"Bot P{opp} read (MCTS):",
                                                bot_result, show_reasoning, "(no search yet)",
-                                               own_eval=bot_eval, seat=opp)
+                                               own_eval=bot_eval, seat=opp, mouse=mouse)
     hint_toggle = _draw_reasoning_section(surface, fonts, HINT_TOP, f"Your P{view.observer} read (MCTS):",
                                           hint_result, show_hint, "(toggle for your read of this position)",
-                                          own_eval=hint_eval, seat=view.observer)
+                                          own_eval=hint_eval, seat=view.observer, mouse=mouse)
     _draw_knowledge(surface, fonts, view, knowledge)
 
-    settings = pygame.Rect(WINDOW[0] - 12 - 84, 12, 84, 24)   # engine-settings button (panel top-right)
-    pygame.draw.rect(surface, BTN, settings, border_radius=4)
-    _text(surface, small, "Settings", (settings.x + 10, settings.y + 4))
+    settings = _button(surface, small, pygame.Rect(WINDOW[0] - 12 - 84, 12, 84, 24), "Settings", mouse)
     analysis = pygame.Rect(settings.x - 8 - 92, 12, 92, 24)   # attention-drawer toggle (left of Settings)
-    pygame.draw.rect(surface, BTN if attn_available else DIVIDER, analysis, border_radius=4)
-    _text(surface, small, "Attention", (analysis.x + 10, analysis.y + 4), INK if attn_available else MUTE)
+    if attn_available:
+        _button(surface, small, analysis, "Attention", mouse)
+    else:                                                     # no checkpoint -> disabled, never highlights
+        pygame.draw.rect(surface, DIVIDER, analysis, border_radius=4)
+        _text(surface, small, "Attention", (analysis.x + 10, analysis.y + 4), MUTE)
     return Frame(buttons, new_game, reasoning_toggle, hint_toggle, review, settings, scenario,
-                 attn_toggle=(analysis if attn_available else None), previews=tuple(previews))
+                 attn_toggle=(analysis if attn_available else None), previews=tuple(previews),
+                 how_to=how_to)
 
 
 # The engine (bot + analysis) modes, in pill order: (mode key, label). ``nn`` = NN-MCTS (hybrid-only).

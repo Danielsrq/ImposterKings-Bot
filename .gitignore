@@ -28,3 +28,6 @@ runs/
 Thumbs.db
 .idea/
 .vscode/
+
+# Generated plots / audits (inspect_activations, plot_training)
+reports/

@@ -105,6 +105,83 @@ def test_king_is_clickable_when_flip_is_legal_and_cards_are_previewable():
     pygame.display.quit()
 
 
+def test_how_to_play_panel_renders_and_clamps_scroll():
+    from imposterkings.card_text import deck_entries
+    from imposterkings.ui.render import draw_how_to_play, how_to_play_height
+
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    # renders at any scroll offset (incl. absurd ones) and always clamps to its own content height
+    for scroll in (0, 50, 400, 99999):
+        ctrl = draw_how_to_play(screen, fonts, (0, 0), scroll=scroll)
+        assert hasattr(ctrl["close"], "collidepoint")
+        assert 0 <= ctrl["scroll"] <= max(0, ctrl["total"] - ctrl["body"].h)
+    assert ctrl["total"] == how_to_play_height(fonts) > 0
+    assert len(deck_entries()) == 14                       # every card is listed
+    pygame.display.quit()
+
+
+def test_chrome_buttons_give_hover_feedback():
+    """Every clickable chrome button must LIGHT UP under the cursor -- the same tactile cue the action
+    buttons give. Compared pixel-wise, so a button that quietly stops responding gets caught."""
+    from imposterkings.ui.render import BTN, BTN_HOVER
+
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    st = mainstate(hand0=(cid("Queen"), cid("Fool")), hand1=(cid("Soldier"),), stack=(sc("Elder"),))
+    view = st.information_set(0)
+    legal = view.legal_moves()
+
+    def edge(rect, mouse):                       # a pixel just inside the button's top edge
+        render_frame(screen, view, fonts, legal, attn_available=True, mouse=mouse)
+        return screen.get_at((rect.centerx, rect.y + 2))[:3]
+
+    f = render_frame(screen, view, fonts, legal, attn_available=True, mouse=(0, 0))
+    for name in ("how_to", "new_game", "scenario", "settings", "attn_toggle",
+                 "reasoning_toggle", "hint_toggle"):
+        r = getattr(f, name)
+        assert r is not None, name
+        assert edge(r, (0, 0)) == BTN, f"{name} idle colour changed"
+        assert edge(r, r.center) == BTN_HOVER, f"{name} gives NO hover feedback"
+    pygame.display.quit()
+
+
+def test_scenario_sits_at_the_foot_of_the_knowledge_column():
+    from imposterkings.ui.render import KNOW_X, PANEL_X
+
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    st = mainstate(hand0=(cid("Queen"),), hand1=(cid("Fool"),), stack=(sc("Elder"),))
+    view = st.information_set(0)
+    f = render_frame(screen, view, fonts, view.legal_moves())
+    assert KNOW_X <= f.scenario.x and f.scenario.right <= PANEL_X   # inside the knowledge column
+    assert f.scenario.bottom <= WINDOW[1]                            # on-screen
+    assert f.scenario.y > WINDOW[1] // 2                             # at its FOOT, not the top
+    for other in (f.how_to, f.new_game):                             # and clear of the top-right row
+        assert not f.scenario.colliderect(other)
+    pygame.display.quit()
+
+
+def test_top_right_buttons_never_overlap_even_at_game_over():
+    """The button chain grows leftward (new_game <- scenario <- how_to <- review); Review only appears at
+    game over, which is exactly when a naive fixed layout would collide."""
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    st = mainstate(hand0=(cid("Queen"),), hand1=(cid("Fool"),), stack=(sc("Elder"),))
+    view = st.information_set(0)
+    frame = render_frame(screen, view, fonts, view.legal_moves(), seed=1)
+    assert frame.how_to is not None
+    rects = [r for r in (frame.review, frame.how_to, frame.scenario, frame.new_game) if r]
+    for i, a in enumerate(rects):
+        for b in rects[i + 1:]:
+            assert not a.colliderect(b)
+    pygame.display.quit()
+
+
 def test_render_frame_draws_pv_lines_from_a_real_search():
     import numpy as np
     from imposterkings.agents import MCTSAgent

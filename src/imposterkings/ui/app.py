@@ -20,7 +20,7 @@ from ..agents import MCTSAgent, RandomAgent
 from ..explain import format_action
 from ..state import GameState
 from .render import (BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_attention_drawer, draw_card_preview,
-                     draw_settings_overlay, make_fonts, render_frame)
+                     draw_how_to_play, draw_settings_overlay, make_fonts, render_frame)
 from .review import PlyRecord, annotate_dual_evals, budget_iters, run_review, _result_eval, _search_from
 from .scenario_setup import run_setup
 
@@ -173,6 +173,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     random_bot = (p1 == "random")
     engine_budget = _engine_budget(engine)          # rebuilt by apply_engine() on any settings change
     settings_open, dragging = False, None      # dragging = the active slider key ("N"/"k"/"l") or None
+    help_open, help_scroll = False, 0        # "How to play" modal (rules + card reference); H toggles
     preview = None                          # right-click card zoom: (assets/ filename, upside_down) or None
     show_attn, attn_mode, attn_hover = False, "absolute", None      # attention-drawer state
     attn_sel, attn_token_view = 0, "all"           # selected rec pill / token view (all|hide_board|cards)
@@ -245,7 +246,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         # Auto-resolve ONLY a choiceless reaction window (a King's-Hand/Assassin prompt when you hold
         # no reaction card -> the sole option is to decline). Every real decision, including a forced
         # last card, is left for you to click.
-        if (not settings_open) and human_turn and len(legal) == 1 \
+        if (not settings_open) and (not help_open) and human_turn and len(legal) == 1 \
                 and legal[0].kind == ActionKind.DECLINE_REACTION:
             apply_logged(act, legal[0], perspective=view_seat)
             clock.tick(60)
@@ -316,7 +317,9 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                              knowledge=knowledge_cache["val"],
                              bot_eval=bot_eval, hint_eval=hint_eval,
                              attn_available=attncfg["ckpt"] is not None,
-                             mouse=(mouse if human_turn else None))   # hover-highlight playable cards
+                             mouse=mouse)   # drives BOTH the chrome-button hover and the playable-card
+    #                                         highlight; the latter self-disables because `legal` is empty
+    #                                         on the bot's turn, so no card is ever flagged playable then.
         controls = (draw_settings_overlay(screen, fonts, engine, mouse,
                                           nn_available=bool(nncfg["ckpts"]),
                                           nn_ckpts=nncfg["ckpts"], nn_ckpt_ix=nncfg["ix"])
@@ -328,6 +331,9 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                                               token_view=attn_token_view, result=attn_cache["result"],
                                               layer_view=attn_layer_view)
             attn_cache["hits"] = attn_ctrl["hits"]
+        help_ctrl = draw_how_to_play(screen, fonts, mouse, help_scroll) if help_open else None
+        if help_ctrl is not None:
+            help_scroll = help_ctrl["scroll"]          # the panel clamps it to its own content height
         if preview is not None:                        # right-click zoom sits on top of everything
             draw_card_preview(screen, fonts, preview[0], flipped=preview[1])
         pygame.display.flip()
@@ -352,15 +358,22 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 if preview is not None:
                     preview = None                      # Esc closes the card zoom first
+                elif help_open:
+                    help_open = False
                 elif settings_open:
                     settings_open = False
                 elif show_attn:
                     show_attn = False
                 else:
                     running = False
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_s and not settings_open:
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_h and not settings_open:
+                help_open = not help_open               # H -> the rules + card reference
+                help_scroll = 0
+            elif event.type == pygame.MOUSEWHEEL and help_open:
+                help_scroll = max(0, help_scroll - event.y * 40)   # clamped upward by the panel itself
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_s and not settings_open and not help_open:
                 open_setup()                            # S -> build a custom position
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_a and not settings_open:
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_a and not settings_open and not help_open:
                 if attncfg["ckpt"] is not None:         # A -> toggle the attention analysis drawer
                     show_attn = not show_attn
                     if show_attn:
@@ -384,7 +397,14 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     apply_engine()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 pos = event.pos
-                if settings_open:                   # modal: route clicks to it, ignore the board
+                if help_open:                       # modal: Close, the button itself, or outside dismisses
+                    if not help_ctrl["close"].collidepoint(pos) and \
+                            help_ctrl["body"].inflate(48, 120).collidepoint(pos) and \
+                            not (frame.how_to and frame.how_to.collidepoint(pos)):
+                        pass                        # a click inside the panel does nothing (yet)
+                    else:
+                        help_open = False
+                elif settings_open:                 # modal: route clicks to it, ignore the board
                     sl = _slider_at(pos)
                     if controls["close"].collidepoint(pos) or frame.settings.collidepoint(pos):
                         settings_open = False
@@ -431,6 +451,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     attn_cache["state"] = None
                 elif frame.settings.collidepoint(pos):
                     settings_open = True
+                elif frame.how_to and frame.how_to.collidepoint(pos):
+                    help_open, help_scroll = True, 0    # rules + card reference (H)
                 elif frame.scenario.collidepoint(pos):          # build a custom position
                     open_setup()
                 elif frame.new_game.collidepoint(pos):          # clickable any time
@@ -467,7 +489,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                        attn_loader=((lambda: (attn_bundle()[0], attncfg["id"]))
                                     if attncfg["ckpt"] is not None else None))
 
-        if (not settings_open) and (not hotseat) and (not game["state"].is_terminal()) \
+        if (not settings_open) and (not help_open) and (not hotseat) and (not game["state"].is_terminal()) \
                 and game["state"].to_play == bot_seat:
             pygame.time.delay(300)
             bview = game["state"].information_set(bot_seat)
