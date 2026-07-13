@@ -106,7 +106,7 @@ def test_king_is_clickable_when_flip_is_legal_and_cards_are_previewable():
 
 
 def test_how_to_play_panel_renders_and_clamps_scroll():
-    from imposterkings.card_text import deck_entries
+    from imposterkings.ui.card_text import deck_entries
     from imposterkings.ui.render import draw_how_to_play, how_to_play_height
 
     pygame.display.init()

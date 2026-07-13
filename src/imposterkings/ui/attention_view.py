@@ -16,8 +16,8 @@ import numpy as np
 import pygame
 
 from ..cards import card_ids_for_name
-from . import assets
-from .render import BG, GOLD, INK, MUTE, PANEL
+from . import assets, labels, widgets
+from .theme import BG, BTN, BTN_HOVER, DIVIDER, GOLD, INK, MUTE, PANEL, P_COLORS, WINDOW
 
 RGB = Tuple[int, int, int]
 
@@ -170,10 +170,10 @@ def token_exclusions(payload, view: str = "all") -> Tuple[int, ...]:
     - "cards": keep CLS + the card tokens only -- kings/board/phase/action go, so the heatmap is purely
       card<->card (and the cells grow, since the grid keeps its size over fewer tokens).
     """
-    labels = list(payload.seq_labels)
-    s = len(labels)
+    seq = list(payload.seq_labels)
+    s = len(seq)
     if view == "hide_board":
-        return (labels.index("board"),) if "board" in labels else ()
+        return (seq.index("board"),) if "board" in seq else ()
     if view == "cards":
         rng = getattr(payload, "card_seq_range", None)          # v2 says so explicitly; v1 = [CLS|N|3 ctx]
         lo, hi = rng if rng is not None else (1, s - 3)
@@ -370,3 +370,134 @@ def draw_tooltip(surface, fonts, payload, hit: AttnHit, pos, layer_view: str = "
     pygame.draw.rect(surface, MUTE, (tx, ty, w, h), 1)
     for i, t in enumerate(lines):
         surface.blit(small.render(t, True, INK), (tx + 6, ty + 4 + i * lh))
+
+
+def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", hover=None,
+                          selected=0, token_view="all", result=None, depth=5,
+                          seat_labels=None, seat_selected=0, layer_view="causal"):
+    """Right-side "analysis mode" drawer over a dim scrim. ``entries`` = the top recommendations as
+    ``[(move, payload), ...]`` (payload = an AttentionExplanation); ``selected`` picks which entry the
+    heatmap shows (clickable rec pills switch). ``token_view`` ("all" | "hide_board" | "cards") drops the
+    context tokens from the heatmap and renormalizes the remaining attention rows -- with fewer tokens the
+    grid keeps its size, so the CELLS GROW (see ``token_exclusions``). In "signed" mode the
+    bottom shows per-entry Top-contributor columns (the side-by-side comparison); otherwise the PV.
+    ``seat_labels`` (e.g. ("P0","P1"), used by the review screen) draws clickable seat pills selecting whose
+    read is explained. Returns clickable controls
+    ``{"close", "mode_toggle", "board_toggle", "rec_pills", "seat_pills", "layer_pills", "hits"}``."""
+    med, small = fonts["med"], fonts["small"]
+    W, H = WINDOW
+    dim = pygame.Surface((W, H), pygame.SRCALPHA)
+    dim.fill((0, 0, 0, 140))
+    surface.blit(dim, (0, 0))
+    dw = int(0.52 * W if getattr(entries[0][1], "feat", "v1") == "v2" else 0.46 * W)   # v2: fixed S=24
+    dx = W - dw
+    pygame.draw.rect(surface, PANEL, (dx, 0, dw, H))
+    pygame.draw.rect(surface, GOLD, (dx, 0, dw, H), 2)
+    pad = 16
+
+    widgets.text(surface, med, "Attention  [Experimental]", (dx + pad, 14), INK)
+    close = pygame.Rect(dx + dw - pad - 82, 12, 82, 26)
+    pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
+    widgets.text(surface, small, "Close [A]", (close.x + 10, close.y + 5), INK)
+
+    # Rec pills: the search's top recommendations; click switches which one the heatmap explains.
+    selected = max(0, min(selected, len(entries) - 1))
+    rec_pills = []
+    xx = dx + pad
+    for i, (mv, pl) in enumerate(entries):
+        label = f"{i + 1}. {labels.compact_action(mv)}   q = {pl.q:+.2f}"
+        wpx = small.size(label)[0] + 20
+        r = pygame.Rect(xx, 44, wpx, 26)
+        pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=13)
+        if i == selected:
+            pygame.draw.rect(surface, GOLD, r, 2, border_radius=13)
+        widgets.text(surface, small, label, (r.x + 10, r.y + 5), GOLD if i == selected else INK)
+        rec_pills.append(r)
+        xx += wpx + 10
+
+    mode_toggle = pygame.Rect(dx + pad, 78, 190, 24)
+    pygame.draw.rect(surface, BTN_HOVER if mode_toggle.collidepoint(mouse) else BTN,
+                     mode_toggle, border_radius=12)
+    _mode_label = {"absolute": "absolute", "row_norm": "row-norm", "signed": "signed (Δq)"}.get(mode, mode)
+    widgets.text(surface, small, f"scale: {_mode_label}", (mode_toggle.x + 10, mode_toggle.y + 4))
+    board_toggle = pygame.Rect(mode_toggle.right + 10, 78, 180, 24)   # cycles the token view
+    pygame.draw.rect(surface, BTN_HOVER if board_toggle.collidepoint(mouse) else BTN,
+                     board_toggle, border_radius=12)
+    widgets.text(surface, small, f"tokens: {TOKEN_VIEW_LABELS.get(token_view, token_view)}",
+          (board_toggle.x + 10, board_toggle.y + 4))
+    seat_pills = []
+    if seat_labels:                                       # review: whose read is being explained
+        sx = board_toggle.right + 10
+        for i, lab in enumerate(seat_labels):
+            r = pygame.Rect(sx, 78, small.size(lab)[0] + 20, 24)
+            pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=12)
+            if i == seat_selected:
+                pygame.draw.rect(surface, GOLD, r, 2, border_radius=12)
+            widgets.text(surface, small, lab, (r.x + 10, r.y + 4), GOLD if i == seat_selected else INK)
+            seat_pills.append(r)
+            sx = r.right + 6
+
+    # Layer-view pills (L>=2 only) share the control row, to the right of scale/board/seat.
+    move, payload = entries[selected]
+    layer_pills = {}
+    if getattr(payload, "per_layer", None) and len(payload.per_layer) >= 2:
+        lx = (seat_pills[-1].right if seat_pills else board_toggle.right) + 16
+        for key, lab in (("causal", "causal"), ("l1", "L1"), ("l2", "L2")):
+            r = pygame.Rect(lx, 78, small.size(lab)[0] + 20, 24)
+            pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=12)
+            if key == layer_view:
+                pygame.draw.rect(surface, GOLD, r, 2, border_radius=12)
+            widgets.text(surface, small, lab, (r.x + 10, r.y + 4), GOLD if key == layer_view else INK)
+            layer_pills[key] = r
+            lx = r.right + 8
+    exclude = token_exclusions(payload, token_view)
+
+    pv_h = 122                                            # tuned: leaves the heat grid an exact 16px cell
+    heat_top = 112                                        # one control row -> the heatmap gets the rest
+    heat_rect = (dx + pad, heat_top, dw - 2 * pad, H - heat_top - pv_h)
+    hits = draw_attention(surface, fonts, payload, heat_rect, mode=mode,
+                                         emphasize_rows=(0,),
+                                         candidate_index=payload.candidate_seq_index, hover=hover,
+                                         exclude_indices=exclude, layer_view=layer_view)
+    if hover is not None:
+        hit = next((h for h in hits if (h.i, h.j, h.head) == hover), None)
+        if hit is not None:
+            draw_tooltip(surface, fonts, payload, hit, mouse, layer_view=layer_view)
+
+    pv_y = H - pv_h + 6
+    pygame.draw.line(surface, DIVIDER, (dx + pad, pv_y - 6), (dx + dw - pad, pv_y - 6))
+    if mode == "signed" and any(getattr(pl, "attribution", None) is not None for _, pl in entries):
+        # per-entry Top-contributor columns: which parts of the position drove each candidate's value
+        widgets.text(surface, small, "Top contributors (Δq to q-logit):", (dx + pad, pv_y), MUTE)
+        col_w = (dw - 2 * pad) // max(1, len(entries))
+        for i, (mv, pl) in enumerate(entries):
+            cx = dx + pad + i * col_w
+            widgets.text(surface, small, f"{i + 1}. {labels.compact_action(mv)}", (cx, pv_y + 20),
+                  GOLD if i == selected else INK)
+            att = getattr(pl, "attribution", None)
+            if att is None:
+                continue
+            order = sorted(range(len(att)), key=lambda k: -abs(float(att[k])))
+            for row, k in enumerate(order[:4]):
+                val = float(att[k])
+                col = (74, 190, 110) if val >= 0 else (214, 72, 72)
+                widgets.text(surface, small, f"{pl.seq_labels[k]} {val:+.2f}", (cx, pv_y + 40 + row * 18), col)
+    else:
+        widgets.text(surface, small, "Principal variation:", (dx + pad, pv_y), MUTE)
+        if result is not None and getattr(result, "root", None) is not None:
+            try:
+                pvs = result.principal_variations(top=2, depth=depth)
+            except Exception:                            # noqa: BLE001 -- PV is best-effort decoration
+                pvs = []
+            yy = pv_y + 22
+            for line in pvs:
+                xx = dx + pad
+                for step in line:
+                    t = small.render(labels.compact_action(step.move), True, P_COLORS.get(step.player, INK))
+                    if xx + t.get_width() > dx + dw - pad:
+                        break
+                    surface.blit(t, (xx, yy))
+                    xx += t.get_width() + 8
+                yy += 20
+    return {"close": close, "mode_toggle": mode_toggle, "board_toggle": board_toggle,
+            "rec_pills": rec_pills, "seat_pills": seat_pills, "layer_pills": layer_pills, "hits": hits}

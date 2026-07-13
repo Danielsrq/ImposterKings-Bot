@@ -10,7 +10,8 @@ from typing import Dict, List, Optional
 
 from .. import cards, scenario
 from . import assets
-from .render import BTN, GOLD, INK, MUTE, PANEL, RED, _draw_card, _text
+from .theme import BTN, GOLD, INK, MUTE, PANEL, RED
+from .widgets import card as _draw_card, text as _text
 
 _PW, _PH = 58, 79          # palette card size
 _ZW, _ZH = 58, 79          # zone card size

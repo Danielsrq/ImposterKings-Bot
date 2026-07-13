@@ -17,7 +17,9 @@ from ..actions import Action, ActionKind
 from ..cards import CARD_DEFS, card_name
 from ..mcts import Node
 from . import assets
-from .render import CARD_COLORS, DIVIDER, GOLD, INK, MUTE, NEUTRAL, P_COLORS, _compact_action, _text
+from .labels import compact_action as _compact_action
+from .theme import CARD_COLORS, DIVIDER, GOLD, INK, MUTE, NEUTRAL, P_COLORS
+from .widgets import text as _text
 
 WHITE = (245, 245, 245)     # flip-king / setup cells (crown on white)
 

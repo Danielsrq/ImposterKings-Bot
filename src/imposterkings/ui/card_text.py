@@ -1,8 +1,10 @@
-"""Human-readable rules + card descriptions -- the copy shown by the UI's "How to play" panel.
+"""Human-readable rules + card descriptions -- the copy shown by the "How to play" panel.
 
-CARD DATA, not UI data: this sits beside ``cards.py`` and imports nothing from ``ui`` (no pygame), so the
-pygame panel, a README generator, a future web front-end or a test can all read the same single source of
-wording. The dependency only ever points ``card_text -> cards/rules``, never back.
+The UI's COPY DECK, kept apart from the code that paints it. ``cards.DECK_SPEC`` holds the *mechanics*
+(value, ability, tags) and the engine reads all of it; this holds the English prose *describing* those
+mechanics, and nothing but the UI ever reads it -- localize the game and this is the file you translate,
+never DECK_SPEC. It lives under ``ui/`` for that reason, but imports **no pygame**, so the wording stays
+testable headlessly and the data/painting split holds.
 
 Every number in the prose is INTERPOLATED from ``rules.py`` rather than typed out, so the panel cannot
 quietly start lying the day a tunable changes. Every ability below was checked against ``abilities.py``:
@@ -17,8 +19,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from . import rules
-from .cards import DECK_SPEC
+from .. import rules
+from ..cards import DECK_SPEC
 
 # --- the short rules summary (label, prose) ---------------------------------------------------------
 RULES: List[Tuple[str, str]] = [

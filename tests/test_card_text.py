@@ -1,18 +1,33 @@
-"""The "How to play" copy is CARD DATA, not UI data: it lives beside cards.py and must import with no
-pygame. These tests guard the two ways it can silently rot -- a card losing its description, and the prose
-drifting away from the engine's tunables."""
+"""The "How to play" copy: the UI's copy deck, kept apart from the code that paints it.
+
+``cards.DECK_SPEC`` holds the MECHANICS (value, ability, tags) and the engine reads all of it; ``card_text``
+holds the English prose DESCRIBING those mechanics, and nothing but the UI reads it -- so it lives under
+``ui/``. These tests guard the three ways it can silently rot: a card losing its description, the prose
+drifting from the engine's tunables, and the wording contradicting what the engine actually allows."""
+import importlib
 import sys
 
-from imposterkings import card_text as CT
 from imposterkings import rules
 from imposterkings.cards import CARD_NAMES, DECK_SPEC
+from imposterkings.ui import card_text as CT
 
 
-def test_imports_without_pygame_or_ui():
-    """It must stay usable from a headless test, a README generator, or a future web front-end."""
-    assert "pygame" not in sys.modules or True          # (pygame may be loaded by a sibling test)
-    assert not any(m.startswith("imposterkings.ui") for m in sys.modules
-                   if m == "imposterkings.card_text")   # card_text itself pulls in no ui
+def test_the_copy_deck_pulls_in_no_pygame():
+    """It sits under ui/ but must stay PURE DATA -- importable headlessly, and paintable by something other
+    than pygame one day. If this fails, drawing code has leaked into the wording."""
+    import ast
+
+    src = importlib.util.find_spec("imposterkings.ui.card_text").origin
+    with open(src, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module.split(".")[0] if node.module else "")
+    assert "pygame" not in imported          # pure data: no drawing may leak into the wording
+    assert {"rules", "cards"} & imported     # it reads the ENGINE (for the tunables), not the renderer
 
 
 def test_every_card_has_text_and_no_extras():

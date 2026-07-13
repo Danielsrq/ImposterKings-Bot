@@ -18,8 +18,11 @@ import numpy as np
 from .. import cards
 from ..actions import Action, ActionKind, StepKind
 from ..infoset import InformationSet
-from .render import (BTN, BTN_HOVER, CARD_COLORS, DIVIDER, GOLD, INK, MUTE, P_COLORS, PANEL, RED,
-                     WINDOW, _compact_action, _cross, _text, _tick, draw_attention_drawer, make_fonts)
+from .attention_view import draw_attention_drawer
+from .labels import compact_action as _compact_action
+from .theme import (BTN, BTN_HOVER, CARD_COLORS, DIVIDER, GOLD, INK, MUTE, PANEL, P_COLORS, RED, WINDOW,
+                    make_fonts)
+from .widgets import cross as _cross, text as _text, tick as _tick
 from . import assets
 from .tree_view import block_at, draw_crown, draw_icicle, draw_outline, draw_tooltip, graft_node
 
