@@ -21,16 +21,15 @@ from ..explain import format_action
 from ..state import GameState
 from .render import (BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_attention_drawer, draw_card_preview,
                      draw_how_to_play, draw_settings_overlay, make_fonts, render_frame)
-from .review import PlyRecord, annotate_dual_evals, budget_iters, run_review, _result_eval, _search_from
+from .review import (DEFAULT_ATTN_CKPTS, PlyRecord, annotate_dual_evals, attn_ckpt_id, budget_iters,
+                     default_attn_ckpt, run_review, _result_eval, _search_from)
 from .scenario_setup import run_setup
 
 # Opponent's setup hide/discard are private -- never reveal the card identity in the log.
 _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
 
-# Attention-drawer checkpoints, best first: the v2 (featurization 2.2) net gives the drawer fixed 18-card
-# axes, attendable unseen cards and zone posteriors; the v1 net is the fallback. Forward slashes throughout
-# (os.path.exists accepts them on Windows) so these compare equal to discover_ckpts()' normalized paths.
-DEFAULT_ATTN_CKPTS = ("models/gen1_v3c_v2feat/attn_d64_L2.pt", "models/attn_d64_L1.pt")
+# DEFAULT_ATTN_CKPTS / attn_ckpt_id live in review.py and are imported (not re-declared) so the app and the
+# standalone review agree on the drawer's checkpoint AND on the fingerprint that keys its explain memo cache.
 # NN+MCTS default (Settings can swap it for any other discovered checkpoint, attention nets included).
 DEFAULT_NN_CKPTS = ("models/mlp_32.pt", "models/mlp_256.pt")
 
@@ -130,7 +129,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
 
     # Attention explainability head: an explicit --attn, else the best deployed checkpoint present. The
     # v2 (featurization 2.2) net is preferred -- fixed 18-card axes + zone posteriors in the drawer.
-    attn_ckpt = attn or next((p for p in DEFAULT_ATTN_CKPTS if os.path.exists(p)), None)
+    attn_ckpt = default_attn_ckpt(attn)
     attncfg = {"ckpt": attn_ckpt, "model": None, "ev": None, "id": None}
 
     def attn_bundle():
@@ -144,7 +143,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 from ..machine_learning.attention_model import load as _attn_load
                 m, _ = _attn_load(attncfg["ckpt"])
                 attncfg["model"], attncfg["ev"] = m, evaluator_from_model(m)
-                attncfg["id"] = f"{os.path.abspath(attncfg['ckpt'])}:{int(os.path.getmtime(attncfg['ckpt']))}"
+                attncfg["id"] = attn_ckpt_id(attncfg["ckpt"])
                 print(f"attention explain head loaded from {attncfg['ckpt']} (L={m.cfg.n_layers})")
             except Exception as e:                  # noqa: BLE001 -- report + disable Analysis
                 print(f"attention head unavailable ({e}); Analysis disabled")

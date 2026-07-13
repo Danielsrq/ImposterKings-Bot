@@ -10,8 +10,9 @@ P1's; each is drawn from its own seat's perspective (+ = good for that player).
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -669,6 +670,39 @@ def attn_entries_for(rec0: PlyRecord, owner: int, seat: int, model, ckpt_id: str
                         attribution=True, ckpt_id=ckpt_id)) for m in moves]
 
 
+# Attention explainability head. Preferred first: the v2 (featurization 2.2) net gives the drawer fixed
+# 18-card axes + zone posteriors. Forward slashes so these compare equal to app.discover_ckpts()' paths.
+DEFAULT_ATTN_CKPTS = ("models/gen1_v3c_v2feat/attn_d64_L2.pt", "models/attn_d64_L1.pt")
+
+
+def default_attn_ckpt(explicit: Optional[str] = None) -> Optional[str]:
+    """``explicit`` if given, else the first DEFAULT_ATTN_CKPTS that exists on disk (None if none do)."""
+    return explicit or next((p for p in DEFAULT_ATTN_CKPTS if os.path.exists(p)), None)
+
+
+def attn_ckpt_id(path: str) -> str:
+    """Fingerprint identifying a loaded checkpoint. It KEYS THE EXPLAIN MEMO CACHE, so app and review must
+    agree on its shape -- hence one definition, imported by both. mtime included so retraining to the same
+    filename invalidates the cache instead of serving stale explanations."""
+    return f"{os.path.abspath(path)}:{int(os.path.getmtime(path))}"
+
+
+def make_attn_loader(ckpt: Optional[str]) -> Optional[Callable]:
+    """A lazy ``attn_loader`` for :func:`run_review` -- ``() -> (model, ckpt_id)``, loading on first press
+    of A (so a review with the drawer unused never imports torch). None when there is no checkpoint, which
+    is exactly what disables the drawer. A load failure propagates to run_review, which reports + disables."""
+    if ckpt is None:
+        return None
+
+    def _load_attn():
+        from ..machine_learning.attention_model import load as _attn_load
+        model, _ = _attn_load(ckpt)
+        print(f"attention explain head loaded from {ckpt} (L={model.cfg.n_layers})")
+        return model, attn_ckpt_id(ckpt)
+
+    return _load_attn
+
+
 def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
     """``attn_loader``: optional callable returning ``(model|None, ckpt_id)`` -- enables the attention
     drawer (press A). None / a failed load leaves review fully functional with the drawer disabled."""
@@ -848,7 +882,6 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
 
 
 def main(argv=None) -> None:
-    import os
     import time
 
     import pygame
@@ -858,7 +891,9 @@ def main(argv=None) -> None:
     p.add_argument("--p1", default="hybrid", choices=["mcts", "hybrid", "branching"],
                    help="engine mode for both bots + the dual-eval (default: hybrid)")
     p.add_argument("--iters", type=int, default=800, help="MCTS iterations per decision (mcts mode)")
-    p.add_argument("--k", type=int, default=50, help="budget multiplier (hybrid/branching)")
+    p.add_argument("--k", type=int, default=20,
+                   help="budget multiplier (hybrid/branching). 20 = the study budget, matching ui.app -- so "
+                        "a reviewed game is played at the SAME strength you played against")
     p.add_argument("--l", type=int, default=3,
                    help="effective legal-moves for a sub-decision card at selection (hybrid/branching)")
     p.add_argument("--seed", type=int, default=0, help="deck/deal seed")
@@ -873,14 +908,28 @@ def main(argv=None) -> None:
     p.add_argument("--review-l", type=int, default=None, help="l for --review-k (default: recorded / 3)")
     p.add_argument("--nn", nargs="?", const="models/mlp_32.pt", default=None,
                    help="review with the net as an NN-MCTS eval/policy head (bare --nn uses "
-                        "models/mlp_32.pt); the budget comes from --p1/--k/--iters (e.g. --p1 hybrid --k 20)")
+                        "models/mlp_32.pt); the budget comes from --p1/--k/--iters (e.g. --p1 hybrid --k 20). "
+                        "An MLP *or* an attention checkpoint works -- the head is chosen by checkpoint type.")
+    p.add_argument("--attn", nargs="?", const=DEFAULT_ATTN_CKPTS[0], default=None,
+                   help="attention checkpoint for the explainability drawer (press A in the review). "
+                        f"Defaults to the first of {list(DEFAULT_ATTN_CKPTS)} that exists, so the drawer is "
+                        "normally available without passing anything; --no-attn opts out.")
+    p.add_argument("--no-attn", action="store_true",
+                   help="do not load an attention head even if a default checkpoint is present (the "
+                        "drawer is then disabled and torch is never imported for it)")
     args = p.parse_args(argv)
 
     ev = None
     if args.nn:                                            # lazy: torch only needed when reviewing with a net
-        from ..machine_learning.evaluator import build_evaluator
-        ev = build_evaluator(args.nn)
+        from ..machine_learning.benchmark import _evaluator_for   # dispatches MLP vs attention checkpoints
+        ev = _evaluator_for(args.nn)
         print(f"NN-MCTS review head loaded from {args.nn}")
+
+    # The drawer defaults ON when a checkpoint is lying around (matching the app), since a review with no
+    # explanation available is the strictly poorer default; --no-attn opts out.
+    attn_ckpt = None if args.no_attn else default_attn_ckpt(args.attn)
+    if attn_ckpt is not None and not os.path.exists(attn_ckpt):   # an explicit --attn is returned verbatim
+        p.error(f"--attn checkpoint not found: {attn_ckpt}")      # -> fail loudly here, not on first A
 
     t0 = time.perf_counter()
     if args.replay:
@@ -918,10 +967,13 @@ def main(argv=None) -> None:
     dt = time.perf_counter() - t0
     print(f"  {len(traj)} decisions in {dt:.1f}s. Opening review window...")
 
+    if attn_ckpt:
+        print(f"  attention drawer armed ({attn_ckpt}) — press A in the review")
+
     pygame.init()
     screen = pygame.display.set_mode(WINDOW)
     pygame.display.set_caption(f"ImposterKings review  ({cap})")
-    run_review(screen, make_fonts(), traj)
+    run_review(screen, make_fonts(), traj, attn_loader=make_attn_loader(attn_ckpt))
     pygame.quit()
 
 
