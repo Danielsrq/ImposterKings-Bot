@@ -99,9 +99,11 @@ def _one(seed: int, seat: int, sp: int, forced: bool, spec, ckpt: Optional[str])
     rec = GameRecord(deal_seed=seed, gen={
         "spec": spec_label(spec), "mode": spec[0], "k": spec[1], "l": spec[2] if len(spec) > 2 else None,
         "self_play": True, "temp_plies": 0, "value_ckpt": ckpt,
-        # The experiment fields. NOTE: four games share one deal_seed (2 arms x 2 starters), so this corpus
-        # CANNOT be pooled by token_dataset as-is -- its _guard_seed will (correctly) reject the collision,
-        # because game_id == deal_seed and a naive pool would leak the same deal across the train/val split.
+        # `paired_deals` tells token_dataset._guard_seed that the repeated deal_seed is DELIBERATE: four
+        # games share one deal (2 arms x 2 starters), and grouping them under one game_id is exactly right --
+        # they share an identical 18-card permutation, so splitting them across train/val would leak the
+        # validation hands into training. The guard still rejects a seed repeated ACROSS corpora.
+        "paired_deals": 4,
         "experiment": "assassin_hide", "arm": "forced" if forced else "free",
         "assassin_seat": seat, "forced_starting_player": sp,
     })
@@ -138,9 +140,29 @@ def _chunk(seeds: List[int], spec, ckpt) -> Dict:
     return {"rows": rows, "recs": recs}
 
 
+def _existing(out_dir: str):
+    """Deals already on disk, and the next free shard index -- so a long run RESUMES instead of redoing
+    work or clobbering it. (The 100-deal pilot cost 35 min; a 500-deal run must not be all-or-nothing.)"""
+    import glob
+    import json
+    done, shards = set(), sorted(glob.glob(os.path.join(out_dir, "games_*.jsonl")))
+    rows = []
+    for f in shards:
+        with open(f, encoding="utf-8") as fh:
+            for line in fh:
+                r = json.loads(line)
+                done.add(r["deal_seed"])
+                g = r["gen"]
+                rows.append({"seed": r["deal_seed"], "seat": g["assassin_seat"],
+                             "starter": r["starting_player"], "arm": g["arm"],
+                             "holder_won": int(r["winner"] == g["assassin_seat"])})
+    return done, len(shards), rows
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Causal test: does hiding the Assassin at setup help or hurt?")
-    p.add_argument("--deals", type=int, default=150, help="deals WITH the Assassin in a hand (x4 games each)")
+    p.add_argument("--deals", type=int, default=150,
+                   help="TOTAL deals wanted (already-recorded ones count); each is 4 games")
     p.add_argument("--base-seed", type=int, default=50_000_000)
     p.add_argument("--spec", default="hybrid-k20-l3")
     p.add_argument("--nn", default=os.path.join("models", "v3c_gen2", "attn_d64_L2.pt"),
@@ -149,33 +171,47 @@ def main(argv=None) -> None:
     p.add_argument("--workers", type=int, default=10)
     p.add_argument("--chunk", type=int, default=5)
     p.add_argument("--out-dir", default=os.path.join("datasets", "forced_assassin_hide"))
+    p.add_argument("--fresh", action="store_true", help="ignore what is on disk (default: RESUME)")
     args = p.parse_args(argv)
 
     spec = parse_spec(args.spec)
+    done, shard0, old_rows = (set(), 0, []) if args.fresh else _existing(args.out_dir)
+    if done:
+        print(f"resuming: {len(done)} deals ({len(old_rows)} games) already recorded in {args.out_dir}/")
+
     # The Assassin sits in one of the two hands 16/18 of the time; the rest of the seeds are skipped.
+    # Scan from base_seed so the seed->deal mapping is stable across runs and the new deals EXTEND the old.
     seeds, s = [], args.base_seed
-    while len(seeds) < args.deals:
-        if assassin_seat(s) is not None:
+    while len(seeds) + len(done) < args.deals:
+        if s not in done and assassin_seat(s) is not None:
             seeds.append(s)
         s += 1
-    print(f"forced-hide experiment: {len(seeds)} deals (scanned {s - args.base_seed} seeds; the Assassin is "
-          f"in a hand 16/18 of the time)\n  {len(seeds) * 4} games = {len(seeds)} deals x 2 starters x "
-          f"2 arms (forced | free), self-play {spec_label(spec)}, net={args.nn}")
+
+    if not seeds:
+        print("  nothing to do -- the target is already on disk")
+        report(old_rows)
+        return
+
+    print(f"forced-hide experiment: {len(seeds)} NEW deals -> {len(done) + len(seeds)} total\n"
+          f"  {len(seeds) * 4} new games = {len(seeds)} deals x 2 starters x 2 arms (forced | free), "
+          f"self-play {spec_label(spec)}, net={args.nn}")
 
     chunks = [seeds[i:i + args.chunk] for i in range(0, len(seeds), args.chunk)]
     t0 = time.perf_counter()
     from joblib import Parallel, delayed
     from tqdm import tqdm
-    jobs = [delayed(_chunk)(c, spec, args.nn) for c in chunks]
-    out = list(tqdm(Parallel(n_jobs=args.workers, return_as="generator")(jobs), total=len(jobs),
-                    desc="chunks", unit="chunk"))
-    rows = [r for o in out for r in o["rows"]]
-    recs = [r for o in out for r in o["recs"]]
-
     os.makedirs(args.out_dir, exist_ok=True)
-    for i, o in enumerate(out):
-        record.write_jsonl(os.path.join(args.out_dir, f"games_{i:05d}.jsonl"), o["recs"])
-    print(f"\n  recorded {len(recs)} games -> {args.out_dir}/  ({len(out)} shards)")
+    jobs = [delayed(_chunk)(c, spec, args.nn) for c in chunks]
+
+    rows = list(old_rows)
+    n_new = 0
+    # Write each shard AS IT LANDS, not at the end: a crash 90 minutes in should cost one chunk, not the run.
+    for i, o in enumerate(tqdm(Parallel(n_jobs=args.workers, return_as="generator")(jobs),
+                               total=len(jobs), desc="chunks", unit="chunk")):
+        record.write_jsonl(os.path.join(args.out_dir, f"games_{shard0 + i:05d}.jsonl"), o["recs"])
+        rows.extend(o["rows"])
+        n_new += len(o["recs"])
+    print(f"\n  recorded {n_new} new games -> {args.out_dir}/  ({len(rows)} games total)")
 
     report(rows, time.perf_counter() - t0)
 

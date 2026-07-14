@@ -48,7 +48,8 @@ def game_split(game_id: np.ndarray, val_frac: float, seed: int):
     return ~val, val
 
 
-CORPUS_NAMES = {0: "k20l3 (gen-0)", 1: "gen1_v3c (k20)", 3: "v3c_k50", 4: "mixed_v3c_vs_mcts500"}
+CORPUS_NAMES = {0: "k20l3 (gen-0)", 1: "gen1_v3c (k20)", 3: "v3c_k50", 4: "mixed_v3c_vs_mcts500",
+                5: "forced_assassin_hide"}
 
 
 def corpus_of(game_id: np.ndarray) -> np.ndarray:

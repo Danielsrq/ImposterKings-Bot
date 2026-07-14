@@ -25,14 +25,22 @@ from ..state import GameState
 from .features import ACTION_DIM, BOARD_DIM, CARD_DIM, PHASE_DIM, tokenize
 
 
-def _guard_seed(seed: int, seen: set, shard: str) -> None:
+def _guard_seed(seed: int, seen: set, shard: str, paired: bool = False) -> None:
     """``game_id == deal_seed`` and train/val split BY GAME -- so two corpora sharing a seed would fuse two
-    DIFFERENT games under one id and leak rows across the split. Fail loudly rather than corrupt silently."""
-    if seed in seen:
+    DIFFERENT games under one id and leak rows across the split. Fail loudly rather than corrupt silently.
+
+    ``paired`` corpora (``gen.paired_deals``) repeat a seed ON PURPOSE: ``forced_hide`` plays the SAME deal
+    four times (forced|free x starter 0|1) and the pairing is the whole design. There ``game_id ==
+    deal_seed`` is exactly right -- it keeps all four games of a deal on the SAME side of the split, which
+    is what we want, because they share an identical 18-card permutation and splitting them apart would leak
+    the val hands into training. So the repeat is permitted; what stays forbidden is a repeat ACROSS corpora.
+    """
+    if seed in seen and not paired:
         raise ValueError(
             f"duplicate deal_seed {seed} (again in {shard}). Pooled corpora must use DISJOINT --base-seed "
             f"ranges: game_id == deal_seed, and the train/val split is by game_id, so a collision fuses two "
-            f"different games and leaks them across the split.")
+            f"different games and leaks them across the split. (A corpus that repeats a seed BY DESIGN must "
+            f"say so with gen.paired_deals -- see forced_hide.py.)")
     seen.add(seed)
 
 
@@ -68,7 +76,7 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
     for f in files:
         for rec in read_jsonl(f):
             g = rec["deal_seed"]
-            _guard_seed(g, seen, f)
+            _guard_seed(g, seen, f, paired=bool((rec.get("gen") or {}).get("paired_deals")))
             rewards = rec["rewards"]
             st = GameState.deal(np.random.default_rng(g),      # honour the RECORDED starter: a no-op for a
                                 rec.get("starting_player"))   # normal deal, but a mirrored corpus
@@ -150,7 +158,7 @@ def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
     for f in files:
         for rec in read_jsonl(f):
             g = rec["deal_seed"]
-            _guard_seed(g, seen, f)
+            _guard_seed(g, seen, f, paired=bool((rec.get("gen") or {}).get("paired_deals")))
             rewards = rec["rewards"]
             st = GameState.deal(np.random.default_rng(g),      # honour the RECORDED starter: a no-op for a
                                 rec.get("starting_player"))   # normal deal, but a mirrored corpus
