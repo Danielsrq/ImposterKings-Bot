@@ -27,7 +27,7 @@ from .attention_model import AttentionModel, AttnConfig, collate
 from .attention_model import save as save_attention
 from .features import Tokens
 from .token_dataset import TokenRows, load as load_tokens
-from .train import game_split, ranking_metrics
+from .train import game_split, per_corpus_metrics, ranking_metrics
 
 
 class TokenTorchDataset(Dataset):
@@ -167,6 +167,7 @@ def run(rows: TokenRows, cfg: AttnConfig, hp: Dict) -> Dict:
     model.cpu()                                   # checkpoints + downstream consumers stay CPU-native
     yt = rows.y[tri].astype(np.float32)
     rank = ranking_metrics(pv, yva, rows.decision_id[vai], rows.is_chosen[vai])
+    by_corpus = per_corpus_metrics(pv, yva, rows.game_id[vai], rows.decision_id[vai], rows.is_chosen[vai])
     n = len(tri) + len(vai)
     tail = hist["epoch_val_mse"][-3:] or [float("nan")]
     return {"model": model, "params": model.param_count(),
@@ -177,6 +178,7 @@ def run(rows: TokenRows, cfg: AttnConfig, hp: Dict) -> Dict:
             "val_mae": float(np.mean(np.abs(pv - yva))),
             "baseline_mse": float(np.mean((yva - yt.mean()) ** 2)),
             "schedule": sched_kind, "total_steps": step, "warmup_steps": warmup, "history": hist,
+            "by_corpus": by_corpus,
             "epochs": epochs_run, "seconds": seconds, "epoch_secs": epoch_secs, "rows": n,
             "rows_per_sec": (n * epochs_run / seconds) if seconds > 0 else 0.0, **rank}
 
@@ -225,12 +227,22 @@ def main(argv=None) -> None:
     print(f"top1_bestq {r['top1_bestq'] * 100:.1f}%  top1_chosen {r['top1_chosen'] * 100:.1f}%  "
           f"recall2 {r['recall2'] * 100:.1f}%  spearman {r['spearman']:.3f}")
 
+    if r["by_corpus"]:                    # pooled dataset: is any source corpus being ignored?
+        print("\nval fit by source corpus (NOT comparable across corpora -- a deeper-search corpus has "
+              "cleaner\nlabels and so a lower achievable floor; compare a corpus against ITSELF across arms):")
+        print(f"  {'corpus':>22} {'games':>6} {'rows':>7} {'val_mse':>8} {'top1':>6} {'recall2':>8} {'rho':>6}")
+        for c in sorted(r["by_corpus"]):
+            b = r["by_corpus"][c]
+            print(f"  {b['name']:>22} {b['games']:>6} {b['rows']:>7} {b['val_mse']:>8.4f} "
+                  f"{b['top1_bestq'] * 100:>5.1f}% {b['recall2'] * 100:>7.1f}% {b['spearman']:>6.3f}")
+
     os.makedirs(args.out_dir, exist_ok=True)
     out = os.path.join(args.out_dir, f"attn_d{cfg.d_model}_L{cfg.n_layers}.pt")
     keys = ("train_mse", "val_mse", "final_val_mse", "best_val_mse", "tail3_val_mse", "val_mae",
             "baseline_mse", "top1_bestq", "top1_chosen", "recall2", "spearman")
     save_attention(out, r["model"], meta={"target": "q", "npz": args.npz, "seconds": r["seconds"],
                    "config": vars(args), "metrics": {k: r[k] for k in keys},
+                   "by_corpus": r["by_corpus"],
                    "history": r["history"]})       # loss-vs-step travels WITH the checkpoint
     print(f"saved {out}   (history: {len(r['history']['step'])} steps, "
           f"{len(r['history']['epoch'])} epochs -- plot with plot_training.py)")

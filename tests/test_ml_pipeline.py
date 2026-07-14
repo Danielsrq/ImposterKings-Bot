@@ -10,7 +10,37 @@ from imposterkings import record  # noqa: E402
 from imposterkings.data_analysis import datagen  # noqa: E402
 from imposterkings.machine_learning import dataset, features  # noqa: E402
 from imposterkings.machine_learning.mlp import MLP  # noqa: E402
-from imposterkings.machine_learning.train import game_split, load_npz, parse_archs, train_one  # noqa: E402
+from imposterkings.machine_learning.train import (  # noqa: E402
+    corpus_of, game_split, load_npz, parse_archs, per_corpus_metrics, train_one)
+
+
+def test_corpus_of_recovers_the_source_from_the_deal_seed():
+    """Pooled datasets carry no corpus label. game_id == deal_seed and each corpus owns a disjoint --base-seed
+    DECADE (the same property token_dataset._guard_seed already leans on), so the decade IS the corpus id."""
+    gid = np.array([10_000_000, 10_001_999, 30_000_000, 30_001_999, 40_000_000, 40_000_999])
+    assert corpus_of(gid).tolist() == [1, 1, 3, 3, 4, 4]
+
+
+def test_per_corpus_metrics_splits_a_pooled_val_set_and_is_silent_on_a_single_corpus():
+    """The point of the breakdown: the asymmetric `mixed` corpus labels only ONE seat (~58 rows/game vs ~119),
+    so it is outnumbered ~4:1 and a single aggregate val_mse could hide a model that ignores it entirely."""
+    gid = np.array([10_000_000] * 4 + [40_000_000] * 4)
+    did = np.array([0, 0, 1, 1, 2, 2, 3, 3])                  # 2 candidates per decision
+    y = np.array([0.5, -0.5, 0.5, -0.5, 0.9, -0.9, 0.9, -0.9], dtype=np.float32)
+    chosen = np.array([1, 0, 1, 0, 1, 0, 1, 0])
+
+    pred = y.copy()                                            # perfect on gen-1...
+    pred[4:] = -y[4:]                                          # ...and exactly inverted on the mixed corpus
+    by = per_corpus_metrics(pred, y, gid, did, chosen)
+
+    assert set(by) == {1, 4}                                   # only the corpora actually present
+    assert by[1]["name"] == "gen1_v3c (k20)" and by[4]["name"] == "mixed_v3c_vs_mcts500"
+    assert by[1]["games"] == 1 and by[1]["rows"] == 4
+    assert by[1]["val_mse"] == pytest.approx(0.0) and by[1]["top1_bestq"] == 1.0
+    assert by[4]["val_mse"] > 1.0 and by[4]["top1_bestq"] == 0.0    # the failure the aggregate would mask
+
+    # a single-corpus dataset gets NO breakdown -- there is nothing to compare, so the trainer stays quiet
+    assert per_corpus_metrics(pred[:4], y[:4], gid[:4], did[:4], chosen[:4]) == {}
 
 
 def test_parse_archs():

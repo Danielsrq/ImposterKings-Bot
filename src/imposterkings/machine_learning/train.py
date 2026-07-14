@@ -48,6 +48,44 @@ def game_split(game_id: np.ndarray, val_frac: float, seed: int):
     return ~val, val
 
 
+CORPUS_NAMES = {0: "k20l3 (gen-0)", 1: "gen1_v3c (k20)", 3: "v3c_k50", 4: "mixed_v3c_vs_mcts500"}
+
+
+def corpus_of(game_id: np.ndarray) -> np.ndarray:
+    """Which source corpus each row came from, recovered from its deal seed.
+
+    A pooled dataset carries no corpus label -- but ``game_id == deal_seed`` and datagen gives every corpus a
+    disjoint ``--base-seed`` DECADE (gen-1 = 10M, k50 = 30M, mixed = 40M), which ``token_dataset._guard_seed``
+    already depends on. So the decade IS the corpus id, for free and with no schema change.
+    """
+    return np.asarray(game_id, dtype=np.int64) // 10_000_000
+
+
+def per_corpus_metrics(pred, y, game_id, did, chosen) -> Dict[int, Dict[str, float]]:
+    """Break the val fit down by source corpus. Empty unless the dataset is POOLED.
+
+    A pooled corpus can be quietly dominated by one source -- the asymmetric ``mixed`` games label only the
+    primary seat (~58 rows/game vs ~119), so they are outnumbered ~4:1 and a single aggregate val_mse would
+    never say whether they are being fit at all. NB: the numbers are NOT comparable ACROSS corpora -- a
+    deeper-search corpus has cleaner labels and therefore a lower achievable floor (see the study log). Read
+    them per-corpus across ARMS, not against each other.
+    """
+    cid = corpus_of(game_id)
+    uniq = np.unique(cid)
+    if len(uniq) < 2:
+        return {}
+    out: Dict[int, Dict[str, float]] = {}
+    for c in uniq:
+        m = cid == c
+        rank = ranking_metrics(pred[m], y[m], did[m], chosen[m])
+        out[int(c)] = {"name": CORPUS_NAMES.get(int(c), f"seed{int(c)}0M"),
+                       "rows": int(m.sum()), "games": int(len(np.unique(np.asarray(game_id)[m]))),
+                       "val_mse": float(np.mean((pred[m] - y[m]) ** 2)),
+                       "top1_bestq": rank["top1_bestq"], "recall2": rank["recall2"],
+                       "spearman": rank["spearman"]}
+    return out
+
+
 def ranking_metrics(pred, y, did, chosen) -> Dict[str, float]:
     """Per decision (grouped by decision_id): does argmax(pred) equal the best-q / the played candidate."""
     groups: Dict[int, List[int]] = defaultdict(list)

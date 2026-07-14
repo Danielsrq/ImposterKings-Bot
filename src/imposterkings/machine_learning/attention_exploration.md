@@ -421,10 +421,147 @@ Direct head-to-heads (100 mirrored deals = 200 games, hybrid-k20-l3 both sides):
 
 ---
 
+## Study 5 (gen-2) — pooled 5,000-game corpus + a capacity arm (2026-07-14)
+
+**The first generation that produced a measurable strength gain.** Studies 2–4 all ended the same way: the
+proxies improved, the winrate didn't (gen-1 vs gen-0 was 48.5% ±4.9 — parity). This one breaks the pattern,
+but *not* along the axis we expected.
+
+**Corpus:** the three v3c corpora, pooled — `selfplay_gen1_v3c` (2,000 games @k20-l3) + `selfplay_v3c_k50`
+(2,000 @k50-l3) + `mixed_v3c_vs_mcts500` (1,000, asymmetric vs `fixed500`). Disjoint seed decades (10M / 30M
+/ 40M), so `token_dataset --data A B C` pools them safely. **533,343 rows / 94,188 decisions / 5,000 games,
+0 desync skips** — 2.25× gen-1's rows. Gen-0 (`selfplay_k20l3`) was deliberately excluded: it desyncs on
+**449/2,000 games (22.45%)**, and not randomly — 88% of the desyncs sit at `ABILITY_MAY` while the current
+engine is already at `MAIN` or terminal, the exact signature of `bcf59ff` (Mystic muting strips all
+abilities). The dropped games are precisely the ones where a mute mattered.
+
+All arms: v2 featurization, **cosine schedule + 5% warmup, 40 epochs**, batch 1024, lr 1e-3, dropout 0.1,
+seed 0, RTX 3060 Ti. The **ctrl** arm exists because gen-2 changes *two* things at once (data AND schedule) —
+it isolates the data by holding everything else fixed against gen-1's corpus alone.
+
+| arm | corpus | config | params | train_mse | val_mse | top1_bestq | recall@2 | spearman | time |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| deployed `gen1_v3c_v2feat` | gen-1 | d64/h4, **constant LR** | 108,737 | 0.0300 | 0.0355 | 53.1% | 79.7% | 0.469 | 69 s |
+| **ctrl** | gen-1 | d64/h4, cosine | 108,737 | 0.0318 | 0.0392 | 56.8% | 81.0% | 0.513 | 267 s |
+| **gen2** | **pooled 5k** | d64/h4, cosine | 108,737 | 0.0277 | 0.0262 | 60.5% | 83.2% | 0.577 | 510 s |
+| **gen2-d96** | pooled 5k | **d96/h6/ffn384**, cosine | 236,833 | 0.0251 | **0.0237** | **63.9%** | **84.7%** | **0.617** | 717 s |
+
+(`val_mse` is NOT comparable across corpora — the pooled set mixes k20, k50 and asymmetric labels, and a
+cleaner-label corpus raises the achievable R² even with the model unchanged. The **per-corpus val breakdown**
+now printed by `train_tokens` is the honest cross-arm comparison: on the **gen-1 slice specifically**, gen2
+scores top1 **60.9%** vs ctrl's 56.8% — same games, neither model trained on them. So **the extra data is worth
+≈ +4.1pp top1**, and **cosine another ≈ +3.7pp** over the deployed net. Two separate wins; the ctrl arm is what
+separates them.)
+
+Note both pooled arms have a **negative** train/val gap (0.0251 vs 0.0237): still *underfit* against the
+0.0059 label-noise floor. That is why the capacity arm paid.
+
+### Strength — 100 mirrored deals (200 games) per cell, `--nn-mcts hybrid-k20-l3`, base-seed 0
+
+| net | vs vanilla-MCTS@k20 | vs MLP256-MCTS@k20 | vs **deployed**, head-to-head |
+|---|---|---|---|
+| gen-0 v3c (Studies 2–3) | 62.0% ±5.4 | 50.0% ±5.4 | — |
+| deployed gen1-v2feat (Study 4) | — | 52.5% ±6.1 | — |
+| **gen2 d64/h4** | 62.5% ±5.5 | 56.0% ±5.8 | **52.7% ±4.0** (600 games) ❌ |
+| **gen2 d96/h6** | **68.5% ±6.0** | **61.0% ±5.7** | **55.25% ±3.70** (400 games) ✅ |
+
+### Findings
+
+1. **The data alone was NOT enough; capacity was.** gen2-d64 posts the study's biggest proxy jump (top1
+   53.1% → 60.5%) and still cannot be shown stronger than the net it replaces: **52.7% over 600 games,
+   CI [48.7, 56.7]**, straddling 50% (two independent passes agree: 53.5% on seeds 0–99, 52.2% on 100–299).
+   Resolving a 2.7pp edge would need ~2,600 games. **d96/h6 clears the gate: 55.25% ±3.70, CI [51.5, 59.0]**
+   — the program's first *proven* generational gain, after three studies of parity. 2.25× the data moved the
+   proxies; only the wider net moved the board.
+2. **The net can now play WITHOUT SEARCH.** Greedy (one forward pass per decision, no tree, no rollouts, no
+   determinization) vs vanilla-MCTS@k20-l3, same 100 mirrored deals:
+
+   | greedy net | params | winrate |
+   |---|---:|---:|
+   | mlp_32 | 55.8 K | 30.0% ±5.7 |
+   | mlp_256 | 225 K | 39.0% ±4.9 |
+   | gen2 d64/h4 | 109 K | 41.0% ±5.5 |
+   | **gen2 d96/h6** | 237 K | **50.0% ±5.6** |
+
+   A single forward pass now **draws level with a ~500-simulation search**. And it is not capacity: mlp_256
+   (225K) scores 39.0% while d96 (237K) scores 50.0% at the same size, and d64 (109K) beats mlp_256 at *half*
+   the parameters. **The win is the tokenized featurization + attention, not the parameter budget** — the
+   clearest evidence yet that the zone-posterior encoding does real work. Search is still worth ~18pp on top
+   (68.5% vs 50.0%), so the tree is not redundant — but the net is no longer a passenger.
+   ⚠️ Greedy mode was **broken for the attention net** until this study (`NNPolicy` hardcoded `features.encode`
+   + the MLP forward → `KeyError: 'feature_dim'`). It now dispatches on `model_type`/`cfg.feat`. Greedy must
+   featurize the **InformationSet**, not the GameState — `evaluator_from_model` takes a *state* because MCTS
+   calls it on an already-determinized node, and reusing that seam would hand the net the opponent's real hand.
+3. **d96's extra heads SPECIALIZE — they do not dilute.** Causal L0 entropy (card rows, the ones that feed
+   L1's CLS and therefore carry gradient), as a fraction of uniform:
+
+   | net | per-head |
+   |---|---|
+   | gen2 d64/h4 | 75% · 66% · **58%** · 71% |
+   | **gen2 d96/h6** | 79% · 52% · 63% · 76% · 70% · **26%** |
+
+   Head 5 at **26%** is the sharpest head the program has produced (Study 4's best was 64%). Six heads let the
+   model *divide the game up*, and the division is legible: **head 5 = tempo/context** (71% of its mass on the
+   `board` token — hand sizes, turn, reaction window), **head 1 = threat** (27% on the unseen **Assassin**, then
+   kings and Inquisitor — the "fear" behaviour, now a dedicated head rather than a tendency smeared across
+   four), **head 0 = material** (Queen, Princess, King's Hand, weighted broadly). 0 dead GELU units in both
+   (0/256, 0/384).
+4. **Cost is sub-linear in parameters.** d96 is 2.18× the params but only **1.34× the latency** (1.65 vs
+   1.23 ms/leaf at batch 6, torch @ 1 thread): at this scale the forward pass is dispatch-bound, not
+   FLOP-bound. The UI's ~1.5 s median decision becomes ~2.0 s.
+
+---
+
+## Study 5b — is the bot RIGHT never to hide the Assassin? (2026-07-14)
+
+A corpus census (`data_analysis/corpus_stats.py`) found the bot picked "hide the Assassin" as its **argmax 0
+times in 4,000 setup decisions** — and the *netless* gen-0 rollout bot hides it in 0.4% of hands that hold it,
+so it is not a learned artifact of the net. But the threat that hiding would dodge is real and large: the
+Assassin is the **most-guessed card in the game** (941/5,497 guesses), and an **Inquisitor rips it out of a
+hand in 20.3% of games**. The corpus cannot settle it — it only ever hid the Assassin 64 times, by temperature
+accident, at 54.7% [42.6, 66.3] against a 59.5% baseline. That interval *contains* the baseline. **The data
+does not say hiding is bad; it says nobody ever tried it.**
+
+So: an intervention, not another observation (`data_analysis/forced_hide.py`). 100 deals × 2 arms × 2 starters
+= **400 games**, self-play v3c-gen2 @k20-l3, seeds 50M+. **Paired on the deal** (the same 18-card permutation
+played forced *and* free — ~75% of outcome variance is deal luck, so pairing is what makes 400 games enough)
+and **mirrored on the starter** (`deal(rng, starting_player=s)` re-uses the same permutation with either seat
+first, cancelling the +17.6pp second-player advantage). Only the HIDE is forced; the search still runs and its
+real candidates are recorded, so we also learn what the bot *wanted*.
+
+| arm | Assassin-holder wins |
+|---|---|
+| **FORCED** to hide it | 109/200 = **54.5%** |
+| **FREE** to choose | 101/200 = **50.5%** |
+| paired difference | **+4.0pp** (SE 3.7, **z = +1.07**, 56/200 pairs disagreed) |
+
+**Verdict: not significant — and that is itself the finding.** Forcing a move the search rates as *unthinkable*
+(0/4000) costs nothing, and the point estimate favours it. The bot's conviction is far stronger than the
+evidence warrants. The plausible mechanism is a **search horizon** effect: the cost of hiding (the Assassin
+cannot react to a king flip — which ends 29.6% of all games) is immediate and legible to a shallow rollout,
+while the benefit (dodging the Inquisitor) is contingent and deep. Note the model is *not* inattentive to the
+card — d96's second-sharpest head spends 27% of its attention on the unseen Assassin. It sees it; the search
+cannot see far enough for the hide to pay off inside the rollout.
+
+Settling it needs ~1,100 paired deals (~4,400 games, ~6 h). Corpus recorded at `datasets/forced_assassin_hide/`
+(400 games, `gen.arm` ∈ {forced, free}, `gen.assassin_seat`) — usable as training data covering positions the
+policy would never otherwise visit. NB it reuses each `deal_seed` across 4 games (that IS the pairing), so
+`token_dataset`'s `_guard_seed` will correctly refuse to pool it with the training corpora.
+
+**Engine note:** to mirror a deal, all five re-derivation sites now pass the **recorded** `starting_player`
+instead of letting `deal()` re-flip its coin. Verified a no-op on all 5,000 existing recorded games (0 desync):
+`deal()` draws the permutation *first* and the starter *second*, so re-dealing with that same starter
+reproduces identical hands.
+
+---
+
 ## Metric glossary
 
-- **winrate** — fraction of games the challenger wins vs vanilla-MCTS@k20 (mirrored; 200 games). ± is the
-  **95% confidence interval** (`1.96·s/√n` over per-deal scores); overlapping CIs ⇒ difference not significant.
+- **winrate** — fraction of games the challenger wins vs the stated opponent (mirrored; 200 games unless
+  noted). ± is the **95% confidence interval** (`1.96·s/√n` over per-deal scores); overlapping CIs ⇒ difference
+  not significant. ⚠️ **Winrate is opponent-relative and NOT comparable across studies with different
+  opponents**: the same gen-0 v3c net scores **62.0% vs vanilla** and **50.0% vs MLP256-MCTS**. Studies 1–2 use
+  vanilla; Studies 3–5 report both.
 - **top1_bestq** — fraction of decisions where the net's argmax-q move equals the search's best (highest-visit)
   move. **recall@2** — fraction where the search's best move is in the net's top-2 by q. **spearman** — rank
   correlation between the net's q ordering and the search's visit ordering over legal moves.
