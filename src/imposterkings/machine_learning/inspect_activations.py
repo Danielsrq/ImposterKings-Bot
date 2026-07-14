@@ -184,15 +184,35 @@ def main(argv=None) -> None:
         a.set_xticks([]); a.set_yticks([])
     fig.tight_layout(); fig.savefig(os.path.join(args.out, "saturation.png"), dpi=110); plt.close(fig)
 
-    # (3) the FFN hidden layer -- this is the true analogue of Karpathy's [batch, n_hidden] picture
-    key = sorted(a for a in acts if a.endswith("_gelu"))[0]
-    A = acts[key][:600]
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
-    ax[0].imshow(np.abs(A) < 0.01, cmap="gray", interpolation="nearest", aspect="auto")
-    ax[0].set_title(f"{key}: |a| < 0.01  (white = 'dead'; a white COLUMN = a dead neuron)")
-    ax[0].set_xlabel("neuron"); ax[0].set_ylabel("example")
-    ax[1].hist(acts[key].reshape(-1), bins=100, color="#5ec962")
-    ax[1].set_title(f"{key} activations (GELU cannot saturate at +-1; its dead zone is 0)")
+    # (3) the FFN hidden layer -- Karpathy's [batch, n_hidden] picture. ONE ROW PER LAYER: it used to plot
+    # only sorted(...)[0] (= L0) and silently drop the rest, which hid the more selective layer entirely.
+    keys = sorted(a for a in acts if a.endswith("_gelu"))
+    fig, axes = plt.subplots(len(keys), 3, figsize=(17, 4.3 * len(keys)), squeeze=False)
+    for r, key in enumerate(keys):
+        A = acts[key]
+        ax = axes[r]
+        ax[0].imshow(np.abs(A[:600]) < 0.01, cmap="gray", interpolation="nearest", aspect="auto")
+        ax[0].set_title(f"{key}: |a| < 0.01   (white = silent on that example)")
+        ax[0].set_xlabel("neuron"); ax[0].set_ylabel("example")
+
+        ax[1].hist(A.reshape(-1), bins=100, color="#5ec962")
+        ax[1].set_yscale("log")
+        ax[1].set_title(f"{key} activations (GELU has no +-1 saturation; its quiet zone is 0)")
+
+        # The panel that actually answers "are any neurons dead". The raster above is 600 sampled rows of a
+        # 480k-row tensor, so scattered white pixels SMEAR into pale columns that look dead and are not; and
+        # a hard |a|<0.01 cut paints a healthy 0.008 activation as dead. GELU (unlike ReLU) has a NON-ZERO
+        # gradient in its quiet zone, so a neuron that is often near 0 is SELECTIVE, not dead -- it can still
+        # learn and come back. The only real death is "never fires at all".
+        silent = (np.abs(A) < 0.01).mean(axis=0)
+        ax[2].hist(silent * 100, bins=40, color="#3b528b")
+        ax[2].axvline(90, ls="--", color="crimson", lw=1.2)
+        ax[2].text(90, ax[2].get_ylim()[1] * 0.9, " 'dead' >90%", color="crimson", fontsize=8)
+        ax[2].set_xlim(0, 100)
+        ax[2].set_xlabel("% of the time this neuron is silent"); ax[2].set_ylabel("neurons")
+        n_dead = int((np.abs(A).max(axis=0) < 0.01).sum())
+        ax[2].set_title(f"per-neuron silence   median {np.median(silent) * 100:.0f}%  "
+                        f"max {silent.max() * 100:.0f}%\nTRULY dead (never fires): {n_dead}/{A.shape[1]}")
     fig.tight_layout(); fig.savefig(os.path.join(args.out, "ffn_gelu.png"), dpi=110); plt.close(fig)
 
     # (4) init vs trained vs labels

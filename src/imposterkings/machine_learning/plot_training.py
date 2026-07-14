@@ -53,7 +53,8 @@ def main(argv=None) -> None:
     tr = np.asarray(h["epoch_train_mse"], float)
     va = np.asarray(h["epoch_val_mse"], float)
 
-    fig, ax = plt.subplots(1, 2, figsize=(14, 4.8))
+    n_panels = 3 if (h.get("ud")) else 2       # older checkpoints predate the update-to-data tracking
+    fig, ax = plt.subplots(1, n_panels, figsize=(7 * n_panels, 4.8))
 
     # --- (a) per-STEP training loss, with the LR schedule on a twin axis ---------------------------
     k = max(1, args.smooth)
@@ -85,6 +86,24 @@ def main(argv=None) -> None:
                     f"last-5 std {tail.std():.4f}")
     ax[1].set_xlabel("epoch"); ax[1].set_yscale("log")
     ax[1].legend(fontsize=8)
+
+    # --- (c) update-to-data ratio, per weight tensor (Karpathy: want ~ -3) -------------------------
+    ud = h.get("ud") or []
+    if ud:
+        us = np.asarray(h["ud_step"], float)
+        names = sorted(ud[0])
+        # Colour by DEPTH so a layer that is frozen or exploding is identifiable, not just "some tensor".
+        cmap = plt.get_cmap("viridis")
+        for i, n in enumerate(names):
+            ax[2].plot(us, [u[n] for u in ud], lw=0.9, alpha=0.75, color=cmap(i / max(1, len(names) - 1)))
+        ax[2].axhline(-3.0, ls="--", color="crimson", lw=1.2)
+        ax[2].axhspan(-4.0, -2.0, color="grey", alpha=0.12)
+        ax[2].text(us[-1], -3.0, " target -3", color="crimson", va="bottom", ha="right", fontsize=8)
+        ax[2].set_xlabel("optimizer step")
+        ax[2].set_ylabel("log10( std(update) / std(param) )")
+        # Under cosine the LR -> 0 by design, so the tail MUST fall. Read the plateau, not the end.
+        ax[2].set_title(f"update-to-data, {len(names)} weight tensors\n"
+                        f"(band = healthy [-4,-2]; the tail falls because cosine drives lr -> 0)")
 
     fig.tight_layout()
     fig.savefig(out, dpi=115)

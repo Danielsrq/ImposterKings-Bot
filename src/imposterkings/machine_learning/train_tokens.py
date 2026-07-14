@@ -84,6 +84,29 @@ def _predict(model, rows, idx, batch, device) -> np.ndarray:
     return np.concatenate(preds) if preds else np.zeros(0, np.float32)
 
 
+@torch.no_grad()
+def update_to_data(model, before: Dict[str, "torch.Tensor"]) -> Dict[str, float]:
+    """Karpathy's update-to-data ratio, per weight tensor: log10( std(delta) / std(param) ). Want ~ -3.
+
+    Too high (> -2) and the optimizer is smashing the weights each step -- training is unstable and the loss
+    bounces. Too low (< -4) and the weights are frozen: that layer is learning nothing and you are burning
+    compute on it. It is the single cheapest way to see WHICH layer is misbehaving, because it is per-tensor.
+
+    NB Karpathy writes it as ``lr * grad`` -- correct for SGD. We use **Adam**, whose step is
+    ``lr * m_hat / (sqrt(v_hat) + eps)`` and can be orders of magnitude away from ``lr * grad`` (that is the
+    whole point of Adam). So we measure the ACTUAL parameter delta across ``opt.step()``, which is exact and
+    optimizer-agnostic. Biases/LayerNorm gains (ndim < 2) are skipped: their std is not comparable.
+    """
+    out = {}
+    for name, p in model.named_parameters():
+        if p.ndim < 2 or name not in before:
+            continue
+        d = (p.detach() - before[name]).std().item()
+        s = p.detach().std().item()
+        out[name] = math.log10(d / s) if d > 0 and s > 0 else float("nan")
+    return out
+
+
 def lr_lambda(step: int, total: int, warmup: int) -> float:
     """Linear warmup -> cosine decay to ~0, as a multiplier on the base LR (LambdaLR, stepped PER STEP).
 
@@ -124,7 +147,9 @@ def run(rows: TokenRows, cfg: AttnConfig, hp: Dict) -> Dict:
     yva = rows.y[vai].astype(np.float32)
     ytr_sub = rows.y[ysub].astype(np.float32)
     hist: Dict[str, list] = {"step": [], "lr": [], "train_loss": [],
-                             "epoch": [], "epoch_train_mse": [], "epoch_val_mse": [], "epoch_secs": []}
+                             "epoch": [], "epoch_train_mse": [], "epoch_val_mse": [], "epoch_secs": [],
+                             "ud_step": [], "ud": []}      # update-to-data ratio, sampled (see below)
+    ud_every = max(1, len(dl) // 4)                        # ~4 samples/epoch: snapshotting weights is not free
     t0 = time.perf_counter()
     best_val, best_state, bad, epochs_run, epoch_secs, step = float("inf"), None, 0, 0, [], 0
     for ep in range(hp["epochs"]):
@@ -135,7 +160,13 @@ def run(rows: TokenRows, cfg: AttnConfig, hp: Dict) -> Dict:
             opt.zero_grad()
             pred = _forward(model, packed)
             loss = (wb * (pred - yb) ** 2).sum() / wb.sum().clamp_min(1e-8)
-            loss.backward(); opt.step()
+            loss.backward()
+            snap = ({n: p.detach().clone() for n, p in model.named_parameters() if p.ndim >= 2}
+                    if step % ud_every == 0 else None)     # snapshot BEFORE the step, to diff against
+            opt.step()
+            if snap is not None:
+                hist["ud_step"].append(step)
+                hist["ud"].append(update_to_data(model, snap))
             if sched is not None:
                 sched.step()
             hist["step"].append(step)                      # loss-vs-STEP, persisted into the checkpoint
@@ -226,6 +257,25 @@ def main(argv=None) -> None:
           f"{r['tail3_val_mse']:.4f}   (a big final-vs-best gap => the curve never settled)")
     print(f"top1_bestq {r['top1_bestq'] * 100:.1f}%  top1_chosen {r['top1_chosen'] * 100:.1f}%  "
           f"recall2 {r['recall2'] * 100:.1f}%  spearman {r['spearman']:.3f}")
+
+    ud = r["history"]["ud"]
+    if ud:
+        # Karpathy's update-to-data ratio: log10(std(delta) / std(param)) should sit near -3. Read it at the
+        # PLATEAU (the middle of training) -- under cosine the LR decays to 0 by design, so the tail must
+        # trend down and a low value THERE is correct, not a frozen layer.
+        mid = ud[len(ud) // 3: 2 * len(ud) // 3]
+        names = sorted(ud[0])
+        agg = {n: float(np.nanmedian([u[n] for u in mid])) for n in names}
+        bad = {n: v for n, v in agg.items() if not (-4.0 <= v <= -2.0)}
+        print(f"\nUPDATE-TO-DATA  log10(std(delta)/std(param)) at the training plateau; want ~ -3.0")
+        print(f"  median over all {len(names)} weight tensors: {np.median(list(agg.values())):+.2f}")
+        if bad:
+            print(f"  OUTSIDE [-4, -2] ({len(bad)} tensor(s)) -- > -2 = unstable/too-big steps; "
+                  f"< -4 = barely learning:")
+            for n, v in sorted(bad.items(), key=lambda kv: kv[1])[:8]:
+                print(f"    {n:>44} {v:+.2f}")
+        else:
+            print(f"  every tensor inside [-4, -2] -- no layer is frozen or being smashed")
 
     if r["by_corpus"]:                    # pooled dataset: is any source corpus being ignored?
         print("\nval fit by source corpus (NOT comparable across corpora -- a deeper-search corpus has "
