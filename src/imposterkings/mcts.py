@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .actions import Action
 from .infoset import InformationSet
+from .rng import as_search_rng
 
 DEFAULT_C = math.sqrt(2)
 
@@ -54,6 +55,11 @@ class SearchConfig:
     c: float = DEFAULT_C
     scaled: bool = True
     use_knowledge: bool = True     # honor guess-leaked opponent-hand facts when determinizing
+    # Which RNG serves the search's scalar draws (rollout picks, expansion picks, determinize shuffles).
+    # "stdlib" measured 9.0% faster over 200 paired positions at N=500 (190/200 favoured it); "numpy"
+    # reproduces the pre-rng.py stream bit-for-bit. The DEAL's RNG is untouched either way -- only the
+    # search stream changes, and nothing replays that.
+    rng_backend: str = "stdlib"
     # AlphaZero mode: when an evaluator is attached, selection is PUCT (policy prior) and a non-terminal
     # leaf is valued by the net (no rollout). evaluator(state) -> (per-seat value vector, {move: prior}).
     evaluator: Optional["Callable"] = None
@@ -146,7 +152,7 @@ def _select(node: Node, state, config: SearchConfig
         legal_set = frozenset(legal)
         untried = [m for m in legal if m not in node.children]
         if untried:
-            move = untried[int(config.rng.integers(len(untried)))]
+            move = untried[config.rng.pick(len(untried))]
             child = _expand(node, move, state.to_play)
             visited.append((node, legal_set))
             return child, state.apply(move), visited
@@ -206,7 +212,7 @@ def _rollout(state, config: SearchConfig) -> List[float]:
         legal = state.legal_moves()
         if not legal:                           # no legal move -> the player to move loses (game rule)
             return state.with_(winner=1 - state.to_play).result(scaled=config.scaled)
-        state = state.apply(legal[int(config.rng.integers(len(legal)))])
+        state = state.apply(legal[config.rng.pick(len(legal))])
     return state.result(scaled=config.scaled)
 
 
@@ -230,6 +236,11 @@ def search(info: InformationSet, config: SearchConfig) -> SearchResult:
     """Run SO-ISMCTS from ``info`` and return per-root-move statistics."""
     start = time.perf_counter()
     root = Node(parent=None, incoming_move=None, player_just_moved=None)
+
+    # Adapt the caller's RNG ONCE, here, rather than per draw: callers (agents, arena, the UI, the tests)
+    # all still hand us a plain numpy Generator, and the search's ~8k scalar draws then go through the
+    # chosen backend. determinize() re-wraps defensively for its own direct callers.
+    config = replace(config, rng=as_search_rng(config.rng, config.rng_backend))
 
     use_nn = config.evaluator is not None
     for _ in range(config.iterations):

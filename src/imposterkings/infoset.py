@@ -22,6 +22,7 @@ import numpy as np
 
 from . import cards
 from .actions import Action, StepKind
+from .rng import as_search_rng
 from .state import GameState, PendingStep, StackCard
 
 
@@ -151,7 +152,7 @@ class InformationSet:
 
     # --- the MCTS sampling seam --------------------------------------------------------
 
-    def determinize(self, rng: np.random.Generator, use_knowledge: bool = True) -> GameState:
+    def determinize(self, rng, use_knowledge: bool = True) -> GameState:
         """Sample a concrete GameState consistent with this information set.
 
         Distributes the unknown pool into the opponent's hand, their hidden card (if their king is
@@ -165,8 +166,8 @@ class InformationSet:
         lacks = self.opp_hand_lacks if use_knowledge else frozenset()
         has = self.opp_hand_has if use_knowledge else frozenset()
 
-        free = [c for c in unknown if c not in pinned]
-        free = [int(free[i]) for i in rng.permutation(len(free))]
+        free = [int(c) for c in unknown if c not in pinned]
+        as_search_rng(rng).shuffle(free)          # in place; see rng.py (a raw Generator still works)
 
         # Build the opponent's hand constructively (no rejection loops on tight constraints):
         hand = set(pinned)                                       # committed cards always in hand
