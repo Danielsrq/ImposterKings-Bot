@@ -37,7 +37,9 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
         for rec in read_jsonl(f):
             g = rec["deal_seed"]
             rewards = rec["rewards"]
-            st = GameState.deal(np.random.default_rng(g))
+            st = GameState.deal(np.random.default_rng(g),      # honour the RECORDED starter: a no-op for a
+                                rec.get("starting_player"))   # normal deal, but a mirrored corpus
+                                                              # forces it and would otherwise desync
             for d in rec["decisions"]:
                 cands = d.get("candidates") or []
                 if cands:                                  # a real (searched) decision

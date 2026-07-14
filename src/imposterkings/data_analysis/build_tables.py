@@ -46,8 +46,8 @@ def _iter_records(data_dir: str, limit: Optional[int] = None):
 
 CARD_LOC_COLS = ["game_id", "card_id", "name", "value", "ability", "init_location"]
 PLY_COLS = ["game_id", "ply", "seat", "phase", "action_kind", "action_card", "guess_name", "target",
-            "number", "leading_card", "source_card", "against_card", "mover_z", "mcts_q", "root_value",
-            "legal_count"]
+            "number", "leading_card", "source_card", "against_card", "blocked_card", "mover_z", "mcts_q",
+            "root_value", "legal_count"]
 GAME_COLS = ["game_id", "winner", "starting_player", "num_decisions", "hidden0", "hidden1",
              "kings0", "kings1", "n_kingshand", "n_assassin_reveal"]
 
@@ -61,33 +61,50 @@ def build(data_dir: str, out_dir: str, limit: Optional[int] = None) -> Dict[str,
 
     for r in _iter_records(data_dir, limit):
         gid = r["deal_seed"]
-        st = GameState.deal(np.random.default_rng(gid))
+        # honour the RECORDED starter (a no-op for an ordinary deal; a mirrored corpus forces it)
+        st = GameState.deal(np.random.default_rng(gid), starting_player=r.get("starting_player"))
         post_setup = None
-        try:
-            for i, d in enumerate(r["decisions"]):
-                if post_setup is None and st.phase == StepKind.MAIN:
-                    post_setup = st
-                lead = st.leading
-                pend = st.pending[-1] if st.pending else None
-                cands = d.get("candidates") or []
-                tot = sum(c["visits"] for c in cands)
-                root_v = sum(c["visits"] * c["mean_q"] for c in cands) / tot if tot else ""
-                mq = next((c["mean_q"] for c in cands if c["move"] == d["chosen"]), "")
-                ch = d["chosen"]
-                plyev.append({
-                    "game_id": gid, "ply": i, "seat": d["seat"], "phase": d["phase"],
-                    "action_kind": ch["kind"], "action_card": _name(ch.get("card")),
-                    "guess_name": ch.get("name"), "target": ch.get("target"), "number": ch.get("number"),
-                    "leading_card": _name(lead.card) if lead else None,
-                    "source_card": _name(pend.source) if pend and pend.source is not None else None,
-                    "against_card": _name(pend.against) if pend and pend.against is not None else None,
-                    "mover_z": d.get("z"), "mcts_q": mq, "root_value": root_v,
-                    "legal_count": len(st.legal_moves()),
-                })
-                st = st.apply(dict_to_action(ch))
-        except Exception:
+        rows: List[Dict] = []
+        desynced = False
+        for i, d in enumerate(r["decisions"]):
+            ch = d["chosen"]
+            a = dict_to_action(ch)
+            # THE canary. `st.apply` does NOT validate legality -- abilities.resolve just dispatches on
+            # pending[-1].kind -- so a corpus recorded before a rules change replays into a CORRUPT state
+            # rather than raising. It happened to raise on 446 of the gen-0 corpus's 449 desynced games,
+            # and the bare `except` here swallowed them: these tables were built from 1,554/2,000 games
+            # and said nothing. Check legality explicitly, drop the game, and COUNT it.
+            if a not in st.legal_moves():
+                desynced = True
+                break
+            if post_setup is None and st.phase == StepKind.MAIN:
+                post_setup = st
+            lead = st.leading
+            pend = st.pending[-1] if st.pending else None
+            cands = d.get("candidates") or []
+            tot = sum(c["visits"] for c in cands)
+            root_v = sum(c["visits"] * c["mean_q"] for c in cands) / tot if tot else ""
+            mq = next((c["mean_q"] for c in cands if c["move"] == d["chosen"]), "")
+            rows.append({
+                "game_id": gid, "ply": i, "seat": d["seat"], "phase": d["phase"],
+                "action_kind": ch["kind"], "action_card": _name(ch.get("card")),
+                "guess_name": ch.get("name"), "target": ch.get("target"), "number": ch.get("number"),
+                "leading_card": _name(lead.card) if lead else None,
+                "source_card": _name(pend.source) if pend and pend.source is not None else None,
+                "against_card": _name(pend.against) if pend and pend.against is not None else None,
+                # What a King's Hand COUNTERED is pend.source -- except in the nested anti-Assassin window,
+                # which carries no source at all (abilities.py:444). Falling back to the leading card there
+                # attributes the block to whatever happened to sit on the stack. Name the Assassin.
+                "blocked_card": ("Assassin" if d["phase"] == StepKind.REACTION_KH_VS_ASSASSIN.name
+                                 else (_name(pend.source) if pend and pend.source is not None else None)),
+                "mover_z": d.get("z"), "mcts_q": mq, "root_value": root_v,
+                "legal_count": len(st.legal_moves()),
+            })
+            st = st.apply(a)
+        if desynced:
             failures += 1
             continue
+        plyev.extend(rows)
         gt = post_setup if post_setup is not None else st          # post-setup ground truth
         loc: Dict[int, str] = {}
         for c in gt.hands[0]:
@@ -181,7 +198,9 @@ def report(out_dir: str) -> None:
     by_phase = Counter(r["phase"] for r in kh)
     print("(b) blocked context (phase):", dict(by_phase),
           "  [REACTION_KINGSHAND=ability, REACTION_KH_VS_ASSASSIN=assassin flip]")
-    blocked = Counter((r["source_card"] or r["leading_card"] or "?") for r in kh)
+    # `blocked_card` already resolves the nested anti-Assassin window (which carries no `source`). The old
+    # `source_card or leading_card` fallback silently credited those blocks to whatever card was leading.
+    blocked = Counter((r["blocked_card"] or "?") for r in kh)
     print("(b) card whose ability/flip was blocked:", _top(blocked, len(kh)) if kh else "(none)")
 
     # assassin usage for context
@@ -201,8 +220,13 @@ def main(argv=None) -> None:
     print(f"building tables from {args.data} -> {args.out_dir}"
           + (f" (limit {args.limit})" if args.limit else ""))
     stats = build(args.data, args.out_dir, args.limit)
-    print(f"  {stats['games']} games | {stats['card_rows']} card rows | {stats['ply_rows']} ply rows"
-          + (f" | {stats['failures']} replay failures" if stats["failures"] else ""))
+    print(f"  {stats['games']} games | {stats['card_rows']} card rows | {stats['ply_rows']} ply rows")
+    if stats["failures"]:
+        total = stats["games"] + stats["failures"]
+        print(f"  WARNING: DROPPED {stats['failures']}/{total} game(s) ({stats['failures'] / total:.1%}) "
+              f"whose recorded actions are no longer legal -- this corpus predates an engine rules change. "
+              f"Every table above is computed on the survivors and is BIASED toward the games the change "
+              f"did not touch (for gen-0 that means the games where a Mystic mute never mattered).")
     if args.report:
         report(args.out_dir)
 

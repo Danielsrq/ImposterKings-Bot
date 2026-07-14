@@ -70,7 +70,9 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
             g = rec["deal_seed"]
             _guard_seed(g, seen, f)
             rewards = rec["rewards"]
-            st = GameState.deal(np.random.default_rng(g))
+            st = GameState.deal(np.random.default_rng(g),      # honour the RECORDED starter: a no-op for a
+                                rec.get("starting_player"))   # normal deal, but a mirrored corpus
+                                                              # forces it and would otherwise desync
             mark = (len(cards_chunks), len(offsets), len(board), total_tokens, dec_id)
             desynced = False
             for d in rec["decisions"]:
@@ -150,7 +152,9 @@ def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
             g = rec["deal_seed"]
             _guard_seed(g, seen, f)
             rewards = rec["rewards"]
-            st = GameState.deal(np.random.default_rng(g))
+            st = GameState.deal(np.random.default_rng(g),      # honour the RECORDED starter: a no-op for a
+                                rec.get("starting_player"))   # normal deal, but a mirrored corpus
+                                                              # forces it and would otherwise desync
             mark = (len(cards), dec_id)
             desynced = False
             for d in rec["decisions"]:
