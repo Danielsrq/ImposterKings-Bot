@@ -150,3 +150,38 @@ def test_review_nn_head_accepts_an_attention_checkpoint(tmp_path):
     value, priors = ev(s)
     assert len(value) == 2 and abs(value[0] + value[1]) < 1e-6          # zero-sum leaf
     assert set(priors) == set(s.legal_moves()) and abs(sum(priors.values()) - 1.0) < 1e-5
+
+
+# --- the drawer follows the PLY, not the turn root -------------------------------------------------
+
+def test_every_ply_is_explainable_for_its_own_mover_not_just_turn_roots():
+    """A turn is a SEQUENCE of micro-decisions (play, then a guess, then a reaction), and each ply carries
+    its own search. The drawer used to key on the turn ROOT, so stepping through a turn left the heatmap
+    frozen on that turn's first decision -- about half of all plies were unreachable."""
+    from imposterkings.ui.review import attn_entries_for, build_trajectory, turns_of
+
+    traj = build_trajectory(iters=30, seed=2, cross_eval=True)
+    roots = {s for s, _e, _o in turns_of(traj)}
+    assert len(roots) < len(traj), "this game has no mid-turn plies -- pick another seed"
+
+    model = _model()
+    for i, rec in enumerate(traj):
+        mover = rec.seat                                    # THIS ply's decider (not the turn's owner:
+        entries = attn_entries_for(rec, mover, mover, model, "ck")   # a reaction flips the mover mid-turn)
+        assert entries, f"ply {i} has no explanation for its own mover"
+        assert entries[0][0] == rec.move                    # the move actually played comes first
+
+
+def test_the_opponents_read_exists_at_turn_roots_and_is_reported_absent_elsewhere():
+    """Only turn-START plies get the dual cross-search, so the opponent's read genuinely does not exist
+    mid-turn. That must come back as [] (the drawer then says so) rather than a wrong or invented answer."""
+    from imposterkings.ui.review import attn_entries_for, build_trajectory, turns_of
+
+    traj = build_trajectory(iters=30, seed=2, cross_eval=True)
+    roots = {s for s, _e, _o in turns_of(traj)}
+    model = _model()
+    at_root = [i for i in roots if attn_entries_for(traj[i], traj[i].seat, 1 - traj[i].seat, model, "ck")]
+    mid = [i for i in range(len(traj)) if i not in roots
+           and attn_entries_for(traj[i], traj[i].seat, 1 - traj[i].seat, model, "ck")]
+    assert at_root, "turn roots must carry both seats' reads"
+    assert not mid, "a mid-turn ply has no opponent cross-search -- it must report empty, not guess"

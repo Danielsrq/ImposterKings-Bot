@@ -58,8 +58,15 @@ def _make_agent(spec: Spec, evaluator=None):
 
 
 def _evaluator_for(ckpt: str):
-    """Build the leaf evaluator matching the checkpoint: attention model (model_type=='attention') or
-    the default MLP (MLP checkpoints carry no model_type key)."""
+    """Build the leaf evaluator matching the checkpoint.
+
+    ``.npz`` -> the pure-numpy path (npz_infer), which never touches torch -- this is what the shipped game
+    uses. ``.pt`` -> torch: an attention model (model_type=='attention') or the default MLP (MLP checkpoints
+    carry no model_type key). The .npz branch comes FIRST and imports nothing torch-ward, so a torch-less
+    machine can still run every .npz checkpoint."""
+    if ckpt.endswith(".npz"):
+        from .npz_infer import build_evaluator as be
+        return be(ckpt)
     import torch
     mt = torch.load(ckpt, map_location="cpu", weights_only=False).get("model_type")
     if mt == "attention":

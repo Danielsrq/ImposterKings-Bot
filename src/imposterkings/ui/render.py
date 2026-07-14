@@ -64,7 +64,8 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
                  bot_result=None, show_reasoning: bool = True, seed=None,
                  hint_result=None, show_hint: bool = False, knowledge=None,
                  bot_eval=None, hint_eval=None, attn_available: bool = False,
-                 mouse: Optional[Tuple[int, int]] = None) -> Frame:
+                 mouse: Optional[Tuple[int, int]] = None,
+                 bot_pending: bool = False, hint_pending: bool = False) -> Frame:
     """Paint the whole screen and hand back every clickable rect.
 
     ``mouse`` drives BOTH the chrome-button hover and the playable-card highlight. The latter self-disables
@@ -83,7 +84,8 @@ def render_frame(surface, view, fonts, legal_moves: List[Action], *,
     side_panel.draw_log(surface, fonts, log)
     reasoning_toggle, hint_toggle = side_panel.draw_reads(
         surface, fonts, view, bot_result=bot_result, show_reasoning=show_reasoning, bot_eval=bot_eval,
-        hint_result=hint_result, show_hint=show_hint, hint_eval=hint_eval, mouse=mouse)
+        hint_result=hint_result, show_hint=show_hint, hint_eval=hint_eval, mouse=mouse,
+        bot_pending=bot_pending, hint_pending=hint_pending)
     side_panel.draw_knowledge(surface, fonts, view, knowledge)
 
     settings = widgets.button(surface, small, pygame.Rect(SETTINGS_X, 12, 84, 24), "Settings", mouse)

@@ -19,6 +19,7 @@ import numpy as np
 from .. import cards
 from ..actions import Action, ActionKind, StepKind
 from ..infoset import InformationSet
+from ..paths import model_path, resolve_ckpt
 from .attention_view import draw_attention_drawer
 from .labels import compact_action as _compact_action
 from .theme import (BTN, BTN_HOVER, CARD_COLORS, DIVIDER, GOLD, INK, MUTE, PANEL, P_COLORS, RED, WINDOW,
@@ -171,6 +172,43 @@ def annotate_dual_evals(traj: List[PlyRecord], iters, rng, evaluator=None) -> in
         rec.result_by_seat = (rbs[0], rbs[1])
         rec.eval_by_seat = (_result_eval(rbs[0], rec.state, 0), _result_eval(rbs[1], rec.state, 1))
     return computed
+
+
+def missing_dual_evals(traj: List[PlyRecord]) -> List[Tuple[int, int]]:
+    """The ``(ply_index, seat)`` searches :func:`annotate_dual_evals` would still have to run -- i.e. exactly
+    the work that makes "Review game" stall at the end of a match.
+
+    The app drains this list on its idle worker DURING play (you spend most of a game thinking, and the
+    worker is doing nothing), so by the time the game ends the review has nothing left to compute and opens
+    instantly. Same predicate as annotate_dual_evals, so the two cannot disagree about what is missing: a
+    seat is a gap unless it already has a result, or it is the mover and the ply recorded its own search."""
+    out: List[Tuple[int, int]] = []
+    for start, _end, _owner in turns_of(traj):
+        rec = traj[start]
+        if rec.state is None:
+            continue
+        mover = rec.state.to_play
+        rbs = rec.result_by_seat if rec.result_by_seat is not None else (None, None)
+        for s in (0, 1):
+            if rbs[s] is None and not (s == mover and rec.result is not None):
+                out.append((start, s))
+    return out
+
+
+def set_seat_result(rec: PlyRecord, seat: int, res) -> None:
+    """Store one seat's search into a ply, filling ``eval_by_seat`` once BOTH seats are known (the review's
+    graph needs the pair). Mirrors what annotate_dual_evals writes, so a pre-filled ply is indistinguishable
+    from one it computed itself."""
+    rbs = list(rec.result_by_seat) if rec.result_by_seat is not None else [None, None]
+    rbs[seat] = res
+    if rbs[seat] is None:
+        return
+    mover = rec.state.to_play
+    if rbs[1 - seat] is None and rec.result is not None and (1 - seat) == mover:
+        rbs[1 - seat] = rec.result                      # the mover's own decision search counts
+    rec.result_by_seat = (rbs[0], rbs[1])
+    if rbs[0] is not None and rbs[1] is not None:
+        rec.eval_by_seat = (_result_eval(rbs[0], rec.state, 0), _result_eval(rbs[1], rec.state, 1))
 
 
 _SETUP_KINDS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
@@ -604,8 +642,8 @@ def render_review_frame(screen, fonts, traj, turns, *, cursor, mode="icicle", re
         r = pygame.Rect(bx, 50, 96 if key in ("zout", "renorm") else 84, 22)
         active = (key == "renorm" and renorm) or (key != "renorm" and key == mode)
         btns[key] = _button(screen, small, label, r, active=active, hover=r.collidepoint(mouse))
-    _text(screen, small, "◄/► step · I/O view · R renorm · click card/graph=jump · click box=zoom · "
-                         "Backspace=out · Esc quit", (604, 54), MUTE)
+    _text(screen, small, "◄/► step · I/O view · R renorm · A attention (Tab swaps seat) · click=jump/zoom "
+                         "· Backspace=out · Esc quit", (604, 54), MUTE)
 
     _draw_graph(screen, fonts, traj, turns, cursor, TL_TOP)
     strip_hits = _draw_strip(screen, fonts, traj, turns, cursor)
@@ -672,19 +710,41 @@ def attn_entries_for(rec0: PlyRecord, owner: int, seat: int, model, ckpt_id: str
 
 # Attention explainability head. Preferred first: the v2 (featurization 2.2) net gives the drawer fixed
 # 18-card axes + zone posteriors. Forward slashes so these compare equal to app.discover_ckpts()' paths.
-DEFAULT_ATTN_CKPTS = ("models/gen1_v3c_v2feat/attn_d64_L2.pt", "models/attn_d64_L1.pt")
+DEFAULT_ATTN_CKPTS = ("models/release/attn_d64_L2.npz",          # torch-free -- what the release ships
+                      "models/gen1_v3c_v2feat/attn_d64_L2.pt",   # dev checkpoints (need torch)
+                      "models/attn_d64_L1.pt")
+
+
+def load_attn_model(ckpt: str):
+    """Load an attention net for the DRAWER, torch-free when it can be: ``.npz`` -> npz_infer (numpy),
+    ``.pt`` -> torch. Both satisfy explain()'s ``explain_forward``/``readout_u`` seam, so the drawer cannot
+    tell them apart -- which is exactly what lets the shipped game explain a move without bundling torch."""
+    if ckpt.endswith(".npz"):
+        from ..machine_learning.npz_infer import load as _load
+        return _load(ckpt)
+    from ..machine_learning.attention_model import load as _load
+    return _load(ckpt)[0]
 
 
 def default_attn_ckpt(explicit: Optional[str] = None) -> Optional[str]:
-    """``explicit`` if given, else the first DEFAULT_ATTN_CKPTS that exists on disk (None if none do)."""
-    return explicit or next((p for p in DEFAULT_ATTN_CKPTS if os.path.exists(p)), None)
+    """``explicit`` if given, else the first DEFAULT_ATTN_CKPTS that exists (None if none do).
+
+    Candidates resolve against the BUNDLE root (paths.model_path), not the working directory -- otherwise a
+    frozen build launched from anywhere but the repo root would silently find no attention head and quietly
+    disable the drawer."""
+    if explicit:
+        return resolve_ckpt(explicit)
+    return next((p for p in (model_path(c) for c in DEFAULT_ATTN_CKPTS) if os.path.exists(p)), None)
 
 
 def attn_ckpt_id(path: str) -> str:
     """Fingerprint identifying a loaded checkpoint. It KEYS THE EXPLAIN MEMO CACHE, so app and review must
-    agree on its shape -- hence one definition, imported by both. mtime included so retraining to the same
-    filename invalidates the cache instead of serving stale explanations."""
-    return f"{os.path.abspath(path)}:{int(os.path.getmtime(path))}"
+    agree on its shape -- hence one definition, imported by both.
+
+    Size, not mtime: retraining to the same filename with a different net changes the size (or the path),
+    while a FROZEN build rewrites mtimes on every extraction -- an mtime key would churn the cache on each
+    launch of the shipped game for no reason."""
+    return f"{os.path.abspath(path)}:{os.path.getsize(path)}"
 
 
 def make_attn_loader(ckpt: Optional[str]) -> Optional[Callable]:
@@ -695,8 +755,7 @@ def make_attn_loader(ckpt: Optional[str]) -> Optional[Callable]:
         return None
 
     def _load_attn():
-        from ..machine_learning.attention_model import load as _attn_load
-        model, _ = _attn_load(ckpt)
+        model = load_attn_model(ckpt)
         print(f"attention explain head loaded from {ckpt} (L={model.cfg.n_layers})")
         return model, attn_ckpt_id(ckpt)
 
@@ -718,14 +777,14 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
     last_tree = {0: None, 1: None}              # last non-None (result, played_path) per seat
     mid = W // 2
     turns = turns_of(traj)
-    # Attention drawer state: entries are explained lazily per (ckpt, turn-start, seat) and memoized --
-    # the forward pass is deterministic, so first view pays one pass per entry, revisits are instant.
+    # Attention drawer state: entries are explained lazily per (ckpt, PLY, seat) and memoized -- the forward
+    # pass is deterministic, so the first view of a ply pays one pass per entry and every revisit is free.
     show_attn, attn_mode, attn_token_view = False, "absolute", "all"   # token view: all|hide_board|cards
     attn_layer_view = "causal"                  # L>=2: causal composite | l1 | l2
-    attn_sel, attn_hover, attn_hits, attn_turn = 0, None, [], None
-    attn_seat = None                            # None -> follow the current turn's owner
+    attn_sel, attn_hover, attn_hits, attn_ply = 0, None, [], None
+    attn_seat = None                            # None -> follow this ply's mover; Tab pins a seat
     attn_model = {"tried": False, "model": None, "id": ""}
-    attn_cache: dict = {}                       # (ckpt_id, turn_start, seat) -> entries
+    attn_cache: dict = {}                       # (ckpt_id, ply, seat) -> entries
 
     def attn_get_model():
         if not attn_model["tried"]:
@@ -744,34 +803,45 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
                                   ost=ost, zoom=zoom, last_tree=last_tree, mouse=mouse)
         btns, strip_hits, blocks, ptop = hit["btns"], hit["strip_hits"], hit["blocks"], hit["ptop"]
 
-        # Attention drawer overlay (drawn AFTER the frame, BEFORE flip -- render_review_frame is reused
-        # by ui.headless, so the overlay lives here). Explains the CURRENT turn for the selected seat.
+        # Attention drawer overlay (drawn AFTER the frame, BEFORE flip -- render_review_frame is reused by
+        # ui.headless, so the overlay lives here).
+        #
+        # It explains the ply AT THE CURSOR, not the turn root. Every ply carries its own search (a turn is
+        # a SEQUENCE of micro-decisions -- play, then a guess, then a reaction), so pinning the drawer to the
+        # turn root threw away all of them: stepping through a turn left the heatmap frozen on the first
+        # decision. Keyed by cursor and memoized, so stepping back and forth costs one forward pass per
+        # (checkpoint, ply, seat) and nothing thereafter.
         attn_ctrl = None
         if show_attn:
-            start, _end, owner = turns[_current_turn(turns, cursor)]
-            if start != attn_turn:                        # stepped to a new turn -> reset selection
-                attn_turn, attn_sel, attn_hover, attn_seat = start, 0, None, None
+            rec = traj[cursor]
+            mover = rec.seat                              # the seat deciding at THIS ply -- not the turn's
+            if cursor != attn_ply:                        # owner, which differs inside a reaction window
+                attn_ply, attn_sel, attn_hover = cursor, 0, None   # (attn_seat is sticky: Tab should hold)
             amodel = attn_get_model()
             if amodel is None:
                 show_attn = False                         # no loader / load failed
             else:
-                seat = attn_seat if attn_seat is not None else owner
-                key = (attn_model["id"], start, seat)
-                if key not in attn_cache:                 # memo: one explain() per (ckpt, turn, seat)
-                    attn_cache[key] = attn_entries_for(traj[start], owner, seat, amodel, attn_model["id"])
+                seat = attn_seat if attn_seat is not None else mover
+                key = (attn_model["id"], cursor, seat)
+                if key not in attn_cache:                 # memo: one explain() per (ckpt, ply, seat)
+                    attn_cache[key] = attn_entries_for(rec, mover, seat, amodel, attn_model["id"])
                 entries = attn_cache[key]
                 if entries:
                     attn_ctrl = draw_attention_drawer(
                         screen, fonts, entries, mouse, mode=attn_mode, hover=attn_hover,
                         selected=attn_sel, token_view=attn_token_view,
-                        result=_seat_result(traj[start], owner, seat),
-                        seat_labels=("P0", "P1"), seat_selected=seat, layer_view=attn_layer_view)
+                        result=_seat_result(rec, mover, seat),
+                        seat_labels=("P0", "P1"), seat_selected=seat, layer_view=attn_layer_view,
+                        head_note=f"ply {cursor + 1}/{len(traj)} · Tab swaps seat · ◄ ► steps")
                     attn_hits = attn_ctrl["hits"]
-                else:                                     # nothing to explain for this (turn, seat)
-                    box = pygame.Rect(W - 360, 8, 352, 30)
+                else:
+                    # No read for this (ply, seat). Expected off the turn root: only turn-start plies carry
+                    # BOTH seats' cross-search; a mid-turn ply has only the mover's own. Say which.
+                    box = pygame.Rect(W - 420, 8, 412, 30)
                     pygame.draw.rect(screen, PANEL, box, border_radius=6)
                     pygame.draw.rect(screen, GOLD, box, 1, border_radius=6)
-                    _text(screen, fonts["small"], f"(no P{seat} read to explain here -- A closes)",
+                    _text(screen, fonts["small"],
+                          f"(no P{seat} read at ply {cursor + 1} -- Tab for P{1 - seat}, A closes)",
                           (box.x + 10, box.y + 7), MUTE)
                     attn_hits = []
         pygame.display.flip()
@@ -790,7 +860,12 @@ def run_review(screen, fonts, traj: List[PlyRecord], attn_loader=None) -> None:
                 elif e.key == pygame.K_a:
                     if attn_loader is not None:           # A toggles the attention drawer
                         show_attn = not show_attn
-                        attn_turn = None                  # force re-resolve of turn/seat on open
+                        attn_ply, attn_seat = None, None  # reopen fresh: re-resolve ply, follow the mover
+                elif e.key == pygame.K_TAB and show_attn:
+                    # Swap whose read is explained. Sticky across ply steps -- if you are following P1's
+                    # thinking through a turn, stepping should not silently snap you back to the mover.
+                    cur = attn_seat if attn_seat is not None else traj[cursor].seat
+                    attn_seat, attn_sel, attn_hover = 1 - cur, 0, None
                 elif e.key == pygame.K_LEFT:
                     cursor = max(0, cursor - 1)
                 elif e.key == pygame.K_RIGHT:

@@ -183,6 +183,36 @@ class AttentionModel(nn.Module):
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
+    # --- the backend-agnostic seam ---------------------------------------------------------------
+    # `explain()` talks to a model ONLY through these two methods, and `npz_infer.NumpyAttention` implements
+    # them too. That is what lets explain.py be torch-free -- and hence lets the shipped game render the
+    # attention drawer without a 4.2 GB dependency. Everything crossing this seam is numpy.
+
+    @torch.no_grad()
+    def explain_forward(self, tok, need_values: bool = False):
+        """One (view, action) -> ``(q: float, attns: [np [h,S,S]], values: [np [h,S,dh]] | None,
+        cards: np [N, C])``. The torch twin of NumpyAttention.explain_forward."""
+        self.eval()
+        if self.cfg.feat == "v2":
+            b = collate2([tok])
+            kw = {"kings": b["kings"]}
+        else:
+            b = collate([tok])
+            kw = {}
+        q, attns, values = self.forward_layers(b["cards"], b["board"], b["phase"], b["action"],
+                                               b["card_mask"], need_values=True, **kw)
+        return (float(q[0].item()),
+                [a[0].cpu().numpy().astype(np.float32) for a in attns],
+                [v[0].cpu().numpy().astype(np.float32) for v in values] if need_values else None,
+                b["cards"][0].cpu().numpy())
+
+    @torch.no_grad()
+    def readout_u(self) -> np.ndarray:
+        """The readout direction u [heads, dh] = head.weight @ W_o of the LAST layer. A token's signed
+        contribution to the q-logit is ``A[h,0,j] * (u[h] . v[h,j])`` -- see explain()."""
+        u = self.head.weight[0] @ self.layers[-1].attn.wo.weight
+        return u.view(self.cfg.n_heads, -1).cpu().numpy().astype(np.float32)
+
 
 # --- batching + interpretability helpers --------------------------------------------------------
 

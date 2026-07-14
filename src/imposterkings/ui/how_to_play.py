@@ -39,7 +39,11 @@ def draw_how_to_play(surface, fonts, mouse, scroll: int = 0) -> dict:
 
     Content comes from ``card_text`` (pure data, no pygame) -- the wording lives in one place and
     its numbers are interpolated from ``rules.py``, so this panel cannot drift from the engine. Body is
-    clipped and offset by ``scroll`` (px) so the list can never spill out of the box."""
+    clipped and offset by ``scroll`` (px) so the list can never spill out of the box.
+
+    Returns ``{"close", "body", "total", "scroll", "previews"}``. ``previews`` is ``[(rect, asset)]`` for the
+    card thumbnails -- the SAME shape ``Frame.previews`` uses for the board, so the caller feeds both into
+    one ``draw_card_preview`` path instead of growing a second zoom implementation."""
     big, med, small = fonts["big"], fonts["med"], fonts["small"]
     W, H = WINDOW
     dim = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -74,7 +78,7 @@ def draw_how_to_play(surface, fonts, mouse, scroll: int = 0) -> dict:
 
     y += 14
     widgets.text(surface, med, "CARDS", (x0, y), GOLD)
-    hint = "right-click any card in play to zoom it"
+    hint = "right-click any card to zoom it"          # true HERE too now, not just on the board
     widgets.text(surface, small, hint, (body.right - small.size(hint)[0], y + 4), MUTE)
     y += 32
 
@@ -82,19 +86,22 @@ def draw_how_to_play(surface, fonts, mouse, scroll: int = 0) -> dict:
     txt_w = col_w - _HTP_THUMB[0] - 12
     rows = card_text.deck_entries()
     half = (len(rows) + 1) // 2
-    for col, chunk in enumerate((rows[:half], rows[half:])):
+    previews = []                                     # (rect, assets/ filename) -- the SAME shape the board
+    for col, chunk in enumerate((rows[:half], rows[half:])):        # hands out, so one zoom path serves both
         cx, cy = x0 + col * (col_w + 30), y
         for name, value, copies, text in chunk:
             lines = widgets.wrap(small, text, txt_w)
             rh = max(_HTP_THUMB[1], 22 + len(lines) * lh) + 6
             if cy + rh > body.y - 40 and cy < body.bottom + 40:      # cheap cull for scrolled-away rows
+                cid = cards.card_ids_for_name(name)[0]
+                thumb = pygame.Rect(cx, cy, *_HTP_THUMB)
                 try:
-                    surface.blit(assets.card_surface(cards.card_ids_for_name(name)[0], _HTP_THUMB),
-                                 (cx, cy))
+                    surface.blit(assets.card_surface(cid, _HTP_THUMB), (cx, cy))
+                    if thumb.colliderect(body):                      # only the visible part is clickable
+                        previews.append((thumb, cards.asset_path(cid)))
                 except Exception:                                    # noqa: BLE001 -- art is decoration
-                    pygame.draw.rect(surface, MUTE, (cx, cy, *_HTP_THUMB))
-                pygame.draw.rect(surface, CARD_COLORS.get(name, NEUTRAL),
-                                 (cx, cy, *_HTP_THUMB), 1)
+                    pygame.draw.rect(surface, MUTE, thumb)
+                pygame.draw.rect(surface, CARD_COLORS.get(name, NEUTRAL), thumb, 1)
                 tx = cx + _HTP_THUMB[0] + 12
                 head = f"{name}  {value}" + (f"   x{copies}" if copies > 1 else "")
                 tags = [t.name.lower() for t in cards.card_def(cards.card_ids_for_name(name)[0]).tags]
@@ -113,5 +120,5 @@ def draw_how_to_play(surface, fonts, mouse, scroll: int = 0) -> dict:
         kh = max(24, int(body.h * body.h / total))
         ky = body.y + int((body.h - kh) * scroll / max(1, total - body.h))
         pygame.draw.rect(surface, GOLD, (track.x, ky, 4, kh), border_radius=2)
-    return {"close": close, "body": body, "total": total, "scroll": scroll}
+    return {"close": close, "body": body, "total": total, "scroll": scroll, "previews": previews}
 

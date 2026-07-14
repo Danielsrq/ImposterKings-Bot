@@ -85,9 +85,14 @@ def draw_explain(surface, fonts, result, top: int, depth: int = 5, own_eval=None
 
 
 def draw_reasoning_section(surface, fonts, top, title, result, shown, placeholder,
-                           own_eval=None, seat=None, mouse=None) -> "pygame.Rect":
+                           own_eval=None, seat=None, mouse=None, pending: bool = False) -> "pygame.Rect":
     """Header + [hide]/[show] toggle at ``top``; render the PV lines when ``shown``. Returns the toggle
-    Rect. Shared by the bot-reasoning and human-hint panels."""
+    Rect. Shared by the bot-reasoning and human-hint panels.
+
+    ``pending``: the search for this panel is queued or running on the worker. Searches became ASYNCHRONOUS
+    (they used to block the UI thread), which opened a window where the panel is switched ON but its result
+    has not landed yet -- and the panel then showed its "toggle to see this" placeholder, telling you to
+    turn on something that was already on. Say "thinking" instead: the panel is working, not idle."""
     small = fonts["small"]
     px = PANEL_X + 12
     pygame.draw.line(surface, DIVIDER, (PANEL_X + 8, top - 12), (WINDOW[0] - 8, top - 12))
@@ -98,20 +103,23 @@ def draw_reasoning_section(surface, fonts, top, title, result, shown, placeholde
         if result is not None:
             draw_explain(surface, fonts, result, top + 26, own_eval=own_eval, seat=seat)
         else:
-            widgets.text(surface, small, placeholder, (px, top + 26), MUTE)
+            msg, colour = ("(thinking...)", GOLD) if pending else (placeholder, MUTE)
+            widgets.text(surface, small, msg, (px, top + 26), colour)
     return toggle
 
 
 def draw_reads(surface, fonts, view, *, bot_result, show_reasoning, bot_eval,
-               hint_result, show_hint, hint_eval, mouse):
+               hint_result, show_hint, hint_eval, mouse,
+               bot_pending: bool = False, hint_pending: bool = False):
     """The two PV sections: the bot's read and your own. Returns ``(reasoning_toggle, hint_toggle)``."""
     opp = 1 - view.observer
     reasoning = draw_reasoning_section(surface, fonts, REASON_TOP, f"Bot P{opp} read (MCTS):",
                                        bot_result, show_reasoning, "(no search yet)",
-                                       own_eval=bot_eval, seat=opp, mouse=mouse)
+                                       own_eval=bot_eval, seat=opp, mouse=mouse, pending=bot_pending)
     hint = draw_reasoning_section(surface, fonts, HINT_TOP, f"Your P{view.observer} read (MCTS):",
                                   hint_result, show_hint, "(toggle for your read of this position)",
-                                  own_eval=hint_eval, seat=view.observer, mouse=mouse)
+                                  own_eval=hint_eval, seat=view.observer, mouse=mouse,
+                                  pending=hint_pending)
     return reasoning, hint
 
 

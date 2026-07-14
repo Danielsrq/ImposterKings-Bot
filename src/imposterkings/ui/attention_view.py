@@ -374,7 +374,7 @@ def draw_tooltip(surface, fonts, payload, hit: AttnHit, pos, layer_view: str = "
 
 def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", hover=None,
                           selected=0, token_view="all", result=None, depth=5,
-                          seat_labels=None, seat_selected=0, layer_view="causal"):
+                          seat_labels=None, seat_selected=0, layer_view="causal", head_note=""):
     """Right-side "analysis mode" drawer over a dim scrim. ``entries`` = the top recommendations as
     ``[(move, payload), ...]`` (payload = an AttentionExplanation); ``selected`` picks which entry the
     heatmap shows (clickable rec pills switch). ``token_view`` ("all" | "hide_board" | "cards") drops the
@@ -395,10 +395,24 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
     pygame.draw.rect(surface, GOLD, (dx, 0, dw, H), 2)
     pad = 16
 
-    widgets.text(surface, med, "Attention  [Experimental]", (dx + pad, 14), INK)
+    title = "Attention  [Experimental]"
+    widgets.text(surface, med, title, (dx + pad, 14), INK)
     close = pygame.Rect(dx + dw - pad - 82, 12, 82, 26)
     pygame.draw.rect(surface, BTN_HOVER if close.collidepoint(mouse) else BTN, close, border_radius=4)
     widgets.text(surface, small, "Close [A]", (close.x + 10, close.y + 5), INK)
+
+    # WHICH net is talking. The explainer is a SEPARATE slot from the net driving the search, so when an MLP
+    # (or plain MCTS) is picking the moves, this panel answers "what does the attention net think of this
+    # move" -- NOT "why the bot played it". Two different questions behind an identical-looking panel is
+    # exactly the sort of thing that quietly misleads, so it gets said. On the title row: the rec pills own
+    # y=44, and the panel's whole geometry hangs off that.
+    if head_note:
+        nx = dx + pad + med.size(title)[0] + 14
+        avail = close.x - 10 - nx
+        note = head_note
+        while note and small.size(note)[0] > avail:
+            note = note[:-2] + "…"
+        widgets.text(surface, small, note, (nx, 20), MUTE)
 
     # Rec pills: the search's top recommendations; click switches which one the heatmap explains.
     selected = max(0, min(selected, len(entries) - 1))

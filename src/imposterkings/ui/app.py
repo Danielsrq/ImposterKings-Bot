@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 from collections import deque
 
 import numpy as np
@@ -18,11 +19,13 @@ from .. import cards
 from ..actions import ActionKind, StepKind
 from ..agents import MCTSAgent, RandomAgent
 from ..explain import format_action
+from ..paths import model_dir, model_path, resolve_ckpt, same_file
 from ..state import GameState
 from .render import (BTN_H, BTN_TOP, PANEL_X, WINDOW, draw_attention_drawer, draw_card_preview,
                      draw_how_to_play, draw_settings_overlay, make_fonts, render_frame)
 from .review import (DEFAULT_ATTN_CKPTS, PlyRecord, annotate_dual_evals, attn_ckpt_id, budget_iters,
-                     default_attn_ckpt, run_review, _result_eval, _search_from)
+                     default_attn_ckpt, missing_dual_evals, run_review, set_seat_result, _result_eval,
+                     _search_from)
 from .scenario_setup import run_setup
 
 # Opponent's setup hide/discard are private -- never reveal the card identity in the log.
@@ -31,15 +34,23 @@ _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
 # DEFAULT_ATTN_CKPTS / attn_ckpt_id live in review.py and are imported (not re-declared) so the app and the
 # standalone review agree on the drawer's checkpoint AND on the fingerprint that keys its explain memo cache.
 # NN+MCTS default (Settings can swap it for any other discovered checkpoint, attention nets included).
-DEFAULT_NN_CKPTS = ("models/mlp_32.pt", "models/mlp_256.pt")
+# The .npz forms come first: they are what the RELEASE ships, and they need no torch.
+DEFAULT_NN_CKPTS = ("models/release/attn_d64_L2.npz", "models/release/mlp_256.npz",
+                    "models/mlp_32.pt", "models/mlp_256.pt")
 
 
-def discover_ckpts(root: str = "models"):
-    """Every ``*.pt`` under ``models/`` (attention nets first, then MLPs; each group name-sorted) -- the
-    menu of nets the NN+MCTS mode can be pointed at."""
+def discover_ckpts(root: Optional[str] = None):
+    """Every checkpoint under ``models/`` (attention nets first, then MLPs; each group name-sorted) -- the
+    menu of nets the NN+MCTS mode can be pointed at, cycled with Settings' < / > arrows.
+
+    Resolved via ``paths.model_dir()``, NOT the working directory, so a shipped .exe launched from the
+    Desktop still finds its weights. Both formats: ``.npz`` (pure numpy, what the frozen release ships) and
+    ``.pt`` (torch, dev only) -- a torch-less machine simply self-disables any .pt it is pointed at."""
     import glob
-    found = sorted(p.replace("\\", "/") for p in glob.glob(os.path.join(root, "**", "*.pt"),
-                                                           recursive=True))
+    base = str(model_dir()) if root is None else root
+    found = sorted(p.replace("\\", "/")
+                   for ext in ("*.npz", "*.pt")
+                   for p in glob.glob(os.path.join(base, "**", ext), recursive=True))
     attn = [p for p in found if "attn" in os.path.basename(p)]
     return attn + [p for p in found if p not in attn]
 
@@ -93,10 +104,19 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     # Checkpoints for the "NN+MCTS" mode: every models/**/*.pt, so the Settings overlay can swap the net
     # driving the search (MLP *or* attention -- the evaluator dispatches on the checkpoint's model_type).
     nn_ckpts = discover_ckpts()
-    nn_ckpt = nn if nn else next((p for p in DEFAULT_NN_CKPTS if os.path.exists(p)), None)
-    if nn_ckpt and nn_ckpt not in nn_ckpts:         # an explicit --nn outside models/ still selectable
+    # Resolve against the BUNDLE root, not the cwd -- a frozen .exe is not launched from the repo, so a
+    # bare "models/..." would resolve relative to wherever the user happened to start it.
+    nn = resolve_ckpt(nn)
+    nn_ckpt = nn if nn else next((p for p in (model_path(c) for c in DEFAULT_NN_CKPTS)
+                                  if os.path.exists(p)), None)
+    # Compare CANONICALLY, never as strings: model_path builds Windows backslashes while discover_ckpts
+    # normalises to forward slashes, so the same file compared unequal and got inserted AGAIN -- the picker
+    # then showed three options, two of them the same net under the same name.
+    ix = next((i for i, p in enumerate(nn_ckpts) if same_file(p, nn_ckpt)), None)
+    if nn_ckpt and ix is None:                      # a --nn from OUTSIDE models/ is still selectable
         nn_ckpts.insert(0, nn_ckpt)
-    nncfg = {"ix": nn_ckpts.index(nn_ckpt) if nn_ckpt in nn_ckpts else 0,
+        ix = 0
+    nncfg = {"ix": ix or 0,
              "ckpts": nn_ckpts, "ev": None}         # ev is built lazily the first time NN mode is used
     nn_available = bool(nn_ckpts)
 
@@ -139,10 +159,15 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             return None, None
         if attncfg["model"] is None:
             try:                                    # torch optional -> a load failure disables Analysis
-                from ..machine_learning.attention_model import evaluator_from_model
-                from ..machine_learning.attention_model import load as _attn_load
-                m, _ = _attn_load(attncfg["ckpt"])
-                attncfg["model"], attncfg["ev"] = m, evaluator_from_model(m)
+                from .review import load_attn_model
+                m = load_attn_model(attncfg["ckpt"])          # .npz -> numpy (no torch), .pt -> torch
+                if attncfg["ckpt"].endswith(".npz"):
+                    from ..machine_learning.npz_infer import evaluator_from
+                    ev = evaluator_from(m)
+                else:
+                    from ..machine_learning.attention_model import evaluator_from_model
+                    ev = evaluator_from_model(m)
+                attncfg["model"], attncfg["ev"] = m, ev
                 attncfg["id"] = attn_ckpt_id(attncfg["ckpt"])
                 print(f"attention explain head loaded from {attncfg['ckpt']} (L={m.cfg.n_layers})")
             except Exception as e:                  # noqa: BLE001 -- report + disable Analysis
@@ -152,9 +177,12 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
 
     nn_agent = None
     if nn and nn_greedy:                            # opt-in standalone greedy policy (no search)
-        from ..machine_learning.agent import NNAgent
-        nn_agent = NNAgent.from_checkpoint(nn)
-        print(f"greedy NN bot loaded from {nn} (no search; side panels still analyze independently)")
+        try:                                        # the ONE torch reach that used to escape run() -- a
+            from ..machine_learning.agent import NNAgent    # torch-less (frozen) build would hard-crash here
+            nn_agent = NNAgent.from_checkpoint(nn)
+            print(f"greedy NN bot loaded from {nn} (no search; side panels still analyze independently)")
+        except Exception as e:                      # noqa: BLE001 -- degrade to the searching bot, as
+            print(f"greedy NN bot unavailable ({e}); falling back to the search bot")   # everything else does
 
     pygame.init()
     screen = pygame.display.set_mode(WINDOW)
@@ -185,6 +213,18 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     knowledge_cache: dict = {"state": None, "val": None}   # [seat -> (has, lacks, level)], per state
     trajectory: list = []                          # per-ply PlyRecord(seat, move, view, result) for review
     game: dict = {}  # holds the resettable per-game state: state, rng, seed, bot
+    # ALL searching happens on ONE background worker thread. Both searches used to run inline in the event
+    # loop -- the bot's move AND the side panels' analysis (show_reasoning is on by default, so that one
+    # fires on every turn, including yours). No events were pumped and no frames drawn for their duration,
+    # and the NN+MCTS bot's p90 is ~5 s (worst case 13 s): long enough for Windows to grey the window out
+    # and label it "Not Responding". The game looked crashed rather than slow.
+    #
+    # One worker, not two, so the bot's move and a panel refresh never compete for the CPU; the bot's move
+    # takes priority because it is what blocks the game. ``gen`` fences results across a New Game: a search
+    # still in flight belongs to the old position and its answer must be dropped, not applied.
+    work: dict = {"thread": None, "out": None, "gen": 0}
+    # Dual-eval backlog for the post-game review, drained by the worker whenever it has nothing better to do.
+    prefill: dict = {"todo": [], "len": -1}
 
     def apply_engine():
         """Rebuild the budget + bot from ``engine`` and re-analyze the current position (live retune)."""
@@ -199,6 +239,9 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         rng = np.random.default_rng(s)
         st0 = initial_state if initial_state is not None else GameState.deal(rng, starting_player=start)
         ev = nn_evaluator() if engine["mode"] == "nn" else None
+        work["gen"] += 1                   # invalidate any in-flight search: it belongs to the OLD game
+        work["thread"], work["out"] = None, None
+        prefill["todo"], prefill["len"] = [], -1
         game.update(seed=s, rng=rng, state=st0, bot=_make_bot(random_bot, engine, nn_agent, ev))
         log.clear()
         trajectory.clear()
@@ -219,6 +262,27 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     new_game(seed)
     if setup:
         open_setup()
+
+    def _attn_head_note() -> str:
+        """What the drawer says about ITSELF: which net is explaining, and -- crucially -- whether that is
+        the same net that is choosing the moves.
+
+        The explain head (`--attn`) and the search head (Settings' NN+MCTS model) are independent slots. Pick
+        mlp_256 as the bot and press A and you still get a drawer, but it is the ATTENTION net's opinion of a
+        move the MLP chose. That is a legitimate and useful question ("what does the attention net make of
+        this?"), just not the one the panel appears to answer, so the difference is stated rather than left
+        for the player to infer."""
+        from .modals import _ckpt_label
+        ck = attncfg["ckpt"]
+        if not ck:
+            return ""
+        me = _ckpt_label(ck)
+        if engine["mode"] != "nn":                                 # plain MCTS / rollouts pick the moves
+            return f"{me} explaining — the bot plays with search only"
+        head = nn_ckpt_path()
+        if head and not same_file(head, ck):
+            return f"{me} explaining — the bot plays with {_ckpt_label(head)}"
+        return f"{me} — explaining the net that is playing"        # they agree: a true self-explanation
 
     def apply_logged(seat, move, result=None, perspective=None):
         st = game["state"]
@@ -263,6 +327,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
 
         # Both seats' read of the CURRENT position, once per state; each gated (and lazily filled when its
         # toggle flips on) by its panel toggle so cost is opt-in. bot seat -> reasoning, human -> hint.
+        analysis_want = []                                  # seats whose panel needs a search, in priority order
         if not state.is_terminal():
             if game["state"] is not analysis["state"]:
                 analysis["state"], analysis[0], analysis[1] = game["state"], None, None
@@ -275,11 +340,16 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 # the Analysis drawer are ONE search and agree; the bot's panel stays on the engine.
                 ev = attn_ev if (attn_ev is not None and s == view_seat) else analysis_ev
                 if want and analysis[s] is None:
-                    its = budget_iters(state, s, engine_budget)
-                    analysis[s] = _search_from(state, s, its, analysis_rng, evaluator=ev)
+                    analysis_want.append((s, ev))           # QUEUED -- the worker runs it, not this thread
         bot_res, hint_res = analysis[bot_seat], analysis[human_seat]
         bot_eval = _result_eval(bot_res, state, bot_seat) if bot_res is not None else None
         hint_eval = _result_eval(hint_res, state, human_seat) if hint_res is not None else None
+        # A panel is "thinking" exactly when it is ON, still empty, and the game is live -- i.e. the worker
+        # either has its search queued or is running it. Without this the panel showed its "toggle to see
+        # this" placeholder while the search was in flight: it told you to switch on something already on.
+        alive = not state.is_terminal()
+        bot_pending = show_reasoning and bot_res is None and alive
+        hint_pending = show_hint and hint_res is None and alive
 
         # Hand-knowledge for both seats (recomputed once per state).
         if game["state"] is not knowledge_cache["state"]:
@@ -315,6 +385,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                              hint_result=hint_res, show_hint=show_hint,
                              knowledge=knowledge_cache["val"],
                              bot_eval=bot_eval, hint_eval=hint_eval,
+                             bot_pending=bot_pending, hint_pending=hint_pending,
                              attn_available=attncfg["ckpt"] is not None,
                              mouse=mouse)   # drives BOTH the chrome-button hover and the playable-card
     #                                         highlight; the latter self-disables because `legal` is empty
@@ -328,7 +399,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
             attn_ctrl = draw_attention_drawer(screen, fonts, attn_cache["entries"], mouse,
                                               mode=attn_mode, hover=attn_hover, selected=attn_sel,
                                               token_view=attn_token_view, result=attn_cache["result"],
-                                              layer_view=attn_layer_view)
+                                              layer_view=attn_layer_view, head_note=_attn_head_note())
             attn_cache["hits"] = attn_ctrl["hits"]
         help_ctrl = draw_how_to_play(screen, fonts, mouse, help_scroll) if help_open else None
         if help_ctrl is not None:
@@ -382,12 +453,17 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                 hit = attn_cell_at(attn_cache["hits"], event.pos)
                 attn_hover = (hit.i, hit.j, hit.head) if hit else None
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
-                # right-click a face-up card -> zoom it (near-native art). Ignored inside the modals.
-                if preview is None and not settings_open and not show_attn:
+                # Right-click a card -> zoom it (near-native art), ON THE BOARD OR IN "How to play".
+                # The panel's own thumbnails are hit-tested FIRST and exclusively: it covers the board, so
+                # falling through would zoom whichever board card happened to sit underneath the panel.
+                if preview is not None or settings_open or show_attn:
+                    preview = None                      # already zoomed / another modal owns the clicks
+                elif help_open and help_ctrl is not None:
+                    hit = next((a for r, a in help_ctrl["previews"] if r.collidepoint(event.pos)), None)
+                    preview = (hit, False) if hit else None
+                else:
                     preview = next(((a, up) for r, a, up in frame.previews
                                     if r.collidepoint(event.pos)), None)
-                else:
-                    preview = None
             elif preview is not None and event.type == pygame.MOUSEBUTTONDOWN:
                 preview = None                      # zoom is modal: any click dismisses it
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -488,12 +564,75 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                        attn_loader=((lambda: (attn_bundle()[0], attncfg["id"]))
                                     if attncfg["ckpt"] is not None else None))
 
-        if (not settings_open) and (not help_open) and (not hotseat) and (not game["state"].is_terminal()) \
-                and game["state"].to_play == bot_seat:
-            pygame.time.delay(300)
-            bview = game["state"].information_set(bot_seat)
-            mv = game["bot"].select_move(bview, game["rng"])
-            apply_logged(bot_seat, mv, getattr(game["bot"], "last_result", None))
+        # --- all searching happens HERE, off the UI thread, so the window keeps breathing ---------------
+        bots_turn = ((not settings_open) and (not help_open) and (not hotseat)
+                     and (not game["state"].is_terminal()) and game["state"].to_play == bot_seat)
+
+        if work["out"] is not None:                                # a search finished -> land it
+            kind, gen, st_at, payload = work["out"]
+            work["out"], work["thread"] = None, None
+            if gen == work["gen"]:                                 # else: New Game -- this answer is orphaned
+                if kind == "bot" and payload[0] is not None and bots_turn and st_at is game["state"]:
+                    apply_logged(bot_seat, payload[0], payload[1])
+                elif kind == "analysis" and analysis["state"] is st_at:
+                    analysis[payload[0]] = payload[1]
+                elif kind == "prefill":                            # a PAST ply -- no current-state check
+                    i, s, res = payload
+                    if i < len(trajectory):
+                        set_seat_result(trajectory[i], s, res)
+
+        # The review's dual-eval backlog: every turn needs BOTH seats' read, but live play only ever computes
+        # the seats whose panel is showing. "Review game" used to search all the gaps AT ONCE, on the main
+        # thread -- a multi-second freeze at exactly the moment you want to look at the game. Instead, fill
+        # them on the idle worker WHILE YOU THINK; by game over there is usually nothing left to do.
+        if len(trajectory) != prefill["len"]:
+            prefill["len"] = len(trajectory)
+            prefill["todo"] = missing_dual_evals(trajectory)
+
+        if work["thread"] is None:                                 # worker idle -> give it the next job
+            st_now, gen = game["state"], work["gen"]
+            job = None
+            if bots_turn:                                          # the bot's move BLOCKS the game -> first
+                bot, rng = game["bot"], game["rng"]
+                bview = st_now.information_set(bot_seat)           # GameState is immutable -> safe to hand off
+
+                def job(bot=bot, rng=rng, bview=bview):            # noqa: F811 -- bound now, not by closure
+                    return ("bot", (bot.select_move(bview, rng), getattr(bot, "last_result", None)))
+            elif analysis_want:                                    # then the visible side panels
+                s, ev = analysis_want[0]
+                its = budget_iters(st_now, s, engine_budget)
+
+                def job(s=s, ev=ev, its=its, st_now=st_now):       # noqa: F811
+                    return ("analysis", (s, _search_from(st_now, s, its, analysis_rng, evaluator=ev)))
+            elif prefill["todo"]:                                  # then, purely with spare time, the backlog
+                # The todo list is a snapshot; a gap may have been filled since (apply_logged donates the
+                # live analysis). Drop those rather than paying for a search whose answer we already have.
+                while prefill["todo"]:
+                    i, s = prefill["todo"].pop(0)
+                    rec = trajectory[i]
+                    rbs = rec.result_by_seat
+                    if rbs is None or rbs[s] is None:
+                        break
+                else:
+                    i = None
+                if i is not None:
+                    ev = nn_evaluator() if engine["mode"] == "nn" else None
+                    its = budget_iters(rec.state, s, engine_budget)
+
+                    def job(i=i, s=s, ev=ev, its=its, rec=rec):    # noqa: F811
+                        return ("prefill", (i, s, _search_from(rec.state, s, its, analysis_rng, evaluator=ev)))
+
+            if job is not None:
+                def _run(job=job, gen=gen, st_at=st_now):
+                    try:
+                        kind, payload = job()
+                        work["out"] = (kind, gen, st_at, payload)
+                    except Exception as e:                         # noqa: BLE001 -- never kill the window
+                        print(f"search failed ({e})")
+                        work["out"] = ("bot", gen, st_at, (None, None))
+
+                work["thread"] = threading.Thread(target=_run, daemon=True)
+                work["thread"].start()
 
         clock.tick(30)
 

@@ -6,14 +6,14 @@ back are non-deck art. Surfaces are cached by ``(filename, size)``.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Dict, Tuple
 
 import pygame
 
 from .. import cards
+from ..paths import asset_dir
 
-ASSETS_DIR = Path(__file__).resolve().parents[3] / "assets"
+ASSETS_DIR = asset_dir()        # frozen-aware: sys._MEIPASS in a build, the repo root from source
 
 _CACHE: Dict[Tuple[str, int, int], "pygame.Surface"] = {}
 

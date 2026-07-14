@@ -6,6 +6,8 @@ own module; the attention drawer lives with the rest of the attention code in ``
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pygame
 
 from . import assets, widgets
@@ -41,11 +43,20 @@ ENGINE_PILLS = [("mcts", "Fixed N"), ("branching", "Branch"), ("hybrid", "Hybrid
 _SLIDER_RANGES = {"N": (25, 1024), "k": (10, 100), "l": (1, 8)}
 
 
-def _ckpt_label(path: str) -> str:
-    """``models/gen1_v3c_v2feat/attn_d64_L2.pt`` -> ``gen1_v3c_v2feat/attn_d64_L2`` (drop models/ + .pt)."""
-    p = path.replace("\\", "/")
-    p = p[len("models/"):] if p.startswith("models/") else p
-    return p[:-3] if p.endswith(".pt") else p
+def _ckpt_label(path: str, others=None) -> str:
+    """A checkpoint's DISPLAY NAME: just the file's own name, e.g. ``attn_d64_L2``.
+
+    Checkpoint paths are absolute (they resolve against the bundle root, not the cwd), so showing the path
+    overflows the box -- and the directory is noise anyway. Show the bare name; only when two discovered
+    checkpoints share a name (``sweep_v3a/attn_d64_L2`` vs ``gen1_v3c_v2feat/attn_d64_L2``, which happens a
+    lot in a dev tree) fall back to ``parent/name`` so the arrows still distinguish them."""
+    p = Path(path)
+    name = p.stem
+    if others:
+        clash = sum(1 for o in others if Path(o).stem == name) > 1
+        if clash and p.parent.name:
+            return f"{p.parent.name}/{name}"
+    return name
 
 
 def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True,
@@ -119,9 +130,11 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True,
             pygame.draw.rect(surface, BTN_HOVER if r.collidepoint(mouse) else BTN, r, border_radius=4)
             widgets.text(surface, small, glyph, (r.centerx - small.size(glyph)[0] // 2, r.y + 5), INK)
         ix = nn_ckpt_ix % len(nn_ckpts)
-        name = _ckpt_label(nn_ckpts[ix])
+        name = _ckpt_label(nn_ckpts[ix], nn_ckpts)
         box = pygame.Rect(ckpt_prev.right + 8, cy, ckpt_next.x - ckpt_prev.right - 16, 28)
         pygame.draw.rect(surface, BG, box, border_radius=4)
+        while name and small.size(name)[0] > box.w - 10:      # a long name is ellipsized, never overflowed:
+            name = name[:-2] + "…"                       # the arrows either side must stay clickable
         tw = small.size(name)[0]
         widgets.text(surface, small, name, (box.centerx - tw // 2, box.y + 5), INK)
         widgets.text(surface, small, f"{ix + 1}/{len(nn_ckpts)}",

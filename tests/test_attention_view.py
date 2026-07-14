@@ -245,3 +245,36 @@ def test_v1_payload_has_no_beliefs_and_still_draws():
     hits = av.draw_attention(surf, _fonts(), p, (20, 20, 900, 820))
     av.draw_tooltip(surf, _fonts(), p, hits[0], (400, 300))
     assert av._zone_lines(p, 1) == [] and not av._is_unseen(p, 1)     # belief helpers are inert at v1
+
+
+def test_head_note_says_which_net_is_explaining_without_covering_the_controls():
+    """The explain head and the search head are separate slots: pick mlp_256 as the bot, press A, and the
+    drawer still opens -- explaining with the ATTENTION net a move the MLP chose. The note makes that
+    explicit. It shares the title row with Close, so a long one must ellipsize, never overlap."""
+    import pygame
+    import torch
+    from imposterkings.actions import StepKind
+    from imposterkings.machine_learning.attention_model import AttentionModel, AttnConfig
+    from imposterkings.machine_learning.explain import explain
+    from imposterkings.state import GameState
+    from imposterkings.ui.attention_view import draw_attention_drawer
+    from imposterkings.ui.theme import WINDOW, make_fonts
+
+    pygame.display.init()
+    screen = pygame.display.set_mode(WINDOW)
+    fonts = make_fonts()
+    torch.manual_seed(0)
+    model = AttentionModel(AttnConfig(d_model=32, feat="v2")).eval()
+    st = GameState.deal(np.random.default_rng(0), starting_player=0)
+    while st.phase in (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD):
+        st = st.apply(st.legal_moves()[0])
+    view = st.information_set(st.to_play)
+    mv = st.legal_moves()[0]
+    entries = [(mv, explain(view, mv, model, attribution=True))]
+
+    for note in ("", "attn_d64_L2 explaining — the bot plays with mlp_256", "x" * 400):
+        ctrl = draw_attention_drawer(screen, fonts, entries, (0, 0), head_note=note)
+        assert hasattr(ctrl["close"], "collidepoint")
+        for pill in ctrl["rec_pills"]:                 # the note must not sit on top of the pills or Close
+            assert not pill.colliderect(ctrl["close"])
+    pygame.display.quit()

@@ -22,10 +22,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 
 from ..cards import CARD_NAMES, asset_path, card_ids_for_name
-from .attention_model import AttentionModel, collate, collate2
 from .features import CAND_COL, tokenize
 
 _CTX_LABELS = ["board", "phase", "action"]                          # the 3 singleton tokens (no card art)
@@ -75,53 +73,39 @@ def _parse_name2(label: str) -> Optional[str]:
     return name if name in _NAME_TO_ASSET else None
 
 
-@torch.no_grad()
-def explain(view, action, model: AttentionModel, *, all_layers: bool = False,
+def explain(view, action, model, *, all_layers: bool = False,
             attribution: bool = False, ckpt_id: str = "") -> AttentionExplanation:
     """Run one forward pass for ``(view, action)`` and package the per-head CLS->token attention.
 
     ``view`` an InformationSet, ``action`` the candidate move to explain (or None), ``model`` an
-    already-loaded :class:`AttentionModel` (its ``cfg.feat`` selects the v1/v2 featurization). With
-    ``all_layers`` the payload carries every layer's attention (for L>=2 card-row routing); otherwise only
-    the last (readout) layer. With ``attribution`` it also computes the signed value-weighted contribution
-    of each token to the q-logit (``row0_signed`` / ``attribution``). Deterministic (eval, no dropout)."""
-    model.eval()
+    already-loaded attention net -- EITHER the torch :class:`AttentionModel` OR the numpy
+    ``npz_infer.NumpyAttention``; both implement ``explain_forward``/``readout_u``, and everything crossing
+    that seam is numpy, so this module needs no torch. (That is what lets the shipped game draw the
+    attention drawer without bundling a 4.2 GB framework.) Its ``cfg.feat`` selects the v1/v2 featurization.
+
+    With ``all_layers`` the payload carries every layer's attention (for L>=2 card-row routing); otherwise
+    only the last (readout) layer. With ``attribution`` it also computes the signed value-weighted
+    contribution of each token to the q-logit (``row0_signed`` / ``attribution``). Deterministic (eval)."""
     feat = getattr(model.cfg, "feat", "v1")
     if feat == "v2":
         from . import features2 as F2
         tok = F2.tokenize(view, action)
-        batch = collate2([tok])
-        kw = {"kings": batch["kings"]}
     else:
         tok = tokenize(view, action)
-        batch = collate([tok])
-        kw = {}
-    args = (batch["cards"], batch["board"], batch["phase"], batch["action"], batch["card_mask"])
-    values_t = None
-    if all_layers or attribution:
-        res = model.forward_layers(*args, need_values=attribution, **kw)
-        q_t, attns_t = res[0], res[1]
-        if attribution:
-            values_t = res[2]
-        attn = attns_t[-1][0].cpu().numpy().astype(np.float32)
-        per_layer: Optional[List[np.ndarray]] = (
-            [a[0].cpu().numpy().astype(np.float32) for a in attns_t] if all_layers else None)
-    else:
-        q_t, attn_t = model(*args, **kw)
-        per_layer = None
-        attn = attn_t[0].cpu().numpy().astype(np.float32)
+
+    q, attns, values, cards = model.explain_forward(tok, need_values=attribution)
+    attn = attns[-1]                                                # [heads, S, S], the readout layer
+    per_layer: Optional[List[np.ndarray]] = list(attns) if all_layers else None
 
     # Signed value-weighted attribution (readout layer): Δq_logit(j) = sum_h A^h[0][j] * (u^h . v_j^h),
     # u = head.weight @ W_o.weight (the readout direction). See attention_exploration / the plan for the math.
     row0_signed = attribution_vec = None
     if attribution:
-        attn_last = attns_t[-1][0]                                  # [heads, S, S]
-        v_last = values_t[-1][0]                                    # [heads, S, dh]
-        u = (model.head.weight[0] @ model.layers[-1].attn.wo.weight).view(model.cfg.n_heads, -1)  # [heads,dh]
-        c = (u.unsqueeze(1) * v_last).sum(-1)                       # [heads, S]  c[h,j] = u[h].v[h,j]
-        rs = attn_last[:, 0, :] * c                                 # [heads, S]  signed contribution to logit
-        row0_signed = rs.cpu().numpy().astype(np.float32)
-        attribution_vec = rs.sum(0).cpu().numpy().astype(np.float32)  # [S] head-summed
+        u = model.readout_u()                                       # [heads, dh]
+        c = (u[:, None, :] * values[-1]).sum(-1)                    # [heads, S]  c[h,j] = u[h].v[h,j]
+        rs = attn[:, 0, :] * c                                      # [heads, S]  signed contribution to logit
+        row0_signed = rs.astype(np.float32)
+        attribution_vec = rs.sum(0).astype(np.float32)              # [S] head-summed
 
     n_cards = len(tok.labels)
     zone_posterior = zone_names = card_seen = card_seq_range = None
@@ -141,7 +125,7 @@ def explain(view, action, model: AttentionModel, *, all_layers: bool = False,
     # Candidate token(s): the is_candidate_action column of the card block. Card-region index j -> seq
     # index 1 + j (cards are contiguous from 1 in both featurizations). v1 also catches the synthetic "*"
     # claim token; v2 has no synthetic token -- a guess flags EVERY instance of the named card instead.
-    cand_col = batch["cards"][0, :, cand_ix].cpu().numpy()
+    cand_col = cards[:, cand_ix]                                    # the batch's card block, already numpy
     cand = [1 + j for j in np.flatnonzero(cand_col == 1.0).tolist() if j < n_cards]
     if not cand and feat != "v2":                                   # fallback: any "*"-suffixed label
         cand = [i for i, lb in enumerate(seq_labels) if lb.endswith("*")]
@@ -156,7 +140,7 @@ def explain(view, action, model: AttentionModel, *, all_layers: bool = False,
                        cand[0] if cand else None)
 
     return AttentionExplanation(
-        q=float(q_t.item()), seq_labels=seq_labels, attn=attn, per_layer=per_layer,
+        q=q, seq_labels=seq_labels, attn=attn, per_layer=per_layer,
         candidate_seq_index=primary, candidate_seq_indices=cand, display_names=display_names,
         name_to_asset=dict(_NAME_TO_ASSET), n_heads=int(attn.shape[0]), n_layers=model.cfg.n_layers,
         ckpt_id=ckpt_id, row0_signed=row0_signed, attribution=attribution_vec, feat=feat,
