@@ -113,9 +113,7 @@ cards — so a card you *haven't* seen is still a token, carrying a **zone poste
 it is). The model can therefore attend to *absence*, which is most of the information in a hidden-hand game.
 It is an action-in q-net: the candidate move is a token, so one forward pass scores one (state, action) pair.
 
-**Honest result: the attention net plays with similar strength to the MLP, not better** — and costs ~3× the CPU. Its value is not strength; it is that you can *read* it.
-
-I've tried treating only played cards as tokens. This still worked but converged less well. There was a bit of an explainability issue because the attention model could not express fear of unseen cards in this tokenization.
+**The attention net plays with similar strength to the MLP, not better** — and costs ~3× the CPU. Its value is not strength; it is that you can *read* it.
 
 ### Featurization (`machine_learning/features2.py`)
 
@@ -151,6 +149,8 @@ is it *afraid* of", not merely "which card did it look at".
 
 The MLP (`features.py`) flattens broadly the same information into a single 216-dim vector — same facts, no
 structure, and no way to ask which part of it mattered.
+
+I've tried treating only played cards as tokens. This still worked but converged less well. There was a bit of an explainability issue because the attention model could not express fear of unseen cards in this tokenization. **Feature Engineering is important**
 
 ### Explainability
 
