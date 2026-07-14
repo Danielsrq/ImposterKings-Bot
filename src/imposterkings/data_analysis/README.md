@@ -15,12 +15,109 @@ Modules:
 | `merge_sweeps`   | De-duped, non-clobbering merge of multiple `budget_scaling` run dirs into `merged_*.csv`. |
 | `datagen`        | **Self-play → replayable JSONL corpus** (the NN dataset); see [DATASET.md](DATASET.md). |
 | `replay_tools`   | Slice a dataset shard into per-game replay files, or bundle replay files back into a shard. |
+| `replay`         | **The shared replay primitive**: re-derive a recorded game ply by ply, handing back the state *before* each action. Has the legality canary; use it instead of writing a fifth replay loop. |
+| `corpus_stats`   | **Who wins and why**: turn-order advantage, setup policy, hand-composition win-rates, ability usage, passive overrides, King's-Hand counters, guess accuracy, win reasons. CSV + `stats.json` + PNGs. |
+| `build_tables`   | Older exploration tables (card locations, ply events, per-game facts) + a query cookbook. |
 
-All three are runnable modules and write CSVs (+ PNGs) to an `--out-dir`. Runs are deterministic:
+All are runnable modules and write CSVs (+ PNGs) to an `--out-dir`. Runs are deterministic:
 paired per-deal seeds and mirrored seating, so results are reproducible and low-variance.
 
 See **[DATASET.md](DATASET.md)** for the NN self-play data-collection spec (schema, the shared MLP/attention
 featurizer, exploration query cookbook, `ui.review --replay`, and generation policy).
+
+---
+
+## `corpus_stats` — who wins, what the bot keeps, which powers pay
+
+```bash
+# one corpus (the default)
+python -m imposterkings.data_analysis.corpus_stats --data datasets/selfplay_gen1_v3c
+
+# several, reported side by side; --pool folds them into one population instead
+python -m imposterkings.data_analysis.corpus_stats \
+    --data datasets/selfplay_gen1_v3c datasets/selfplay_v3c_k50 --pool --max-combo 4
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--data` | `datasets/selfplay_gen1_v3c` | one or more corpus dirs; **side by side** unless `--pool` |
+| `--out-dir` | `results/corpus_stats` | one sub-dir per corpus + a shared `stats.json` |
+| `--max-combo` | `4` | largest hand sub-combination scored (see below — it does not explode) |
+| `--limit` | – | first N games per corpus (smoke) |
+| `--pool` | off | one population. Sound for turn-order across symmetric self-play; **not** across different bots, budgets, or the asymmetric corpus |
+| `--no-plot` | off | skip the PNG |
+
+Every number is produced by **replaying** the game and asking the engine, never by re-deriving state from
+the ply log — `royalty_present()`, `active_royalty()`, `effective_hand_value()`, "does the defender hold the
+named card". Reconstructing those from the recorded actions would mean reimplementing disgraces, mutes,
+King's-Hand removals and Fool grabs, i.e. reimplementing `abilities.resolve` with fresh bugs.
+
+### Three things that will mislead you if you forget them
+
+1. **A hand-row is `(game, seat)`, not a game.** One deal makes two different 8-card hands with opposite
+   outcomes. Pooled over both seats the base win-rate is exactly **50%** — the invariant that proves the unit
+   is right, and the reason a combo's distance from 50% *is* its value.
+2. **The played setup move is a sample, not the policy.** datagen ran at `temp_plies: 6` and setup is plies
+   1–2, so `chosen` was drawn from the visit distribution. The bot's actual preference is `argmax
+   visit_share` over the candidates. Both columns are reported; they are different questions.
+3. **Corpora do not pool freely.** Turn-order pools across symmetric self-play (seat effects cancel by
+   construction). Setup *policy* does not pool across different bots or search budgets, and the asymmetric
+   corpus needs its agent × turn-order 2×2 or the strong bot's record swamps the weak one's.
+
+### Why the combinatorics don't explode
+
+Enumeration runs over **observed** hands, not the theoretical space. Each dealt hand is 8 cards, so
+sub-combinations up to size 4 number `C(8,1..4) = 162`; across 8,000 hand-rows that is 1.3M counter
+increments (sub-second), collapsing to ~1,800 distinct keys — because the deck has **14 distinct names**, not
+18, so `Elder+Elder` is one key. Combos are deduped *per hand*, or a hand holding both Elders would count
+`("Elder",)` twice and quietly drag every duplicate card's win-rate toward 50%.
+
+Win-rates carry **Wilson** intervals, not normal ones: a 4-card combo lands in ~2% of hands, and at that n
+the textbook interval runs off the end of `[0,1]`.
+
+### Everything is split by seat (P1 = moves first, P2 = moves second)
+
+Because **50% is the wrong null once turn order exists**: P1 wins 41.2% of hand-rows and P2 wins 58.8%. A combo
+that wins 55% is *+14pp for P1* but *−4pp for P2* — pooling reports "55%, above average" and hides that it is a
+bad hand for one of the two seats. So `hand_combos.csv` carries `lift_first` / `lift_second` (each seat against
+**its own** baseline) and `interaction` (`lift_first − lift_second`), and `setup_hide.csv` /
+`setup_discard.csv` carry `rate_first` / `rate_second` / `p1_minus_p2` with a two-proportion `z`.
+
+### What it found (`selfplay_gen1_v3c`, 2,000 games / 4,000 hand-rows)
+
+- **Moving second is worth +17.6pp** (58.8% vs 41.2%) — and it is *structural*, not skill-dependent. The
+  asymmetric corpus gives the same lift to **both** agents to a tenth of a point (weak `fixed500`
+  29.5%→46.8%, strong v3c 53.2%→70.5%), and the effect replicates at a deeper search budget (k50: 58.9%).
+- **No hand is seat-specific.** Hand strength and turn order are **additive**. Across 848 well-powered combos
+  the spread of the P1/P2 interaction is **4.70pp against 4.89pp expected from sampling noise alone**
+  (ratio 0.96; only 2.7% clear |z| > 1.96, vs 5% by chance), and that null replicates at ratio **0.96 in all
+  three corpora**. Princess+Queen lifts P1 by +23.6pp and P2 by +25.1pp — the same. **There is no hand that
+  rescues the player who moves first.** The report prints this test and refuses to list the extremes when it
+  passes, because with ~850 combos the largest "interaction" is guaranteed to look impressive by chance.
+- **Princess+Queen wins 74.2%** of the hands that hold it; the best trio (`Assassin+KingsHand+Princess`)
+  wins 85.0% (94.1% as P2).
+- The Mystic's mute lands on **base value 2 (the Assassin) 42%** of the time — the bot learned to mute the
+  card it fears. The King's Hand's most common target is likewise the **Assassin (23%)**.
+- Games end by stall-out **70%** of the time, by Assassin **29.6%**, and by a King's Hand countering into an
+  unbeatable throne **0.7%** (14 games).
+
+### ⚠️ Two traps this module exists to keep you out of
+
+**1. Setup policy looks seat-dependent, and the effect is a search artifact.** In gen-1 (k20) P1 hides the
+Princess 11.1pp more often than P2 (z = +4.8) and the Queen 11.3pp more (z = +4.9) — highly significant, and
+a tempting story about hoarding royalty when you are behind. **It does not replicate.** At k50 — *the same
+net, only a deeper search* — those gaps collapse to +1.1pp (z = +0.5) and +3.0pp (z = +1.3), and a different
+card (Oathbound, +8.6pp, z = +5.1) becomes the "seat-dependent" one instead. The significance is real within
+each corpus; the *card it attaches to* moves with the search budget. Never read a setup asymmetry off one
+corpus.
+
+**2. Hand composition is causal; ability usage is not.** A dealt hand is fixed by `rng.permutation` before
+anyone has acted, so "Princess+Queen wins 74.2%" is a clean causal effect of the deal. But *whether a power
+got used* is a decision made **from a position the bot was already in** — so "Sentry used → 38.8%, declined →
+65.6%" almost certainly does not mean the Sentry is bad; it means the bot reaches for a self-disgracing power
+when it is already losing. Same shape for "kept the Assassin unused → 11.6%": that is a losing player running
+out of turns before the flip ever came, not proof that holding it is fatal. Treat `ability_usage.csv` and
+`passives.csv` as *descriptions of the policy*, not as advice.
 
 ---
 
