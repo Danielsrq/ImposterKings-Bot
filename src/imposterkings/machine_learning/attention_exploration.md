@@ -555,6 +555,77 @@ reproduces identical hands.
 
 ---
 
+## Study 6 (gen-2.5) — can the NN teach the search a move the search cannot find? (2026-07-15)
+
+Study 5b left a sharp question: the bot never hides the Assassin (argmax 0/4,000) yet forcing the hide costs
+nothing (+2.7pp, 2,000 games). A direct search probe showed the move IS explored (3–11% of visits, 11–15%
+prior) but ranks 2nd–5th, and the margin sits **inside MCTS's own noise** (a 0.024 q-gap against a √0.0059 ≈
+0.077 label-noise std). The suspect is **strategy fusion**: hiding the Assassin is an *informational* move
+(it dodges the Inquisitor, which steals the Assassin in 20.3% of games), and SO-ISMCTS determinizes the world
+at the root — destroying the very uncertainty that makes hiding worth it.
+
+**The hypothesis (user's):** the NN can learn from *outcomes* what the search cannot see from *determinized
+rollouts*. Train on games where the Assassin was actually hidden → the net's value of those states stops being
+extrapolation → `mcts._leaf_value` returns better numbers inside that branch → the backed-up q rises → the
+gap flips → the search starts choosing a move it could never find on its own.
+
+**gen-2.5 corpus (6,000 games):** the three v3c corpora with `selfplay_gen1_v3c` **down-sampled to 1,000**
+(shallowest search + weakest generator = noisiest labels; new `token_dataset` `dir:N` cap) + the
+`forced_assassin_hide` corpus (2,000 = 500 deals × 4). Of the forced corpus, **1,000 games are the forced
+hide (genuinely off-distribution — hidden-Assassin states the policy assigns ~0) and 1,000 are ordinary free
+self-play (in-distribution)**, so the off-distribution fraction is **16.7%**, not the whole corpus. Same
+arch/recipe as gen-2: d96/h6/ffn384, cosine 40. (First run with the **update-to-data** diagnostic: median
+−2.90, healthy; the only hot tensor is the readout head at ~−2.3 — visible only because the plot is now split
+per level.)
+
+**The probe** (`data_analysis/probe_hide.py`): 150 setup positions where a seat holds the Assassin, the SAME
+positions and SAME search seed for both nets, so only the evaluator differs. Every prediction was registered
+in advance:
+
+| channel | gen-2 (before) | gen-2.5 (after) | Δ | predicted? |
+|---|---:|---:|---:|---|
+| prior q(hide) — **prior** | +0.116 | +0.128 | **+0.012** | "barely moves" ✓ |
+| **V(hidden state)** — **value** | +0.151 | +0.192 | **+0.041** | "RISES — the channel the corpus feeds" ✓ |
+| visit share — search | 4.7% | 5.9% | +1.2pp | ↑ if real ✓ |
+| gap to best — search | −0.162 | −0.146 | closed ~10% | closes if real ✓ |
+| **argmax flip rate** — behaviour | **0.0%** | **0.7%** | **1 / 150** | — |
+
+**Strength — 100 mirrored deals (200 games), `--nn-mcts hybrid-k20-l3`, base-seed 0:**
+
+| opponent | gen-2 | **gen-2.5** |
+|---|---:|---:|
+| vanilla-MCTS@k20 | 68.5% | **66.5% ±5.0** |
+| MLP256-MCTS@k20 | 61.0% | **63.0% ±4.9** |
+| **gen-2 d96, head-to-head** | — | **51.5% ±4.9** (CI [46.6, 56.4]) |
+
+### Findings
+
+1. **The mechanism is real and points exactly as predicted — but it is far too weak to matter.** The value of
+   hidden-Assassin states rose (+0.041, the largest move and the predicted channel), the prior barely moved
+   (+0.012), and that value propagated causally into more visits (+1.2pp) and a narrower gap (~10%). Yet the
+   search's *argmax flipped in only 1 of 150 positions*. The gap it must overcome (−0.146) dwarfs what one
+   generation of leaf-value learning supplies.
+2. **This localizes the bias in the DETERMINIZATION, not the leaf evaluator.** The net demonstrably learned the
+   states, and the search *still* refuses — because SO-ISMCTS collapses the opponent's uncertainty at the root
+   *before* the net is ever consulted, and the whole value of hiding is that uncertainty. A better value head
+   is structurally unable to price an information-hiding move inside a determinized search. This is a concrete,
+   evidence-backed argument for the CFR track (which reasons over information sets, not sampled worlds).
+3. **Targeted off-distribution data is SAFE — it cost nothing.** gen-2.5 = gen-2 at the board: 51.5% ±4.9
+   head-to-head (parity), and it *held* the ~60% vs MLP256-MCTS (63.0%). Injecting 16.7% blind-spot-correcting
+   games did not degrade general play — an AZ-style loop can add such data without poisoning the policy. (The
+   two anchor moves cut opposite ways — −2pp vs vanilla, +2pp vs MLP256 — the signature of noise around an
+   unchanged strength.)
+4. **Attention structure was untouched.** gen-2.5's heads are near-identical to gen-2's (tempo head 73% on
+   `board`; threat head 24% on the unseen Assassin vs 27% before; spread 53pp vs 54pp). Training on
+   hidden-Assassin games changed the *value* it assigns those states, not *what it looks at* — consistent with
+   the probe: the movement was in the value channel, nothing else.
+
+**Verdict:** the NN can be nudged toward a search blind spot but cannot correct it, because the blind spot is
+the search's determinization, not the net. The right fix is either many AZ generations (each closing ~10% of a
+shrinking gap — slow, and it saturates) or a search that reasons over beliefs rather than sampled worlds (CFR).
+
+---
+
 ## Metric glossary
 
 - **winrate** — fraction of games the challenger wins vs the stated opponent (mirrored; 200 games unless
