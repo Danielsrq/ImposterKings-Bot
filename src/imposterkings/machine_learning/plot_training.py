@@ -53,8 +53,18 @@ def main(argv=None) -> None:
     tr = np.asarray(h["epoch_train_mse"], float)
     va = np.asarray(h["epoch_val_mse"], float)
 
-    n_panels = 3 if (h.get("ud")) else 2       # older checkpoints predate the update-to-data tracking
-    fig, ax = plt.subplots(1, n_panels, figsize=(7 * n_panels, 4.8))
+    # With update-to-data present: a 2-row figure -- top = loss + per-epoch, bottom = the UD ratio split
+    # BY LEVEL (embed | L0 | L1 | head), like the per-layer GELU plot. Older checkpoints (no ud) keep 1x2.
+    ud = h.get("ud") or []
+    if ud:
+        fig = plt.figure(figsize=(15, 9.2))
+        gs = fig.add_gridspec(2, 4)
+        ax = [fig.add_subplot(gs[0, :2]), fig.add_subplot(gs[0, 2:])]
+        ud_axes = []
+        for j in range(4):
+            ud_axes.append(fig.add_subplot(gs[1, j], sharey=ud_axes[0] if ud_axes else None))
+    else:
+        fig, ax = plt.subplots(1, 2, figsize=(14, 4.8))
 
     # --- (a) per-STEP training loss, with the LR schedule on a twin axis ---------------------------
     k = max(1, args.smooth)
@@ -87,23 +97,44 @@ def main(argv=None) -> None:
     ax[1].set_xlabel("epoch"); ax[1].set_yscale("log")
     ax[1].legend(fontsize=8)
 
-    # --- (c) update-to-data ratio, per weight tensor (Karpathy: want ~ -3) -------------------------
-    ud = h.get("ud") or []
+    # --- (c) update-to-data ratio, SPLIT BY LEVEL (embed | L0 | L1 | head) -------------------------
+    # One overlaid panel answers "is SOME tensor misbehaving"; per-level answers "is THIS level healthy" --
+    # a frozen embedding or a dead readout is invisible in the overlay. Karpathy: want ~ -3.
     if ud:
         us = np.asarray(h["ud_step"], float)
         names = sorted(ud[0])
-        # Colour by DEPTH so a layer that is frozen or exploding is identifiable, not just "some tensor".
-        cmap = plt.get_cmap("viridis")
-        for i, n in enumerate(names):
-            ax[2].plot(us, [u[n] for u in ud], lw=0.9, alpha=0.75, color=cmap(i / max(1, len(names) - 1)))
-        ax[2].axhline(-3.0, ls="--", color="crimson", lw=1.2)
-        ax[2].axhspan(-4.0, -2.0, color="grey", alpha=0.12)
-        ax[2].text(us[-1], -3.0, " target -3", color="crimson", va="bottom", ha="right", fontsize=8)
-        ax[2].set_xlabel("optimizer step")
-        ax[2].set_ylabel("log10( std(update) / std(param) )")
-        # Under cosine the LR -> 0 by design, so the tail MUST fall. Read the plateau, not the end.
-        ax[2].set_title(f"update-to-data, {len(names)} weight tensors\n"
-                        f"(band = healthy [-4,-2]; the tail falls because cosine drives lr -> 0)")
+
+        def level(n):                               # which sub-panel a tensor belongs to
+            if n.startswith("embed"):     return 0
+            if n.startswith("layers.0"):  return 1
+            if n.startswith("layers.1"):  return 2
+            return 3                                # head / anything else
+
+        def short(n):                               # a compact role label for the legend
+            p = n.replace(".weight", "").split(".")
+            if p[0] == "layers":  return ".".join(p[2:])     # attn.wq / ffn.0
+            if p[0] == "embed":   return p[1]                # card / board / phase / action / king
+            return p[0]                                      # head
+
+        titles = ["embed (inputs)", "L0", "L1", "head (readout)"]
+        cmap = plt.get_cmap("tab10")
+        for lv, a in enumerate(ud_axes):
+            grp = [n for n in names if level(n) == lv]
+            for i, n in enumerate(grp):
+                a.plot(us, [u[n] for u in ud], lw=1.1, alpha=0.85, color=cmap(i % 10), label=short(n))
+            a.axhline(-3.0, ls="--", color="crimson", lw=1.0)
+            a.axhspan(-4.0, -2.0, color="grey", alpha=0.12)      # the healthy band, in every sub-panel
+            a.set_title(titles[lv], fontsize=10)
+            a.set_xlabel("step")
+            if grp:
+                a.legend(fontsize=6, loc="upper right")
+            if lv == 0:
+                a.set_ylabel("log10( std(Δw) / std(w) )")
+            else:
+                a.tick_params(labelleft=False)                  # shared y -> label only the leftmost
+        ud_axes[0].figure.text(0.5, 0.47, "update-to-data by level  —  band = healthy [-4,-2]; target -3; "
+                               "the tail falls because cosine drives lr → 0 (read the plateau)",
+                               ha="center", fontsize=9, color="#444")
 
     fig.tight_layout()
     fig.savefig(out, dpi=115)

@@ -44,14 +44,35 @@ def _guard_seed(seed: int, seen: set, shard: str, paired: bool = False) -> None:
     seen.add(seed)
 
 
-def _shards(data_dir) -> List[str]:
-    """Every shard across one or MORE corpus dirs (pooling gen-1 + k50 + mixed without copying shards).
+def _parse_data(data) -> Tuple[List[str], Dict[str, int]]:
+    """Split each ``--data`` entry into a dir and an optional per-corpus game CAP: ``dir:N``.
 
-    Pooling is only sound when the corpora use DISJOINT deal-seed ranges: ``game_id == deal_seed`` and
-    ``train_tokens`` splits train/val by game_id, so colliding seeds would fuse different games under one
-    id (and leak across the split). ``build`` asserts this."""
-    dirs = [data_dir] if isinstance(data_dir, str) else list(data_dir)
-    return sorted(f for d in dirs for f in glob.glob(os.path.join(d, "*.jsonl")))
+    ``--limit`` is a GLOBAL first-N cap -- useless for mix-weighting. ``dir:N`` caps ONE corpus, so a
+    shallow-search or weaker-labelled corpus can be down-weighted in the pool (``gen1_v3c:1000``) without
+    copying shards. Split on the LAST colon and only treat the suffix as a cap when it is all digits, so a
+    Windows drive letter (``C:\\...``) is never mistaken for one.
+    """
+    entries = [data] if isinstance(data, str) else list(data)
+    dirs, caps = [], {}
+    for e in entries:
+        head, sep, tail = e.rpartition(":")
+        if sep and tail.isdigit():
+            dirs.append(head)
+            caps[head] = int(tail)
+        else:
+            dirs.append(e)
+    return dirs, caps
+
+
+def _shards(dirs) -> List[Tuple[str, str]]:
+    """``(dir, shard)`` pairs across one or MORE corpus dirs (pooling without copying shards).
+
+    The dir is carried alongside each shard so the build loop can enforce a per-corpus cap. Pooling is only
+    sound when the corpora use DISJOINT deal-seed ranges: ``game_id == deal_seed`` and ``train_tokens``
+    splits train/val by game_id, so colliding seeds would fuse different games under one id (and leak across
+    the split). ``_guard_seed`` asserts this."""
+    dl = [dirs] if isinstance(dirs, str) else list(dirs)
+    return sorted(((d, f) for d in dl for f in glob.glob(os.path.join(d, "*.jsonl"))), key=lambda p: p[1])
 
 
 def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1") -> Dict:
@@ -60,7 +81,8 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
     variable-length path, byte-identical."""
     if feat == "v2":
         return _build_v2(data_dir, out_path, limit)
-    files = _shards(data_dir)
+    dirs, caps = _parse_data(data_dir)
+    files = _shards(dirs)
     try:
         from tqdm import tqdm
         files = tqdm(files, desc="shards", unit="shard")
@@ -73,8 +95,13 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
     y, w, z, gid, did, chosen = [], [], [], [], [], []
     n_games = n_skipped = dec_id = total_tokens = 0
     seen: set = set()
-    for f in files:
+    per_dir: Dict[str, int] = {}                       # games kept PER SOURCE dir, for the dir:N cap
+    for src, f in files:                               # 'src' not 'd': 'd' is the decision var below
+        if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
+            continue                                   # this corpus's cap is met -> skip the rest of it
         for rec in read_jsonl(f):
+            if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
+                break                                  # cap reached mid-shard
             g = rec["deal_seed"]
             _guard_seed(g, seen, f, paired=bool((rec.get("gen") or {}).get("paired_deals")))
             rewards = rec["rewards"]
@@ -110,6 +137,7 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
                 n_skipped += 1
                 continue
             n_games += 1
+            per_dir[src] = per_dir.get(src, 0) + 1      # the cap counts USABLE games (desynced don't)
             if limit and n_games >= limit:
                 break
         if limit and n_games >= limit:
@@ -134,8 +162,8 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
     meta = {"card_dim": CARD_DIM, "board_dim": BOARD_DIM, "phase_dim": PHASE_DIM,
             "action_dim": ACTION_DIM, "target": "q", "n_rows": int(arrs["y"].shape[0]),
             "n_games": n_games, "n_skipped_desynced": n_skipped, "n_decisions": dec_id,
-            "total_card_tokens": int(cards.shape[0]),
-            "source": data_dir if isinstance(data_dir, str) else list(data_dir)}
+            "total_card_tokens": int(cards.shape[0]), "source": dirs,
+            "caps": caps, "games_per_source": dict(per_dir)}      # self-documenting mix
     with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1)
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
@@ -144,7 +172,8 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
 def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
     """The v2 (fixed-18) build: same replay/skip-on-desync logic, fixed-shape output arrays."""
     from .features2 import tokenize as tokenize2
-    files = _shards(data_dir)
+    dirs, caps = _parse_data(data_dir)
+    files = _shards(dirs)
     try:
         from tqdm import tqdm
         files = tqdm(files, desc="shards", unit="shard")
@@ -155,8 +184,13 @@ def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
     y, w, z, gid, did, chosen = [], [], [], [], [], []
     n_games = n_skipped = dec_id = 0
     seen: set = set()
-    for f in files:
+    per_dir: Dict[str, int] = {}                       # games kept PER SOURCE dir, for the dir:N cap
+    for src, f in files:                               # 'src' not 'd': 'd' is the decision var below
+        if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
+            continue                                   # this corpus's cap is met -> skip the rest of it
         for rec in read_jsonl(f):
+            if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
+                break                                  # cap reached mid-shard
             g = rec["deal_seed"]
             _guard_seed(g, seen, f, paired=bool((rec.get("gen") or {}).get("paired_deals")))
             rewards = rec["rewards"]
@@ -188,6 +222,7 @@ def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
                 n_skipped += 1
                 continue
             n_games += 1
+            per_dir[src] = per_dir.get(src, 0) + 1      # the cap counts USABLE games (desynced don't)
             if limit and n_games >= limit:
                 break
         if limit and n_games >= limit:
@@ -211,8 +246,8 @@ def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
     meta = {"feat": "v2", "card_dim": CD2, "board_dim": BD2, "phase_dim": PD2, "action_dim": AD2,
             "target": "q", "n_rows": int(arrs["y"].shape[0]), "n_games": n_games,
             "n_skipped_desynced": n_skipped, "n_decisions": dec_id,
-            "total_card_tokens": int(arrs["y"].shape[0]) * 18,
-            "source": data_dir if isinstance(data_dir, str) else list(data_dir)}
+            "total_card_tokens": int(arrs["y"].shape[0]) * 18, "source": dirs,
+            "caps": caps, "games_per_source": dict(per_dir)}      # self-documenting mix
     with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1)
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
@@ -253,7 +288,9 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Build token training tensors from a self-play corpus.")
     p.add_argument("--data", nargs="+", default=[os.path.join("datasets", "selfplay_k20l3")],
                    help="one or MORE corpus dirs; several are POOLED into one dataset (they must use "
-                        "disjoint --base-seed ranges -- game_id == deal_seed and the split is by game)")
+                        "disjoint --base-seed ranges -- game_id == deal_seed and the split is by game). "
+                        "Append ':N' to cap a corpus at N games for mix-weighting, e.g. "
+                        "datasets/selfplay_gen1_v3c:1000")
     p.add_argument("--out", default=os.path.join("datasets", "tensors", "k20l3_tokens.npz"))
     p.add_argument("--limit", type=int, default=None, help="only process the first N games (smoke)")
     p.add_argument("--feat", default="v1", choices=["v1", "v2"],
