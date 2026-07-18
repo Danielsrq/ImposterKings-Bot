@@ -709,6 +709,61 @@ and calibration). Code: `train_belief.py`, `token_dataset --target belief`, `fea
 
 ---
 
+## Study 8 — belief-weighted determinization: does feeding the belief into the SEARCH help? (2026-07-18)
+
+Study 7's belief net is only worth something if the *search* consumes it. This is the direct test of Study
+6's hypothesis: the hide-Assassin blind spot was localised in the **determinization step** (SO-ISMCTS
+re-samples the opponent's hidden hand *uniformly* at the root, once per iteration). So instead of uniform, we
+sample opponent worlds **from the belief posterior** — belief-weighted determinization — and ask whether the
+bot gets stronger.
+
+**Mechanism (opt-in, off by default).** `InformationSet.determinize(..., belief_weights=None)` gains an
+optional per-card `weights` dict over the 4 hidden zones; `None` is the byte-identical uniform behaviour, so
+the switch is a pure A/B with zero change to existing play. When set, the free-slot fill is a
+weighted-without-replacement draw (Efraimidis-Spirakis) that **preserves the pinned/has/lacks hard
+constraints** — only the *distribution* over legal worlds changes. The belief net runs **once per move**
+(`MCTSAgent(belief=...)` → `SearchConfig.belief_weights`); the per-iteration cost is just a ~9-card weighted
+draw. Because the hook sits above the rollout-vs-PUCT branch, one edit covers both the classic and value-net
+searches. Factory: `attention_model.build_belief_sampler`; A/B driver: `data_analysis/belief_ab.py`.
+
+**Results — 100 mirrored deals (200 games) each, belief-d64 driving the sampler:**
+
+| test | search | belief-agent winrate | CI95 | vs 50% |
+|---|---|---:|---|---:|
+| A | pure-rollout `fixed500` (no value net) | 47.5% ± 5.5 | [42.0, 53.0] | −2.5pp |
+| B | d96 `hybrid-k20-l3` value net (`v3c_gen25`) | 52.5% ± 5.6 | [46.9, 58.1] | +2.5pp |
+
+### Findings
+
+1. **No significant effect at 200 games — both arms straddle 50%.** Belief-weighted determinization neither
+   clearly helps nor hurts. The point estimates even flip sign (rollout −2.5pp, value net +2.5pp), both inside
+   ±5.5pp noise. Resolving a 2.5pp effect would need ~500 deals / 1,000 games (the same "real but tiny" regime
+   as the forced-hide study).
+2. **This is the informative Study-6 outcome.** The clean prediction was: if the blind spot lives in the
+   *world distribution*, sampling from the belief should move the needle. It didn't. That points the bias
+   deeper — at determinization's **collapse to a single fully-known world**: inside each determinized world
+   the opponent's hand is perfectly known to the rollout/leaf, so the *informational* value of a move (hiding
+   the Assassin to deny an Inquisitor) cannot surface no matter *which* worlds you weight. A better
+   distribution over worlds does not fix a per-world information collapse.
+3. **The sign split is consistent, if not conclusive.** The value-net arm being directionally positive fits
+   the leaf evaluator re-projecting to an info-set (so it reads belief features and can use better-sampled
+   worlds a little), while a pure rollout — perfect-information *inside* each world — cannot. Both within
+   noise.
+
+**Verdict:** a learned belief that beats hand-crafted counting as a *predictor* (Study 7) does **not**
+translate into measurable strength when fed to the determinization sampler, at this power. Consistent with the
+strategy-fusion bias living in the determinization machinery (per-world information collapse), beyond the reach
+of any *distribution* over determinized worlds — the concrete, evidence-backed case for the belief-state / CFR
+track. The feature ships as an optional, verified switch (full suite green, belief off by default); the next
+reference point is the **perfect-information (godmode) upper bound**, then belief-state search.
+
+Code: `rng.py` (`uniform()`), `infoset.py` (`determinize(belief_weights=...)` + `_weighted_perm`), `mcts.py`
+(`SearchConfig.belief_weights`), `agents.py` (`MCTSAgent(belief=...)`), `attention_model.py`
+(`belief_sampler_from_model`/`build_belief_sampler`), `data_analysis/belief_ab.py`,
+`tests/test_belief_determinize.py`. Results: `reports/belief_ab_{rolloutN500,d96_k20l3}.csv`.
+
+---
+
 ## Metric glossary
 
 - **winrate** — fraction of games the challenger wins vs the stated opponent (mirrored; 200 games unless

@@ -15,8 +15,9 @@ information that guesses leak (a wrong Inquisitor/Soldier/Judge name proves the 
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -24,6 +25,24 @@ from . import cards
 from .actions import Action, StepKind
 from .rng import as_search_rng
 from .state import GameState, PendingStep, StackCard
+
+
+def _weighted_perm(items: List[int], weight_of: Callable[[int], float], srng) -> List[int]:
+    """A weight-ordered permutation of ``items`` (Efraimidis-Spirakis: key = log(U)/w, largest first) --
+    a weighted sample WITHOUT replacement expressed as a full ordering, so a first-fit fill drawing from it
+    samples the opponent's hand from the belief. A zero/absent weight sinks to the end (never chosen unless
+    the fill is forced to over-reach). Uses only ``srng.uniform()``, so it never touches the pick/shuffle
+    streams the default (uniform) path depends on."""
+    eps = 1e-12
+    keyed = []
+    for it in items:
+        w = weight_of(it)
+        w = w if w > eps else eps
+        u = srng.uniform()
+        u = u if u > eps else eps
+        keyed.append((math.log(u) / w, it))
+    keyed.sort(reverse=True)                            # largest key (highest weight) first
+    return [it for _, it in keyed]
 
 
 @dataclass
@@ -152,7 +171,8 @@ class InformationSet:
 
     # --- the MCTS sampling seam --------------------------------------------------------
 
-    def determinize(self, rng, use_knowledge: bool = True) -> GameState:
+    def determinize(self, rng, use_knowledge: bool = True,
+                    belief_weights: Optional[Dict[int, np.ndarray]] = None) -> GameState:
         """Sample a concrete GameState consistent with this information set.
 
         Distributes the unknown pool into the opponent's hand, their hidden card (if their king is
@@ -160,14 +180,24 @@ class InformationSet:
         With ``use_knowledge`` (default), the sampled opponent HAND honors guess leaks: it excludes
         every ``opp_hand_lacks`` name and includes >=1 of every ``opp_hand_has`` name. Cards of a
         lacked name may still be the opponent's hidden card or muck -- the constraint is hand-only.
-        ``use_knowledge=False`` reproduces uniform sampling (A/B benchmarking + back-compat)."""
+        ``use_knowledge=False`` reproduces uniform sampling (A/B benchmarking + back-compat).
+
+        ``belief_weights`` (opt-in) samples the FREE slots from a learned belief instead of uniformly:
+        a dict ``card id -> array over (their_hand, their_hidden, their_setup, facedown)``. It only
+        reweights the draw -- the pinned / has / lacks HARD constraints below are untouched, so every
+        sampled world stays legal. ``belief_weights=None`` is the exact uniform behaviour (bit-for-bit)."""
         unknown = self.unknown_cards()
         pinned = self._pinned_opp_cards() & set(unknown)
         lacks = self.opp_hand_lacks if use_knowledge else frozenset()
         has = self.opp_hand_has if use_knowledge else frozenset()
 
         free = [int(c) for c in unknown if c not in pinned]
-        as_search_rng(rng).shuffle(free)          # in place; see rng.py (a raw Generator still works)
+        srng = as_search_rng(rng)                 # a raw Generator still works (wrapped once)
+        if belief_weights is None:
+            srng.shuffle(free)                    # in place; UNIFORM (unchanged, bit-for-bit)
+        else:                                     # order the hand fill by P(card in their_hand)
+            free = _weighted_perm(free, lambda c: float(belief_weights[c][0]) if c in belief_weights
+                                  else 1.0, srng)
 
         # Build the opponent's hand constructively (no rejection loops on tight constraints):
         hand = set(pinned)                                       # committed cards always in hand
@@ -193,6 +223,9 @@ class InformationSet:
 
         opp_hidden: Optional[int] = None
         if self.opp_has_hidden and rest:
+            if belief_weights is not None:                       # pick the hidden by P(card in their_hidden)
+                rest = _weighted_perm(rest, lambda c: float(belief_weights[c][1]) if c in belief_weights
+                                      else 1.0, srng)
             opp_hidden, rest = rest[0], rest[1:]
 
         opp_setup_discard = rest[0] if rest else None

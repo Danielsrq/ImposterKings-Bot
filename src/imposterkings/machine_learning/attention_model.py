@@ -388,3 +388,44 @@ def build_evaluator(checkpoint: str, device: str = "cpu"):
     Kept in torch (no numpy reimpl): at k20 the per-leaf volume is modest."""
     model, _ = load(checkpoint, device)
     return evaluator_from_model(model)
+
+
+def belief_sampler_from_model(model: AttentionModel):
+    """`view -> {card id: np.ndarray[4]}` over ``(their_hand, their_hidden, their_setup, facedown)`` from an
+    ALREADY-LOADED belief model (``cfg.head == 'belief'``). ONE state-only forward per call (belief is
+    ``P(zones | s)``); the search then draws opponent worlds from these marginals via
+    ``InformationSet.determinize(..., belief_weights=...)``. Duplicate unseen copies of a name are
+    exchangeable, so every unknown id of a name shares that name's unseen-slot belief (renormalised over the
+    4 hidden zones). The belief twin of :func:`evaluator_from_model`."""
+    if getattr(model.cfg, "head", "value") != "belief":
+        raise ValueError("belief_sampler_from_model needs a belief-head model (cfg.head == 'belief')")
+    from .features2 import (tokenize_state as ts2, _visible_placements, _COPIES, _NAMES,
+                            _HIDDEN_ZONES, _Z)
+    from ..cards import card_name
+    hidden_cols = [_Z[z] for z in _HIDDEN_ZONES]                    # columns of the 12-zone softmax we keep
+
+    @torch.no_grad()
+    def sampler(view):
+        batch = collate2([ts2(view)])
+        logits, _ = model.forward_belief(batch["cards"], batch["board"], batch["phase"],
+                                         batch["action"], batch["card_mask"], kings=batch["kings"])
+        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()      # [18, 12]
+        placed = _visible_placements(view)                         # seen copies fill the LOWER slots
+        name_w, slot_i = {}, 0
+        for nm in _NAMES:
+            unseen = list(range(slot_i + len(placed[nm]), slot_i + _COPIES[nm]))
+            if unseen:                                             # a name with hidden copies
+                w = probs[unseen][:, hidden_cols].mean(axis=0)     # avg the exchangeable unseen slots
+                s = float(w.sum())
+                name_w[nm] = (w / s) if s > 0 else np.full(4, 0.25)
+            slot_i += _COPIES[nm]
+        return {int(c): name_w.get(card_name(c), np.full(4, 0.25)) for c in view.unknown_cards()}
+
+    return sampler
+
+
+def build_belief_sampler(checkpoint: str, device: str = "cpu"):
+    """Load a belief checkpoint and wrap it as a determinization sampler (the belief twin of
+    :func:`build_evaluator`). For `MCTSAgent(belief=...)`."""
+    model, _ = load(checkpoint, device)
+    return belief_sampler_from_model(model)

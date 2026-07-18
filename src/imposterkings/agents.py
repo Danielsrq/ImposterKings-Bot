@@ -48,7 +48,8 @@ class MCTSAgent:
 
     def __init__(self, iterations: int = 1000, c: float = DEFAULT_C, use_knowledge: bool = True,
                  evaluate_forced: bool = False, budget: Optional[Callable] = None,
-                 evaluator: Optional[Callable] = None, rng_backend: str = "stdlib") -> None:
+                 evaluator: Optional[Callable] = None, rng_backend: str = "stdlib",
+                 belief: Optional[Callable] = None) -> None:
         self.iterations = iterations
         self.c = c
         self.use_knowledge = use_knowledge     # False = ignore guess-leaked facts (A/B benchmarking)
@@ -56,8 +57,11 @@ class MCTSAgent:
         self.budget = budget                   # None -> fixed self.iterations
         self.evaluator = evaluator             # NN value/policy head -> PUCT search (None = classic rollout)
         self.rng_backend = rng_backend         # which RNG serves the search's scalar draws (see rng.py)
+        self.belief = belief                   # view -> {card id: P(zone)}: belief-weighted determinization
         self.name = ("nn-mcts" if evaluator is not None else
                      "mcts" if budget is None else f"mcts-{getattr(budget, 'label', 'budget')}")
+        if belief is not None:
+            self.name += "+belief"
         self.last_result: Optional[SearchResult] = None
 
     def select_move(self, view: InformationSet, rng: np.random.Generator) -> Action:
@@ -66,8 +70,10 @@ class MCTSAgent:
             self.last_result = None
             return moves[0]
         iters = self.budget(view, moves) if self.budget is not None else self.iterations
+        belief_weights = self.belief(view) if self.belief is not None else None  # one torch forward per move
         config = SearchConfig(rng=rng, iterations=iters, c=self.c, use_knowledge=self.use_knowledge,
-                              evaluator=self.evaluator, rng_backend=self.rng_backend)
+                              evaluator=self.evaluator, rng_backend=self.rng_backend,
+                              belief_weights=belief_weights)
         self.last_result = search(view, config)
         # The move is still forced when there is only one; return it explicitly (best_move agrees).
         return moves[0] if len(moves) == 1 else self.last_result.best_move

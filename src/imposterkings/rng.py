@@ -34,6 +34,10 @@ class SearchRng(Protocol):
     def shuffle(self, xs: List) -> None:
         """Shuffle ``xs`` IN PLACE."""
 
+    def uniform(self) -> float:
+        """A uniform float in [0, 1). Used only by belief-weighted determinization (opt-in), so the
+        pick/shuffle streams of the default path are untouched."""
+
 
 class NumpyRng:
     """Arm A -- the status quo. Wraps a numpy Generator, preserving its exact stream."""
@@ -51,6 +55,9 @@ class NumpyRng:
         # is bit-for-bit the old behaviour (the A/B compares speed, and must not also change the sampling).
         xs[:] = [xs[i] for i in self.g.permutation(len(xs))]
 
+    def uniform(self) -> float:
+        return float(self.g.random())
+
 
 class FastRng:
     """Arm B -- stdlib `random`. Same two primitives, no ndarray boxing on the way out."""
@@ -65,6 +72,9 @@ class FastRng:
 
     def shuffle(self, xs: List) -> None:
         self.r.shuffle(xs)
+
+    def uniform(self) -> float:
+        return self.r.random()
 
 
 def as_search_rng(rng, backend: str = "numpy") -> SearchRng:

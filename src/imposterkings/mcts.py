@@ -64,6 +64,10 @@ class SearchConfig:
     # leaf is valued by the net (no rollout). evaluator(state) -> (per-seat value vector, {move: prior}).
     evaluator: Optional["Callable"] = None
     c_puct: float = 1.5
+    # Belief-weighted determinization (opt-in): per-move ``card id -> P(zone)`` weights the root sampler
+    # draws opponent worlds from instead of uniformly. Computed ONCE per move in the agent (a torch forward),
+    # handed in as plain data so the search stays torch-free. None = uniform determinization (the default).
+    belief_weights: Optional[dict] = None
 
 
 @dataclass
@@ -244,7 +248,8 @@ def search(info: InformationSet, config: SearchConfig) -> SearchResult:
 
     use_nn = config.evaluator is not None
     for _ in range(config.iterations):
-        state = info.determinize(config.rng, use_knowledge=config.use_knowledge)  # fresh root determinization
+        state = info.determinize(config.rng, use_knowledge=config.use_knowledge,
+                                 belief_weights=config.belief_weights)   # fresh root determinization
         if use_nn:                                   # AlphaZero: PUCT + net value, no rollout
             leaf, leaf_state = _select_puct(root, state, config)
             _backpropagate(leaf, _leaf_value(leaf, leaf_state, config), [])
