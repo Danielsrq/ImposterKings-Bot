@@ -44,24 +44,41 @@ def _guard_seed(seed: int, seen: set, shard: str, paired: bool = False) -> None:
     seen.add(seed)
 
 
-def _parse_data(data) -> Tuple[List[str], Dict[str, int]]:
-    """Split each ``--data`` entry into a dir and an optional per-corpus game CAP: ``dir:N``.
+def _parse_data(data) -> Tuple[List[str], Dict[str, int], Dict[str, Dict[str, str]]]:
+    """Split each ``--data`` entry into a dir plus an optional per-corpus suffix: a game CAP ``dir:N`` OR a
+    record PREDICATE ``dir:field=value``.
 
     ``--limit`` is a GLOBAL first-N cap -- useless for mix-weighting. ``dir:N`` caps ONE corpus, so a
     shallow-search or weaker-labelled corpus can be down-weighted in the pool (``gen1_v3c:1000``) without
-    copying shards. Split on the LAST colon and only treat the suffix as a cap when it is all digits, so a
-    Windows drive letter (``C:\\...``) is never mistaken for one.
+    copying shards. ``dir:field=value`` keeps only records whose ``gen.field`` matches -- e.g.
+    ``forced_assassin_hide:arm=forced`` selects the forced arm alone (the free arm is ordinary self-play).
+    Split on the LAST colon: a suffix of all digits is a cap, one containing ``=`` is a predicate, anything
+    else (a Windows drive letter ``C:\\...``) leaves the entry a plain dir.
     """
     entries = [data] if isinstance(data, str) else list(data)
-    dirs, caps = [], {}
+    dirs: List[str] = []
+    caps: Dict[str, int] = {}
+    preds: Dict[str, Dict[str, str]] = {}
     for e in entries:
         head, sep, tail = e.rpartition(":")
         if sep and tail.isdigit():
             dirs.append(head)
             caps[head] = int(tail)
+        elif sep and "=" in tail:
+            k, _, val = tail.partition("=")
+            dirs.append(head)
+            preds.setdefault(head, {})[k] = val
         else:
             dirs.append(e)
-    return dirs, caps
+    return dirs, caps, preds
+
+
+def _match(rec: dict, pred: Dict[str, str]) -> bool:
+    """True if the record passes a corpus predicate (``gen.field == value`` for every constraint)."""
+    if not pred:
+        return True
+    g = rec.get("gen") or {}
+    return all(str(g.get(k)) == v for k, v in pred.items())
 
 
 def _shards(dirs) -> List[Tuple[str, str]]:
@@ -81,7 +98,7 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
     variable-length path, byte-identical."""
     if feat == "v2":
         return _build_v2(data_dir, out_path, limit)
-    dirs, caps = _parse_data(data_dir)
+    dirs, caps, preds = _parse_data(data_dir)
     files = _shards(dirs)
     try:
         from tqdm import tqdm
@@ -102,6 +119,8 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
         for rec in read_jsonl(f):
             if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
                 break                                  # cap reached mid-shard
+            if not _match(rec, preds.get(src, {})):
+                continue                               # corpus predicate (e.g. arm=forced): skip non-matching
             g = rec["deal_seed"]
             _guard_seed(g, seen, f, paired=bool((rec.get("gen") or {}).get("paired_deals")))
             rewards = rec["rewards"]
@@ -163,7 +182,7 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
             "action_dim": ACTION_DIM, "target": "q", "n_rows": int(arrs["y"].shape[0]),
             "n_games": n_games, "n_skipped_desynced": n_skipped, "n_decisions": dec_id,
             "total_card_tokens": int(cards.shape[0]), "source": dirs,
-            "caps": caps, "games_per_source": dict(per_dir)}      # self-documenting mix
+            "caps": caps, "preds": preds, "games_per_source": dict(per_dir)}      # self-documenting mix
     with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1)
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
@@ -172,7 +191,7 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
 def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
     """The v2 (fixed-18) build: same replay/skip-on-desync logic, fixed-shape output arrays."""
     from .features2 import tokenize as tokenize2
-    dirs, caps = _parse_data(data_dir)
+    dirs, caps, preds = _parse_data(data_dir)
     files = _shards(dirs)
     try:
         from tqdm import tqdm
@@ -191,6 +210,8 @@ def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
         for rec in read_jsonl(f):
             if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
                 break                                  # cap reached mid-shard
+            if not _match(rec, preds.get(src, {})):
+                continue                               # corpus predicate (e.g. arm=forced): skip non-matching
             g = rec["deal_seed"]
             _guard_seed(g, seen, f, paired=bool((rec.get("gen") or {}).get("paired_deals")))
             rewards = rec["rewards"]
@@ -247,7 +268,92 @@ def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
             "target": "q", "n_rows": int(arrs["y"].shape[0]), "n_games": n_games,
             "n_skipped_desynced": n_skipped, "n_decisions": dec_id,
             "total_card_tokens": int(arrs["y"].shape[0]) * 18, "source": dirs,
-            "caps": caps, "games_per_source": dict(per_dir)}      # self-documenting mix
+            "caps": caps, "preds": preds, "games_per_source": dict(per_dir)}      # self-documenting mix
+    with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=1)
+    return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
+
+
+def build_belief(data_dir, out_path: str, limit: Optional[int] = None) -> Dict:
+    """Belief-net dataset (Study 7): ONE state-only row per searched decision, labelled with the TRUE zone
+    of every card (``features2.true_zones``, read off the omniscient replay). No candidate loop, no q/w/z --
+    belief is ``P(zones | s)``, not f(s,a). Always v2 (needs the fixed 18 card-instance tokens). Reuses the
+    same replay / desync-skip / seed-guard / per-corpus cap+predicate as the q builds."""
+    from .features2 import tokenize_state, true_zones
+    dirs, caps, preds = _parse_data(data_dir)
+    files = _shards(dirs)
+    try:
+        from tqdm import tqdm
+        files = tqdm(files, desc="shards", unit="shard")
+    except Exception:
+        pass
+
+    cards, kings, board, phase, action = [], [], [], [], []
+    zlab, smask, gid, did = [], [], [], []
+    n_games = n_skipped = dec_id = 0
+    seen: set = set()
+    per_dir: Dict[str, int] = {}
+    for src, f in files:
+        if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
+            continue
+        for rec in read_jsonl(f):
+            if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
+                break
+            if not _match(rec, preds.get(src, {})):
+                continue                               # corpus predicate (e.g. arm=forced): skip non-matching
+            g = rec["deal_seed"]
+            _guard_seed(g, seen, f, paired=bool((rec.get("gen") or {}).get("paired_deals")))
+            st = GameState.deal(np.random.default_rng(g), rec.get("starting_player"))
+            mark = (len(cards), dec_id)
+            desynced = False
+            for d in rec["decisions"]:
+                a = dict_to_action(d["chosen"])
+                if a not in st.legal_moves():
+                    desynced = True
+                    break
+                if d.get("candidates"):                # one belief row per genuine (searched) decision
+                    view = st.information_set(d["seat"])
+                    t = tokenize_state(view)
+                    zl, sm = true_zones(view, st)
+                    cards.append(t.cards); kings.append(t.kings)
+                    board.append(t.board); phase.append(t.phase); action.append(t.action)
+                    zlab.append(zl); smask.append(sm)
+                    gid.append(g); did.append(dec_id)
+                    dec_id += 1
+                st = st.apply(a)
+            if desynced:
+                r0, dec_id = mark
+                for lst in (cards, kings, board, phase, action, zlab, smask, gid, did):
+                    del lst[r0:]
+                n_skipped += 1
+                continue
+            n_games += 1
+            per_dir[src] = per_dir.get(src, 0) + 1
+            if limit and n_games >= limit:
+                break
+        if limit and n_games >= limit:
+            break
+    if n_skipped:
+        print(f"  WARNING: skipped {n_skipped} desynced game(s) (corpus predates a rules change)")
+
+    from .features2 import ACTION_DIM as AD2, BOARD_DIM as BD2, CARD_DIM as CD2, PHASE_DIM as PD2
+    n_rows = len(gid)
+    arrs = dict(
+        cards=(np.stack(cards) if cards else np.zeros((0, 18, CD2), np.float32)).astype(np.float32),
+        kings=(np.stack(kings) if kings else np.zeros((0, 2, 4), np.float32)).astype(np.float32),
+        board=np.asarray(board, np.float32).reshape(-1, BD2),
+        phase=np.asarray(phase, np.float32).reshape(-1, PD2),
+        action=np.asarray(action, np.float32).reshape(-1, AD2),
+        zone_label=(np.stack(zlab) if zlab else np.zeros((0, 18), np.int64)).astype(np.int64),
+        seen_mask=(np.stack(smask) if smask else np.zeros((0, 18), np.bool_)).astype(np.bool_),
+        game_id=np.asarray(gid, np.int64), decision_id=np.asarray(did, np.int64),
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    np.savez_compressed(out_path, **arrs)
+    meta = {"feat": "v2", "card_dim": CD2, "board_dim": BD2, "phase_dim": PD2, "action_dim": AD2,
+            "target": "belief", "n_zones": 12, "n_rows": n_rows, "n_games": n_games,
+            "n_skipped_desynced": n_skipped, "n_decisions": dec_id, "total_card_tokens": n_rows * 18,
+            "source": dirs, "caps": caps, "preds": preds, "games_per_source": dict(per_dir)}
     with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1)
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
@@ -259,16 +365,18 @@ class TokenRows:
 
     def __init__(self, arrs: Dict[str, np.ndarray]):
         self.feat = "v2" if "kings" in arrs else "v1"
+        self.target = "belief" if "zone_label" in arrs else "q"     # belief datasets carry zone labels
         self.cards = arrs["cards"]                      # v1: [T, 44] ragged; v2: [n, 18, 46]
         self.kings = arrs.get("kings")                  # v2 only: [n, 2, 4]
         self.card_offsets = arrs.get("card_offsets")    # v1 only: [n_rows+1]
         self.board, self.phase, self.action = arrs["board"], arrs["phase"], arrs["action"]
-        self.y, self.w, self.z = arrs["y"], arrs["w"], arrs["z"]
-        self.game_id, self.decision_id, self.is_chosen = (
-            arrs["game_id"], arrs["decision_id"], arrs["is_chosen"])
+        self.y, self.w, self.z = arrs.get("y"), arrs.get("w"), arrs.get("z")     # q datasets only
+        self.zone_label, self.seen_mask = arrs.get("zone_label"), arrs.get("seen_mask")  # belief only
+        self.game_id, self.decision_id = arrs["game_id"], arrs["decision_id"]
+        self.is_chosen = arrs.get("is_chosen")
 
     def __len__(self) -> int:
-        return int(self.y.shape[0])
+        return int(self.game_id.shape[0])
 
     def tokens(self, i: int) -> Tuple[np.ndarray, ...]:
         """Row i's token set. v1: (cards[Nᵢ,44], board, phase, action); v2: (cards[18,46], kings[2,4],
@@ -295,12 +403,20 @@ def main(argv=None) -> None:
     p.add_argument("--limit", type=int, default=None, help="only process the first N games (smoke)")
     p.add_argument("--feat", default="v1", choices=["v1", "v2"],
                    help="featurization version (v2 = fixed-18 instance tokens + zone posteriors)")
+    p.add_argument("--target", default="q", choices=["q", "belief"],
+                   help="q = action-in value labels (mean_q); belief = per-card true-zone labels, one "
+                        "state-only row per decision (Study 7, always v2)")
     args = p.parse_args(argv)
 
     src = args.data if len(args.data) > 1 else args.data[0]
-    print(f"building token tensors ({args.feat}) from {src} -> {args.out}"
-          + (f" (limit {args.limit})" if args.limit else ""))
-    s = build(src, args.out, args.limit, feat=args.feat)
+    if args.target == "belief":
+        print(f"building BELIEF tensors (v2) from {src} -> {args.out}"
+              + (f" (limit {args.limit})" if args.limit else ""))
+        s = build_belief(src, args.out, args.limit)
+    else:
+        print(f"building token tensors ({args.feat}) from {src} -> {args.out}"
+              + (f" (limit {args.limit})" if args.limit else ""))
+        s = build(src, args.out, args.limit, feat=args.feat)
     print(f"  {s['n_rows']} rows ({s['n_decisions']} decisions, {s['n_games']} games), "
           f"{s['total_card_tokens']} card tokens  ->  {args.out}(+.meta.json)")
 

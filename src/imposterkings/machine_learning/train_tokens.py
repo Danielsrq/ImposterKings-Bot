@@ -41,7 +41,9 @@ class TokenTorchDataset(Dataset):
 
     def __getitem__(self, k):
         i = int(self.idx[k])
-        return (*self.rows.tokens(i), float(self.rows.y[i]), float(self.rows.w[i]))
+        y = float(self.rows.y[i]) if self.rows.y is not None else 0.0     # belief datasets carry no q/w;
+        w = float(self.rows.w[i]) if self.rows.w is not None else 0.0     # tokens-only consumers still work
+        return (*self.rows.tokens(i), y, w)
 
 
 def collate_fn(batch):

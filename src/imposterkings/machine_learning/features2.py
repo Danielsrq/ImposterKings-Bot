@@ -287,3 +287,69 @@ def card_token_fields() -> List[str]:
     mech = [f"mech:{s.split(':', 1)[1]}" for s in _v1()[14:22]]      # reuse the v1 category names
     return ([f"id:{n}" for n in _NAMES] + ["power", "base"] + mech
             + [f"st:{s}" for s in STATE_FIELDS] + [f"zone:{z}" for z in ZONES])
+
+
+# --- belief-net supervision (Study 7) -----------------------------------------------------------
+# The zone posterior above is the belief-net SOCKET (a hand-crafted prior). ``true_zones`` reads the
+# GROUND-TRUTH zone of every card off the omniscient state -- the label a belief net learns to predict.
+# No re-collection: token_dataset already replays the full GameState, so the truth is in hand for free.
+
+def _omniscient_zones(state, observer: int) -> Dict[int, str]:
+    """Map every physical card id -> its true zone name, in ``observer``'s frame (the ZONES vocabulary)."""
+    opp = 1 - observer
+    z: Dict[int, str] = {}
+    for c in state.hands[observer]:
+        z[c] = "my_hand"
+    for c in state.hands[opp]:
+        z[c] = "their_hand"
+    if state.hidden[observer] is not None:
+        z[state.hidden[observer]] = "my_hidden"
+    if state.hidden[opp] is not None:
+        z[state.hidden[opp]] = "their_hidden"
+    if state.setup_discard[observer] is not None:
+        z[state.setup_discard[observer]] = "my_setup"
+    if state.setup_discard[opp] is not None:
+        z[state.setup_discard[opp]] = "their_setup"
+    for c in state.antechambers[observer]:
+        z[c] = "my_ante"
+    for c in state.antechambers[opp]:
+        z[c] = "their_ante"
+    for sc in state.stack:
+        z[sc.card] = "stack"
+    for c in state.discard:
+        z[c] = "discard"
+    if state.leftover_faceup is not None and state.leftover_faceup >= 0:
+        z[state.leftover_faceup] = "faceup"
+    if state.leftover_facedown is not None and state.leftover_facedown >= 0:
+        z[state.leftover_facedown] = "facedown"
+    return z
+
+
+def true_zones(view: InformationSet, state) -> Tuple[np.ndarray, np.ndarray]:
+    """Ground-truth ``(zone_label[18] int64, seen_mask[18] bool)``, aligned to ``tokenize_state``'s slots.
+
+    Slot k here is the SAME physical copy ``tokenize_state`` puts at slot k: seen copies fill the lower
+    slots in ``_visible_placements``'s canonical order, unseen copies the rest. Duplicate unseen copies are
+    exchangeable, so their true zones are assigned to slots in canonical (zone-index) order -- a documented
+    modelling choice that makes the target well-defined. ``seen_mask`` marks the ~9 cards the observer can
+    already see (trivial supervision that anchors the sanity check); the unseen slots are the belief target,
+    always in one of ``_HIDDEN_ZONES``.
+    """
+    obs = view.observer
+    zmap = _omniscient_zones(state, obs)
+    placed = _visible_placements(view)
+    zone_label = np.zeros(N_CARDS, np.int64)
+    seen_mask = np.zeros(N_CARDS, np.bool_)
+    slot_i = 0
+    for nm in _NAMES:
+        vis = placed[nm]
+        seen_ids = {p.engine_id for p in vis}
+        unseen_zi = sorted(_Z[zmap[c]] for c in card_ids_for_name(nm) if c not in seen_ids)
+        for k in range(_COPIES[nm]):
+            if k < len(vis):
+                zone_label[slot_i] = _Z[vis[k].zone]
+                seen_mask[slot_i] = True
+            else:
+                zone_label[slot_i] = unseen_zi[k - len(vis)]
+            slot_i += 1
+    return zone_label, seen_mask

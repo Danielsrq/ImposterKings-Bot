@@ -83,6 +83,173 @@ def _square(v: np.ndarray) -> np.ndarray:
     return v[: n * n].reshape(n, n)
 
 
+def _plot_gelu(acts, path, plt):
+    """Karpathy's [batch, n_hidden] GELU picture, one row per layer: silence raster + histogram +
+    per-neuron silence (the only real 'dead' = never fires). Shared by the value and belief audits."""
+    keys = sorted(a for a in acts if a.endswith("_gelu"))
+    fig, axes = plt.subplots(len(keys), 3, figsize=(17, 4.3 * len(keys)), squeeze=False)
+    for r, key in enumerate(keys):
+        A = acts[key]
+        ax = axes[r]
+        ax[0].imshow(np.abs(A[:600]) < 0.01, cmap="gray", interpolation="nearest", aspect="auto")
+        ax[0].set_title(f"{key}: |a| < 0.01   (white = silent on that example)")
+        ax[0].set_xlabel("neuron"); ax[0].set_ylabel("example")
+        ax[1].hist(A.reshape(-1), bins=100, color="#5ec962")
+        ax[1].set_yscale("log")
+        ax[1].set_title(f"{key} activations (GELU has no +-1 saturation; its quiet zone is 0)")
+        silent = (np.abs(A) < 0.01).mean(axis=0)
+        ax[2].hist(silent * 100, bins=40, color="#3b528b")
+        ax[2].axvline(90, ls="--", color="crimson", lw=1.2)
+        ax[2].text(90, ax[2].get_ylim()[1] * 0.9, " 'dead' >90%", color="crimson", fontsize=8)
+        ax[2].set_xlim(0, 100)
+        ax[2].set_xlabel("% of the time this neuron is silent"); ax[2].set_ylabel("neurons")
+        n_dead = int((np.abs(A).max(axis=0) < 0.01).sum())
+        ax[2].set_title(f"per-neuron silence   median {np.median(silent) * 100:.0f}%  "
+                        f"max {silent.max() * 100:.0f}%\nTRULY dead (never fires): {n_dead}/{A.shape[1]}")
+    fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
+
+
+def _forward_all_belief(model, rows, idx, batch=512):
+    """Belief twin of _forward_all: run forward_belief, collect per-card zone logits, the FFN GELU
+    activations, and the attention entropy per head."""
+    from .train_belief import BeliefDataset, collate_belief
+    acts: Dict[str, List[np.ndarray]] = {}
+
+    def grab(name):
+        def hook(_m, _i, out):
+            t = out if isinstance(out, torch.Tensor) else out[0]
+            acts.setdefault(name, []).append(t.detach().float().cpu().numpy())
+        return hook
+
+    hooks = []
+    for li, layer in enumerate(model.layers):
+        hooks.append(layer.ffn[0].register_forward_hook(grab(f"L{li}_pre")))
+        hooks.append(layer.ffn[1].register_forward_hook(grab(f"L{li}_gelu")))
+
+    dl = DataLoader(BeliefDataset(rows, idx), batch_size=batch, shuffle=False, collate_fn=collate_belief)
+    logits_all, ent, mx = [], [], []
+    model.eval()
+    with torch.no_grad():
+        for packed, _, _ in dl:
+            lg, A = model.forward_belief(packed["cards"], packed["board"], packed["phase"],
+                                         packed["action"], packed["card_mask"], kings=packed.get("kings"))
+            logits_all.append(lg.cpu().numpy())
+            a = A.cpu().numpy()
+            s = a.shape[-1]
+            e = -(a * np.log(a + 1e-12)).sum(-1)
+            ent.append((e / math.log(s)).mean(axis=(0, 2)))
+            mx.append(a.max(-1).mean(axis=(0, 2)))
+    for h in hooks:
+        h.remove()
+    logits = np.concatenate(logits_all) if logits_all else np.zeros((0, 18, 12), np.float32)
+    flat = {k: np.concatenate([v.reshape(-1, v.shape[-1]) for v in vs]) for k, vs in acts.items()}
+    return logits, flat, np.mean(ent, axis=0), np.mean(mx, axis=0)
+
+
+def _belief_report(model, rows, args, plt) -> None:
+    """Belief-net audit (Study 7): CE vs baselines, calibration, GELU deadness, attention entropy, and the
+    belief HUD -- a per-card [18 x 12] zone heatmap for a few positions."""
+    from .features2 import INSTANCE_LABELS, ZONES, _NZONE, _ZONE_OFF
+    from .train_belief import _softmax_np
+
+    os.makedirs(args.out, exist_ok=True)
+    tr, va = game_split(rows.game_id, 0.15, 0)
+    vai = np.where(va)[0][: args.rows]
+    logits, acts, ent, mx = _forward_all_belief(model, rows, vai)
+    zl = rows.zone_label[vai].astype(np.int64)
+    seen = rows.seen_mask[vai].astype(bool)
+    unseen = ~seen
+    socket = rows.cards[vai][:, :, _ZONE_OFF:_ZONE_OFF + _NZONE].astype(np.float64)
+
+    probs = _softmax_np(logits.astype(np.float64))
+    p_true = np.take_along_axis(probs, zl[..., None], axis=-1)[..., 0]
+    ce = -np.log(np.clip(p_true, 1e-9, 1.0))
+    top1 = probs.argmax(-1) == zl
+    onehot = np.eye(_NZONE)[zl]
+    brier = ((probs - onehot) ** 2).sum(-1)
+    pred_ent = -(probs * np.log(probs + 1e-12)).sum(-1) / math.log(_NZONE)      # normalised [0,1]
+    soc_ent = -(socket * np.log(socket + 1e-12)).sum(-1) / math.log(_NZONE)
+
+    hc = -np.log(np.clip(np.take_along_axis(socket, zl[..., None], axis=-1)[..., 0], 1e-9, 1.0))
+    support = socket > 1e-12
+    k = support.sum(-1).clip(min=1)
+    uni_true = np.take_along_axis(support, zl[..., None], axis=-1)[..., 0]
+    uni = -np.log(np.where(uni_true, 1.0 / k, 1e-9))
+
+    def mu(a, m):
+        m = m & np.isfinite(a)
+        return float(a[m].mean()) if m.any() else float("nan")
+
+    print("=" * 76)
+    print("BELIEF NET audit   (head=belief, Z=12 zones; all 'unseen' numbers over the ~9 hidden cards)")
+    print("=" * 76)
+    print(f"  val rows {len(vai):,}   seen slots {int(seen.sum()):,}   unseen slots {int(unseen.sum()):,}")
+    print(f"  unseen-CE  {mu(ce, unseen):.4f}   vs hand-crafted {mu(hc, unseen):.4f}  "
+          f"({mu(hc, unseen) - mu(ce, unseen):+.4f} = tell-reading gain)   |  uniform {mu(uni, unseen):.4f}")
+    print(f"  seen-CE    {mu(ce, seen):.4f}   (sanity, want ~0 -- the net must pass known locations through)")
+    print(f"  unseen Brier {mu(brier, unseen):.4f}   top-1 zone {mu(top1.astype(float), unseen) * 100:.1f}%")
+    print()
+    print("=" * 76)
+    print("GELU in the FFN   (a white COLUMN in ffn_gelu.png = a dead neuron)")
+    print("=" * 76)
+    for key in sorted(a for a in acts if a.endswith("_gelu")):
+        A, pre = acts[key], acts[key.replace("_gelu", "_pre")]
+        dead = (np.abs(A) < 0.01).mean(axis=0)
+        print(f"  {key:<8} out~0: {float((np.abs(A) < 0.01).mean()) * 100:4.1f}% | pre-GELU mean "
+              f"{pre.mean():+.3f} std {pre.std():.3f} | neurons dead >90%: {int((dead > 0.9).sum())}/{A.shape[1]}")
+    print()
+    print("=" * 76)
+    print("SOFTMAX in attention   (entropy as a FRACTION of uniform: 1.0 = flat, 0.0 = one-hot)")
+    print("=" * 76)
+    for h in range(len(ent)):
+        tag = "COLLAPSED" if ent[h] < 0.25 else ("peaky/selective" if ent[h] < 0.6 else "diffuse")
+        print(f"  head {h}: entropy {ent[h] * 100:5.1f}% of uniform | mean max-weight {mx[h]:.3f}  -> {tag}")
+
+    # (1) GELU deadness raster (shared with the value audit)
+    _plot_gelu(acts, os.path.join(args.out, "ffn_gelu.png"), plt)
+
+    # (2) the belief HUD: per-card [18 x 12] zone heatmap for the 4 positions with the most hidden cards
+    order = np.argsort(unseen.sum(1))[::-1][:4]
+    fig, axes = plt.subplots(1, 4, figsize=(20, 6), squeeze=False)
+    for j, i in enumerate(order):
+        ax = axes[0][j]
+        ax.imshow(probs[i], cmap="magma", vmin=0, vmax=1, aspect="auto")
+        for slot in range(18):                                  # mark the true zone; hollow = seen (given)
+            ax.plot(zl[i, slot], slot, marker="o", ms=6, mfc="none" if seen[i, slot] else "cyan",
+                    mec="cyan", mew=1.4)
+        ax.set_xticks(range(_NZONE)); ax.set_xticklabels(ZONES, rotation=90, fontsize=6)
+        ax.set_yticks(range(18)); ax.set_yticklabels(INSTANCE_LABELS, fontsize=6)
+        ax.set_title(f"pos {int(i)}  ({int(unseen[i].sum())} hidden)", fontsize=9)
+    fig.suptitle("belief HUD: predicted P(zone) per card  (cyan ring = true zone; hollow = seen)", fontsize=11)
+    fig.tight_layout(); fig.savefig(os.path.join(args.out, "belief_heatmap.png"), dpi=110); plt.close(fig)
+
+    # (3) calibration (reliability of the argmax confidence, unseen slots) + belief-entropy vs hand-crafted
+    conf = probs.max(-1)[unseen]
+    correct = top1[unseen].astype(float)
+    bins = np.linspace(0, 1, 11)
+    which = np.clip(np.digitize(conf, bins) - 1, 0, 9)
+    bx, by = [], []
+    for b in range(10):
+        m = which == b
+        if m.any():
+            bx.append(conf[m].mean()); by.append(correct[m].mean())
+    fig, ax = plt.subplots(1, 2, figsize=(13, 5))
+    ax[0].plot([0, 1], [0, 1], ls="--", color="grey", lw=1)
+    ax[0].plot(bx, by, "o-", color="#b5179e", lw=1.8)
+    ax[0].set_xlim(0, 1); ax[0].set_ylim(0, 1)
+    ax[0].set_xlabel("predicted confidence (max zone prob)"); ax[0].set_ylabel("empirical accuracy")
+    ax[0].set_title(f"calibration (unseen argmax)  |  Brier {mu(brier, unseen):.3f}  "
+                    f"top-1 {mu(correct, np.ones_like(correct, bool)) * 100:.1f}%")
+    ax[1].hist(pred_ent[unseen], bins=40, alpha=0.6, color="#21918c", density=True, label="learned belief")
+    ax[1].hist(soc_ent[unseen], bins=40, alpha=0.5, color="#fb8500", density=True, label="hand-crafted socket")
+    ax[1].set_xlabel("predicted zone entropy (fraction of uniform)"); ax[1].set_ylabel("density")
+    ax[1].set_title("belief sharpness: learned vs hand-crafted (lower = more decisive)")
+    ax[1].legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(os.path.join(args.out, "calibration.png"), dpi=110); plt.close(fig)
+
+    print(f"\nwrote 3 figures (ffn_gelu, belief_heatmap, calibration) -> {args.out}/")
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Activation/saturation audit of the attention q-net.")
     p.add_argument("--ckpt", default=os.path.join("models", "gen1_v3c", "attn_d64_L2.pt"))
@@ -99,13 +266,17 @@ def main(argv=None) -> None:
     torch.set_num_threads(2)
 
     rows = load_rows(args.npz)
+    model, _ = load_attn(args.ckpt)
+    if model.cfg.head == "belief":                                 # Study 7: a different head + no MSE/tanh
+        _belief_report(model, rows, args, plt)
+        return
+
     tr, va = game_split(rows.game_id, 0.1, 0)
     vai = np.where(va)[0][: args.rows]
     y = rows.y[vai].astype(np.float64)
     y_all = rows.y.astype(np.float64)
     base = float(np.mean((y - rows.y[np.where(tr)[0]].mean()) ** 2))
 
-    model, _ = load_attn(args.ckpt)
     cfg = model.cfg
     torch.manual_seed(0)
     fresh = AttentionModel(AttnConfig(**{**vars(cfg)}))            # same arch, UNTRAINED

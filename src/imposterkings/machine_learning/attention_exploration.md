@@ -626,6 +626,89 @@ shrinking gap — slow, and it saturates) or a search that reasons over beliefs 
 
 ---
 
+## Study 7 — the belief net: a *learned* posterior over the opponent's cards (2026-07-18)
+
+Study 6 ended pointing at belief-weighted determinization: the search re-determinizes the opponent's hand
+*uniformly*, which is exactly what destroys the value of informational moves. To sample determinizations from
+the posterior instead, we need a posterior. The v2 featurizer already ships a **hand-crafted** one — the
+12-dim zone posterior on every card token ("the belief-net socket": a delta for seen cards, a hypergeometric
+spread over the 4 hidden zones for unseen ones). It is *determinization-invariant* — pure card-counting, and
+it **never reads action history**. This study replaces it with a **learned** belief net and asks the one
+question that matters: *can a net read the opponent's hide/discard/play choices to beat pure counting?*
+(design record: `machine_learning/BNN_proposal.md`.)
+
+**The net.** The same attention backbone as the value net, with the value head (`CLS → Linear(d,1) → tanh`,
+MSE) swapped for a per-card **belief head** (each of the 18 card tokens → `Linear(d,12) → softmax` over the
+`ZONES`) and MSE swapped for **cross-entropy** against the card's TRUE zone. State-only (`tokenize_state`, the
+action token is a constant zero — belief is `P(zones|s)`, not `f(s,a)`). It is **fed the hand-crafted socket
+and learns a residual**, so the identity map *is* the hand-crafted baseline: any drop in *unseen*-card CE
+below it is tell-reading beyond counting. Loss is over **all 18 cards**; we report **seen-CE** (the sanity
+check — the net must pass known locations through) and **unseen-CE** (the objective) separately.
+
+**Labels are free.** `features2.true_zones` reads every card's true zone off the omniscient replay
+`token_dataset` already does — no re-collection. One state-only row per searched decision.
+
+**Corpus — 5,000 games / 94,140 decision-rows, 0 desync.** `mixed_v3c_vs_mcts500` (1,000) +
+`forced_assassin_hide` **forced arm only** (1,000) + `selfplay_gen25:3000` (3,000). The forced arm is the
+*only* source of `their_hidden`-Assassin coverage (free play never hides it); isolating it needed a new
+`dir:field=value` record predicate in `token_dataset` (`forced_assassin_hide:arm=forced`) — the free arm is
+ordinary self-play and was dropped. All arms: v2, cosine + 5% warmup, 40 epochs, batch 1024, lr 1e-3, dropout
+0.1, seed 0, **15% val by game_id**, RTX 3060 Ti.
+
+| net | config | params | **unseen-CE** | hand-crafted | **gain** | uniform | seen-CE | Brier | top-1 zone | time |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **belief-d64** | d64/h4/ffn256 | 109,517 | **0.8625** | 0.9206 | **+0.058** | 1.1847 | 0.0000 | 0.469 | **66.9%** | 109 s |
+| belief-d96 | d96/h6/ffn384 | 237,997 | 0.8688 | 0.9206 | +0.052 | 1.1847 | 0.0000 | 0.472 | 66.6% | 132 s |
+
+### Findings
+
+1. **The net beats the hand-crafted posterior — it reads tells.** unseen-CE **0.8625 vs 0.9206** (+0.058 nats)
+   on held-out games. Since the hand-crafted socket *is* the net's own input and does pure card-counting, the
+   whole gap is information the counting model throws away: the opponent's *choices* (what it hid, discarded,
+   declined, played). Both crush the uniform-over-feasible-zones baseline (1.185). This is the concrete
+   evidence Study 6 pointed at — the leakage the uniform determinization erases is real and learnable.
+2. **The sanity check is exact: seen-CE = 0.0000.** The 12-way head (over *all* zones, not just the 4 hidden
+   ones) was chosen precisely so a known card can be asserted to sit at belief ≈ 1.0 on its true zone. It
+   does — the net passes observed locations through perfectly, so the unseen-CE is measuring only the genuine
+   uncertainty.
+3. **Near-perfect calibration.** The reliability curve sits on the diagonal across the whole confidence range
+   (Brier 0.469, top-1 zone 66.9%). The learned belief replaces the hand-crafted socket's *quantized* entropy
+   spikes (discrete hypergeometric slot-counts) with a smooth per-position distribution — it is adapting to
+   the specific position, not snapping to a card-count bucket.
+4. **Capacity does NOT help here — d64 ≥ d96.** The smaller net wins on val unseen-CE (0.8625 vs 0.8688)
+   despite 2.2× fewer params. Unlike the value task (Study 5, where d96 was the first proven strength gain),
+   belief is a *lower-capacity* problem: card conservation + a few tells, well within d64/h4. d96's attention
+   heads even start to specialise (one at 55% entropy) without paying for it.
+5. **Healthy internals, and an Assassin-specific head.** 0/256 (0/384) truly-dead GELU units; update-to-data
+   −3.17 (−3.08), every tensor inside [−4,−2] at the plateau. NB the state-only action token has an all-zero
+   input, so `embed.action` receives an exactly-zero gradient and is (correctly) excluded from the UD panel.
+   `head_analysis` shows the belief net *did* specialise: its sharpest L0 head (53% of uniform) puts **18% of
+   its attention on the Assassin token** and another ~18% on the two Elders — a card-conservation reader
+   built around exactly the card the forced-hide arm supplies, while other heads track the two kings and the
+   board. So the belief net carved the problem up by card identity, not by the value net's tempo/threat axes.
+6. **Where the signal lives: the forced arm.** Per-corpus val unseen-CE — `forced_assassin_hide` **0.728**,
+   far below `mixed` 0.919 and `gen25` 0.903. Forced-hide games deterministically park the Assassin in
+   `their_hidden`, a strong, learnable pattern (and the corpus is only 500 distinct paired deals, so more
+   predictable). This is exactly the coverage the arm filter was added to buy.
+
+**Caveat (unchanged from the proposal):** the net learns to read *this bot's* tells from self-play. Against a
+different opponent the leakage model is off — the imperfect-info analog of opponent-overfitting. A ReBeL-style
+loop that interleaves belief and policy updates (rather than freezing one) is the principled fix, and a later
+iteration.
+
+**Verdict:** a learned belief net cleanly beats the hand-crafted card-counting posterior it was built to
+replace, is exactly calibrated, and needs no extra capacity. It is the missing piece from Study 6's verdict.
+**Deferred (not this study):** the Design-A cascade — overwrite the value net's socket with this learned
+belief and retrain (the 12-way head makes it a literal drop-in) — and belief-weighted determinization for
+SO-ISMCTS, the direct test of whether a posterior-sampled search finally *chooses* to hide the Assassin.
+
+Artifacts: `models/belief_5k/belief_d{64,96}_L2.pt`, `reports/training_belief_d{64,96}.png`,
+`reports/activations_belief_d{64,96}/` (GELU deadness, the **belief HUD** — per-card `[18×12]` zone heatmap —
+and calibration). Code: `train_belief.py`, `token_dataset --target belief`, `features2.true_zones`,
+`AttnConfig.head="belief"` + `AttentionModel.forward_belief`.
+
+---
+
 ## Metric glossary
 
 - **winrate** — fraction of games the challenger wins vs the stated opponent (mirrored; 200 games unless

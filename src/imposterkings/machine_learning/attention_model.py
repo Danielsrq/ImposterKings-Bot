@@ -34,12 +34,17 @@ class AttnConfig:
     dropout: float = 0.0
     bounded: bool = True          # Tanh on the value head (q in [-1, 1], matching mlp.py)
     feat: str = "v1"              # featurization version: "v1" (variable tokens) | "v2" (fixed-18 + kings)
+    head: str = "value"           # "value" (CLS -> q) | "belief" (per-card zone softmax, Study 7)
 
     def __post_init__(self):
         if self.d_model % self.n_heads != 0:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         if self.feat not in ("v1", "v2"):
             raise ValueError(f"unknown feat version {self.feat!r}")
+        if self.head not in ("value", "belief"):
+            raise ValueError(f"unknown head {self.head!r}")
+        if self.head == "belief" and self.feat != "v2":
+            raise ValueError("the belief head needs feat='v2' (the fixed 18 card-instance tokens)")
 
 
 class TokenEmbed(nn.Module):
@@ -130,15 +135,14 @@ class AttentionModel(nn.Module):
         self.embed = TokenEmbed(cfg)
         self.cls = nn.Parameter(torch.zeros(cfg.d_model))          # learned readout token (no projection)
         self.layers = nn.ModuleList([EncoderLayer(cfg) for _ in range(cfg.n_layers)])
-        self.head = nn.Linear(cfg.d_model, 1)
+        self.head = nn.Linear(cfg.d_model, 1)                       # value head (always built)
+        if cfg.head == "belief":
+            from . import features2 as F2
+            self.belief_head = nn.Linear(cfg.d_model, F2._NZONE)    # per-card zone logits -> Z=12 (Study 7)
 
-    def forward_layers(self, cards, board, phase, action, card_mask=None, need_values=False, kings=None):
-        """Same encode as :meth:`forward` but returns EVERY layer's attention.
-        Returns (q [B], attns) where attns is a list of per-layer [B, heads, S, S] (len == n_layers), or
-        (q, attns, values) with per-layer value vectors [B, heads, S, dh] when ``need_values`` (for the
-        value-weighted attribution in `explain`). ``forward`` is exactly ``q, attns[-1]``.
-        ``kings`` [B,2,4] is required at feat="v2" (sequence [CLS, 18 cards, 2 kings, board, phase,
-        action], S=24, no mask)."""
+    def _encode(self, cards, board, phase, action, card_mask=None, need_values=False, kings=None):
+        """Shared backbone: native tokens -> CLS-prepended set -> L pre-norm layers. Returns
+        ``(seq [B,S,d], attns, values)`` -- the value/belief heads read off ``seq``."""
         b, n = cards.shape[0], cards.shape[1]
         hc, hb, hp, ha = self.embed(cards, board, phase, action)
         cls = self.cls.view(1, 1, -1).expand(b, 1, -1)
@@ -165,12 +169,30 @@ class AttentionModel(nn.Module):
             else:
                 seq, attn = layer(seq, add_mask)
             attns.append(attn)                                      # each [B, heads, S, S]
+        return seq, attns, values
+
+    def forward_layers(self, cards, board, phase, action, card_mask=None, need_values=False, kings=None):
+        """Same encode as :meth:`forward` but returns EVERY layer's attention.
+        Returns (q [B], attns) where attns is a list of per-layer [B, heads, S, S] (len == n_layers), or
+        (q, attns, values) with per-layer value vectors [B, heads, S, dh] when ``need_values`` (for the
+        value-weighted attribution in `explain`). ``forward`` is exactly ``q, attns[-1]``.
+        ``kings`` [B,2,4] is required at feat="v2" (sequence [CLS, 18 cards, 2 kings, board, phase,
+        action], S=24, no mask)."""
+        seq, attns, values = self._encode(cards, board, phase, action, card_mask, need_values, kings)
         q = self.head(seq[:, 0, :]).squeeze(-1)                     # CLS output -> scalar
         if self.cfg.bounded:
             q = torch.tanh(q)
         if need_values:
             return q, attns, values
         return q, attns
+
+    def forward_belief(self, cards, board, phase, action, card_mask=None, kings=None):
+        """State-only belief head: per-card zone logits ``[B, N, Z]`` over ZONES + the last layer's
+        attention. The N card tokens are sequence positions ``1 : 1+N`` (after CLS). Feed the state-only
+        v2 tokens (``features2.tokenize_state``, zero action) -- belief is ``P(zones | s)``, not f(s,a)."""
+        seq, attns, _ = self._encode(cards, board, phase, action, card_mask, kings=kings)
+        logits = self.belief_head(seq[:, 1:1 + cards.shape[1], :])  # [B, N, Z] over the card tokens
+        return logits, attns[-1]
 
     def forward(self, cards, board, phase, action, card_mask=None, kings=None):
         """cards [B,N,44], board [B,14], phase [B,53], action [B,23], card_mask [B,N] bool (True=real).

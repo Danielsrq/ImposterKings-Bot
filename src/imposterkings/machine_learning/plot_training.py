@@ -53,6 +53,23 @@ def main(argv=None) -> None:
     tr = np.asarray(h["epoch_train_mse"], float)
     va = np.asarray(h["epoch_val_mse"], float)
 
+    # A belief checkpoint (Study 7) stores CE in the same 'mse' history keys; only the reference lines and
+    # labels differ -- the two baselines are the net's own input (hand-crafted CE, the line to beat) and the
+    # naive uniform CE. Value checkpoints keep the MSE floor/baseline constants.
+    meta = blob.get("meta") or {}
+    is_belief = meta.get("target") == "belief"
+    bl = meta.get("baselines") or {}
+    if is_belief:
+        ref_lo, ref_hi = bl.get("handcrafted_ce"), bl.get("uniform_ce")
+        lo_lab, hi_lab = "hand-crafted CE (beat this)", "uniform CE"
+        yl = "cross-entropy (log)"
+        loss_lab = "unseen-CE"
+    else:
+        ref_lo, ref_hi = LABEL_NOISE_FLOOR, MEAN_BASELINE
+        lo_lab, hi_lab = "label-noise floor", "predict-the-mean"
+        yl = "weighted MSE (log)"
+        loss_lab = "mse"
+
     # With update-to-data present: a 2-row figure -- top = loss + per-epoch, bottom = the UD ratio split
     # BY LEVEL (embed | L0 | L1 | head), like the per-layer GELU plot. Older checkpoints (no ud) keep 1x2.
     ud = h.get("ud") or []
@@ -67,18 +84,18 @@ def main(argv=None) -> None:
         fig, ax = plt.subplots(1, 2, figsize=(14, 4.8))
 
     # --- (a) per-STEP training loss, with the LR schedule on a twin axis ---------------------------
-    k = max(1, args.smooth)
-    sm = np.convolve(loss, np.ones(k) / k, mode="valid")
+    k = max(1, min(args.smooth, len(loss)))               # clamp: a window past the run's length would
+    sm = np.convolve(loss, np.ones(k) / k, mode="valid")  # make 'valid' return |k|-|loss|+1 stray points
     ax[0].plot(step, loss, lw=0.4, alpha=0.30, color="#3b528b", label="minibatch loss")
     ax[0].plot(step[k - 1:], sm, lw=1.8, color="#21918c", label=f"moving avg ({k})")
-    ax[0].axhline(MEAN_BASELINE, ls=":", color="grey", lw=1)
-    ax[0].axhline(LABEL_NOISE_FLOOR, ls="--", color="crimson", lw=1)
-    ax[0].text(step[-1], LABEL_NOISE_FLOOR, " label-noise floor", color="crimson", va="bottom", ha="right",
-               fontsize=8)
-    ax[0].text(step[-1], MEAN_BASELINE, " predict-the-mean", color="grey", va="bottom", ha="right",
-               fontsize=8)
+    if ref_hi is not None:
+        ax[0].axhline(ref_hi, ls=":", color="grey", lw=1)
+        ax[0].text(step[-1], ref_hi, f" {hi_lab}", color="grey", va="bottom", ha="right", fontsize=8)
+    if ref_lo is not None:
+        ax[0].axhline(ref_lo, ls="--", color="crimson", lw=1)
+        ax[0].text(step[-1], ref_lo, f" {lo_lab}", color="crimson", va="bottom", ha="right", fontsize=8)
     ax[0].set_yscale("log")
-    ax[0].set_xlabel("optimizer step"); ax[0].set_ylabel("weighted MSE (log)")
+    ax[0].set_xlabel("optimizer step"); ax[0].set_ylabel(yl)
     ax[0].set_title("training loss vs step")
     ax[0].legend(fontsize=8, loc="upper right")
     ax2 = ax[0].twinx()
@@ -87,10 +104,12 @@ def main(argv=None) -> None:
     ax2.tick_params(axis="y", labelcolor="#b8a800")
 
     # --- (b) per-EPOCH train vs val (the overfit gap + whether it SETTLED) -------------------------
-    ax[1].plot(ep, tr, "o-", color="#5ec962", lw=1.8, ms=3, label="train_mse")
-    ax[1].plot(ep, va, "o-", color="#440154", lw=1.8, ms=3, label="val_mse")
-    ax[1].axhline(LABEL_NOISE_FLOOR, ls="--", color="crimson", lw=1, label="label-noise floor (0.0059)")
-    ax[1].axhline(MEAN_BASELINE, ls=":", color="grey", lw=1, label="predict-the-mean (0.2020)")
+    ax[1].plot(ep, tr, "o-", color="#5ec962", lw=1.8, ms=3, label=f"train_{loss_lab}")
+    ax[1].plot(ep, va, "o-", color="#440154", lw=1.8, ms=3, label=f"val_{loss_lab}")
+    if ref_lo is not None:
+        ax[1].axhline(ref_lo, ls="--", color="crimson", lw=1, label=f"{lo_lab} ({ref_lo:.4f})")
+    if ref_hi is not None:
+        ax[1].axhline(ref_hi, ls=":", color="grey", lw=1, label=f"{hi_lab} ({ref_hi:.4f})")
     tail = va[-5:]
     ax[1].set_title(f"per-epoch  |  final val {va[-1]:.4f}  best {va.min():.4f}  "
                     f"last-5 std {tail.std():.4f}")
