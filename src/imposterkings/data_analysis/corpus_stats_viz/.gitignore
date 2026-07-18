@@ -1,0 +1,3 @@
+# generated, self-contained viz outputs (rebuild with the build_*.py scripts)
+*.html
+__pycache__/
