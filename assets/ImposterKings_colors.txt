@@ -1,0 +1,14 @@
+Fool: #A771AF
+Assassin: #A8ABE0
+Elder: #6A9ADC
+Zealot: #7A9CC2
+Inquisitor: #4C9BA8
+Judge: #409145
+Soldier: #50AC7B
+Oathbound: #E2CA20
+Mystic: #EE9A06
+Warlord: #F09A09
+King's Hand: #C7672B
+Sentry: #E07F3B
+Princess: #F25C0F
+Queen: #F5570E

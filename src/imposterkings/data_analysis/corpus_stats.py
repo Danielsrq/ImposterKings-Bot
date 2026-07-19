@@ -146,19 +146,24 @@ class Stats:
         self.fool = Counter()                            # Sentry swaps / Fool grabs, by NAME (index->card)
         self.assassin = Counter()
         self.reasons: Counter = Counter()
+        self.reasons_seat: Counter = Counter()           # (reason, "first"|"second") -> n: HOW each seat wins
         self.last_pair: Counter = Counter()
 
     # -- ingest ------------------------------------------------------------------------------------------
 
     def add(self, g: Game) -> None:
         self.games += 1
+        self._starter = g.starting_player                # who moved first this game (for per-seat outcomes)
         if not g.gen.get("self_play", True):
             self.asymmetric = True           # the two seats are different bots -- policy tables are pooled
         self._turn_order(g)
         self._setup_and_hands(g)
         self._plies(g)
         self._fool_and_assassin(g)
-        self.reasons[win_reason(g)] += 1
+        self._react_funnels(g)
+        reason = win_reason(g)
+        self.reasons[reason] += 1
+        self.reasons_seat[(reason, "first" if g.winner == g.starting_player else "second")] += 1
         lp = g.plies[-1]
         self.last_pair[f"{lp.phase.name}/{lp.action.kind.name}"] += 1
 
@@ -264,12 +269,14 @@ class Stats:
         name = cards.card_name(source)
         use = MAY_USE_ACTION.get(cards.card_ability(source))
         row = self.may[name]
+        seat = "first" if p.seat == self._starter else "second"   # split every outcome by turn order
         row["window_opened"] += 1
         if len(p.state.legal_moves()) == 1:          # only DECLINE on offer (e.g. the Fool with no targets)
             row["forced"] += 1
         if p.action.kind == ActionKind.DECLINE_ABILITY:
             row["declined"] += 1
             row["declined_won" if won else "declined_lost"] += 1
+            row[("declined_won_" if won else "declined_lost_") + seat] += 1
             return
         if use is not None and p.action.kind == use:
             row["activated"] += 1
@@ -282,9 +289,11 @@ class Stats:
                     and nxt.action.kind == ActionKind.REVEAL_KINGSHAND:
                 row["countered"] += 1
                 row["countered_won" if won else "countered_lost"] += 1
+                row[("countered_won_" if won else "countered_lost_") + seat] += 1
             else:
                 row["landed"] += 1
                 row["landed_won" if won else "landed_lost"] += 1
+                row[("landed_won_" if won else "landed_lost_") + seat] += 1
                 if cards.card_ability(source) == Ability.FOOL and p.action.target is not None:
                     grabbed = p.state.stack[p.action.target].card    # index -> the actual card grabbed
                     self._trade("Fool grab (stack->hand)", grabbed, won)
@@ -361,6 +370,53 @@ class Stats:
                     bucket[f"{'countered' if countered else 'landed'}/{won}"] += 1
         if win_reason(g) == "assassin_kills_king":
             self.assassin["won_the_game_outright"] += 1
+
+    def _react_funnels(self, g: Game) -> None:
+        """The King's Hand (reveal-to-counter vs decline, only when you actually HOLD one) and the Assassin
+        (launch the kill vs hold it) recast as activate/decline funnels, so they sit in ability_usage.csv
+        beside the five optional abilities -- with the same per-seat won/lost split. A KH reveal always
+        lands (there is no counter-of-the-counter), so it has no 'countered' arm; the Assassin's kill lands
+        as an instant win unless a King's Hand reveals against it (abilities.py:456)."""
+        assassin = cards.card_ids_for_name("Assassin")[0]
+        kh, asn = self.may["KingsHand"], self.may["Assassin"]
+        tried = set()                                         # seats that launched a kill this game
+        for p in g.plies:
+            if p.phase not in (StepKind.REACTION_KINGSHAND, StepKind.REACTION_KH_VS_ASSASSIN):
+                continue
+            revealed = p.action.kind == ActionKind.REVEAL_KINGSHAND
+            if revealed or len(p.state.legal_moves()) > 1:    # a REAL choice: a King's Hand was in hand
+                won = g.won(p.seat)
+                s = "first" if p.seat == self._starter else "second"
+                kh["window_opened"] += 1
+                key = "landed" if revealed else "declined"    # revealing = the counter lands
+                kh["activated" if revealed else "declined"] += 1
+                if revealed:
+                    kh["landed"] += 1
+                kh[f"{key}_won" if won else f"{key}_lost"] += 1
+                kh[(f"{key}_won_" if won else f"{key}_lost_") + s] += 1
+            if p.phase == StepKind.REACTION_KH_VS_ASSASSIN:   # this window IS a launched kill by the OTHER seat
+                atk = 1 - p.seat
+                tried.add(atk)
+                aw = g.won(atk)
+                s = "first" if atk == self._starter else "second"
+                asn["window_opened"] += 1
+                asn["activated"] += 1
+                key = "countered" if revealed else "landed"   # reveal counters the kill; decline = king dies
+                asn[key] += 1
+                asn[f"{key}_won" if aw else f"{key}_lost"] += 1
+                asn[(f"{key}_won_" if aw else f"{key}_lost_") + s] += 1
+        for seat in (0, 1):                                   # held the Assassin into play but never launched
+            if assassin not in g.dealt.hands[seat] or seat in tried:
+                continue
+            if g.setup_choice(seat, StepKind.SETUP_HIDE) == assassin \
+                    or g.setup_choice(seat, StepKind.SETUP_DISCARD) == assassin:
+                continue                                       # hiding/discarding is a separate setup choice
+            aw = g.won(seat)
+            s = "first" if seat == self._starter else "second"
+            asn["window_opened"] += 1
+            asn["declined"] += 1
+            asn["declined_won" if aw else "declined_lost"] += 1
+            asn[("declined_won_" if aw else "declined_lost_") + s] += 1
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -490,6 +546,10 @@ def tables(s: Stats) -> Dict[str, List[dict]]:
         "events_assassin": [{"corpus": s.name, "bucket": k, "n": v} for k, v in sorted(s.assassin.items())],
         "win_reasons": [{"corpus": s.name, "reason": k, "n": v,
                          "share": round(v / max(1, s.games), 4)} for k, v in s.reasons.most_common()],
+        "win_reasons_by_seat": [{"corpus": s.name, "reason": r, "winner": seat, "n": v,
+                                 "share_of_winner": round(v / max(1, sum(vv for (rr, ss), vv
+                                                          in s.reasons_seat.items() if ss == seat)), 4)}
+                                for (r, seat), v in sorted(s.reasons_seat.items(), key=lambda kv: -kv[1])],
         "last_ply": [{"corpus": s.name, "phase_action": k, "n": v} for k, v in s.last_pair.most_common()],
     }
 
