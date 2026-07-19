@@ -68,6 +68,10 @@ class SearchConfig:
     # draws opponent worlds from instead of uniformly. Computed ONCE per move in the agent (a torch forward),
     # handed in as plain data so the search stays torch-free. None = uniform determinization (the default).
     belief_weights: Optional[dict] = None
+    # Godmode (perfect-info) toggle: search a FIXED true state, determinized ONCE, instead of re-sampling the
+    # opponent's hand each iteration -> plain MCTS on the true game. Set by MCTSAgent(godmode=True) from the
+    # true GameState the arena hands it. None = normal SO-ISMCTS (the default, unchanged).
+    true_state: Optional["GameState"] = None
 
 
 @dataclass
@@ -248,8 +252,9 @@ def search(info: InformationSet, config: SearchConfig) -> SearchResult:
 
     use_nn = config.evaluator is not None
     for _ in range(config.iterations):
-        state = info.determinize(config.rng, use_knowledge=config.use_knowledge,
-                                 belief_weights=config.belief_weights)   # fresh root determinization
+        state = (config.true_state if config.true_state is not None            # godmode: one fixed true world
+                 else info.determinize(config.rng, use_knowledge=config.use_knowledge,
+                                       belief_weights=config.belief_weights))  # else fresh root determinization
         if use_nn:                                   # AlphaZero: PUCT + net value, no rollout
             leaf, leaf_state = _select_puct(root, state, config)
             _backpropagate(leaf, _leaf_value(leaf, leaf_state, config), [])

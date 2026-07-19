@@ -40,6 +40,8 @@ class Candidate:
     visits: int
     mean_q: float
     visit_share: float
+    solved: Optional[float] = None      # godmode: EXACT value (mover perspective, +/-1); None for MCTS
+    win: Optional[bool] = None          # godmode: is this move a proven win for the mover
 
 
 @dataclass
@@ -51,27 +53,35 @@ class DecisionRecord:
     sims: int
     elapsed_ms: float
     z: Optional[float] = None  # back-filled terminal reward for the deciding seat
+    eval_type: str = "mcts"             # "mcts" | "godmode" -- how candidates were valued
+    solved_value: Optional[float] = None   # godmode: the position's EXACT value (mover perspective)
 
     @classmethod
     def build(cls, seat: int, view: InformationSet, move: Action, agent) -> "DecisionRecord":
         result = getattr(agent, "last_result", None)
         candidates: List[Candidate] = []
         sims, elapsed_ms = 0, 0.0
+        eval_type, solved_value = "mcts", None
         if result is not None:
             sims, elapsed_ms = result.iterations, result.elapsed * 1000.0
+            eval_type = getattr(result, "eval_type", "mcts")
+            god = eval_type == "godmode"
+            solved_value = result.root_value() if god else None
             candidates = [
-                Candidate(action_to_dict(s.move), format_action(s.move), s.visits, s.mean_q, s.visit_share)
+                Candidate(action_to_dict(s.move), format_action(s.move), s.visits, s.mean_q, s.visit_share,
+                          solved=(s.mean_q if god else None), win=(getattr(s, "win", None) if god else None))
                 for s in result.stats
             ]
         return cls(seat=seat, phase=view.pending[-1].kind.name, chosen=action_to_dict(move),
-                   candidates=candidates, sims=sims, elapsed_ms=elapsed_ms)
+                   candidates=candidates, sims=sims, elapsed_ms=elapsed_ms,
+                   eval_type=eval_type, solved_value=solved_value)
 
 
 @dataclass
 class GameRecord:
     # replayable header: (deal_seed, ordered decisions[].chosen) fully reconstructs the game, since
     # GameState.deal(default_rng(deal_seed)) + apply(actions) is deterministic (state.apply has no rng).
-    schema_version: int = 1
+    schema_version: int = 2             # v2: DecisionRecord gains eval_type + solved_value (godmode)
     gen: Optional[dict] = None          # generator meta: spec label, mode/k/l, temp_plies, base_seed
     deal_seed: Optional[int] = None
     starting_player: Optional[int] = None
@@ -88,8 +98,12 @@ def play_and_record(agents, rng: np.random.Generator,
     while not state.is_terminal():
         seat = state.to_play
         view = state.information_set(seat)
-        move = agents[seat].select_move(view, rng)
-        record.decisions.append(DecisionRecord.build(seat, view, move, agents[seat]))
+        agent = agents[seat]
+        if getattr(agent, "perfect_info", False):      # godmode gets the true state; others stay view-only
+            move = agent.select_move(view, rng, state=state)
+        else:
+            move = agent.select_move(view, rng)
+        record.decisions.append(DecisionRecord.build(seat, view, move, agent))
         state = state.apply(move)
     record.winner = state.winner
     record.rewards = state.result()

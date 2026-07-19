@@ -764,6 +764,78 @@ Code: `rng.py` (`uniform()`), `infoset.py` (`determinize(belief_weights=...)` + 
 
 ---
 
+## Study 9 — godmode: is the second-player's ~60/40 edge structural or informational? (2026-07-19)
+
+MCTS self-play shows the **second player wins ~60/40** (7,000 games; seat is even). Is that a *structural*
+property of the game, or an artifact of *imperfect information*? The clean test is to solve/play the
+**perfect-information variant** (both hands public) and see whether the edge survives. Two independent attacks
+were built; they **disagree**, and understanding *why* is the finding.
+
+### The exact solver (`godmode.py`)
+
+Perfect-info ImposterKings is deterministic, sequential, zero-sum, **no draws** (terminals are strict ±1), so
+the value is a boolean and we solve it with an **AND-OR search** (the win/loss specialisation of alpha-beta):
+find one winning child at your nodes, refute all at the opponent's — every cut is a *proof*, so every value
+(and every transposition-table entry) is exact. Runs on the true `GameState`, minimax in a fixed P0
+perspective (because `apply` often keeps the same mover). Verified against brute-force minimax on end-games.
+
+- **Feasibility (the probe):** full-game roots are **intractable** in pure Python (~16-24k nodes/sec,
+  0/12 solved at 20s) — the setup hide/discard fan-out multiplies a ~400k-node main game by hundreds. So we
+  fix both setups with the net (greedy) and solve the **main game** exactly. Even so only ~58% solve at 45s;
+  **shallow value-net move ordering** (a forward at depth ≤8) lifted that to ~70% and cut node counts ~5×.
+- **The confound (`godmode_study.py`):** a naive main-game bias came out **35.8% second-player** — but the
+  selection-bias probe (2nd-player rate on fast- vs slow-solved deals: 23% vs 48%) exposed it. Cause:
+  **second-player wins cost ~3× more nodes to prove** (median 193k vs 63k), so with a fixed budget they
+  disproportionately time out and are *excluded* → the solvable subset over-represents first-player wins.
+- **The fix (flip trick):** play the first player's first move too, so the solve **root is the second
+  player**, flipping which outcome is cheap to prove. Solve rate 58→79%, the selection gradient *vanished*
+  (flat 50.6/51.9), and the number moved to **51.3% ± 7.8** — with a **negligible** handicap (97.5% winner
+  agreement A-vs-flip). So the exact solver says perfect-info main play is **~balanced (~48-51%)** — caveats:
+  the flip handicap is unmeasured on the hardest deals, and setup is net-fixed.
+
+### Godmode-MCTS (a determinize-once toggle) — and why it can't settle it
+
+An optional `SearchConfig.true_state` (`mcts.py`) makes the search **determinize once** to the true state
+instead of re-sampling → plain MCTS on the true game. `MCTSAgent(godmode=True)` (`perfect_info` → the arena
+hands it the state); IS-MCTS is byte-identical when off; composable/asymmetric per seat. Fixed budget →
+**no outcome-dependent selection bias** and **no flip handicap**. Validated: agrees with the exact solver on
+end-games. Head-to-head, mirrored, second-player winrate (`godmode_mcts_study.py`):
+
+| arm | second-player winrate |
+|---|---|
+| random vs random | 56.2% ± 2.2 |
+| IS-MCTS (imperfect, value-net, **k20-l3**) | 57.0% ± 6.7 |
+| **both-godmode (value-net, k20-l3)** | **58.7% ± 7.9** |
+| both-godmode (value-net, N=200) | 51.0% ± 9.8 *(underpowered noise)* |
+| both-godmode (pure rollout, N=1000) | 60.0% ± 8.6 |
+| exact-solver flip | ~48-51% |
+| **asymmetric** godmode vs IS-MCTS (value-net) | **65.5% ± 4.8** (godmode winrate) |
+
+**At proper (k20-l3) strength, perfect info does NOT collapse the edge** — godmode 58.7% ≈ imperfect 57.0%.
+The N=200 "balanced" 51% was noise (100 deals, ±10). **The reason MCTS can't answer this is the leaf
+evaluator**: the value net scores each leaf from the mover's *info-set* (it re-hides the opponent) and was
+**trained on the P2-biased 60/40 self-play**, so its values *carry the bias* into the godmode search — a
+perfect-info *tree* cannot override a biased *evaluator*. Pure rollout is worse: its random-playout leaf is
+itself **56% P2-biased**. So every MCTS estimate clusters at ~57-60%, ≈ imperfect-info, because no *unbiased
+perfect-info evaluator* exists (the net is fundamentally imperfect-info).
+
+### Verdict — unresolved, and precisely why
+
+The two clean-ish methods disagree: the **leaf-eval-free exact solver says ~50% (informational edge)**; every
+**biased-evaluator MCTS says ~58% (edge persists / structural)**. The disagreement is fully explained by the
+evaluator-bias problem, so neither is decisive. What IS clean: **perfect information is worth ~+15pp** — a
+godmode agent beats the otherwise-identical IS-MCTS agent **65.5%**. Settling the bias question needs an
+*unbiased* perfect-info verdict: the exact solver run to completion (Rust), or a value net trained on
+perfect-info play. Methodological findings (the win/loss proof-cost asymmetry → selection bias; the flip fix;
+the evaluator-bias ceiling on MCTS) are the durable content.
+
+Code: `godmode.py` (solver + `GodmodeAgent`), `mcts.py` (`SearchConfig.true_state`), `agents.py`
+(`MCTSAgent(godmode=)`), `arena.py`/`record.py` (`perfect_info` branch + schema v2), `data_analysis/`
+`godmode_study.py` + `godmode_mcts_study.py`, `tests/test_godmode.py`. Results: `reports/godmode_*.csv`,
+`reports/gm_*.csv`.
+
+---
+
 ## Metric glossary
 
 - **winrate** — fraction of games the challenger wins vs the stated opponent (mirrored; 200 games unless

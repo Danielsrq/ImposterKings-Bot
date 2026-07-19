@@ -33,7 +33,11 @@ def play_game(agents, rng: np.random.Generator,
     while not state.is_terminal():
         seat = state.to_play
         view = state.information_set(seat)
-        move = agents[seat].select_move(view, play_rng)
+        agent = agents[seat]
+        if getattr(agent, "perfect_info", False):     # a perfect-info agent (godmode) gets the TRUE state;
+            move = agent.select_move(view, play_rng, state=state)   # every other agent stays view-only
+        else:
+            move = agent.select_move(view, play_rng)
         if on_decision is not None:
             on_decision(seat, view, move, agents[seat], state)
         state = state.apply(move)
