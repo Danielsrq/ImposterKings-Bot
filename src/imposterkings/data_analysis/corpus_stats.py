@@ -142,7 +142,8 @@ class Stats:
         self.kh: Counter = Counter()                     # countered card name -> n
         self.kh_phase: Counter = Counter()
         self.guess = defaultdict(lambda: Counter())      # (source, guessed name) -> Counter
-        self.fool = Counter()                            # lifecycle buckets, x won/lost
+        self.stack_trade = defaultdict(lambda: Counter())  # (trade label, card name) -> Counter: which card
+        self.fool = Counter()                            # Sentry swaps / Fool grabs, by NAME (index->card)
         self.assassin = Counter()
         self.reasons: Counter = Counter()
         self.last_pair: Counter = Counter()
@@ -226,6 +227,9 @@ class Stats:
             elif p.phase == StepKind.ABILITY_GUESS:
                 self._guess(p, nxt)
 
+            elif p.phase == StepKind.ABILITY_HAND_CARD:
+                self._hand_card(p, won)
+
             elif p.action.kind == ActionKind.REVEAL_KINGSHAND:
                 # WHAT it countered lives in the step, not the action. The nested anti-Assassin window
                 # carries no `source` at all (abilities.py:444) -- key it by phase or you will silently
@@ -281,6 +285,9 @@ class Stats:
             else:
                 row["landed"] += 1
                 row["landed_won" if won else "landed_lost"] += 1
+                if cards.card_ability(source) == Ability.FOOL and p.action.target is not None:
+                    grabbed = p.state.stack[p.action.target].card    # index -> the actual card grabbed
+                    self._trade("Fool grab (stack->hand)", grabbed, won)
             if cards.card_ability(source) == Ability.INQUISITOR:
                 self._guess(p, nxt)
 
@@ -297,6 +304,20 @@ class Stats:
         row["correct"] += int(held)
         row["countered"] += int(countered)
         row["effect_applied"] += int(held and not countered)
+
+    def _trade(self, label: str, card_id: int, won: bool) -> None:
+        row = self.stack_trade[(label, cards.card_name(card_id))]
+        row["n"] += 1
+        row["won" if won else "lost"] += 1
+
+    def _hand_card(self, p: Ply, won: bool) -> None:
+        """Sentry's swap resolves by STACK INDEX, so read the actual cards off the replayed state: the hand
+        card going IN (``action.card``) and the stack card coming OUT (``stack[step.picked]``). Princess-give
+        and Judge-queue also use ABILITY_HAND_CARD but are not stack swaps -- skip them."""
+        if cards.card_ability(p.step.source) != Ability.SENTRY or p.action.card is None:
+            return
+        self._trade("Sentry in (hand->stack)", p.action.card, won)          # what it puts onto the stack
+        self._trade("Sentry out (stack->hand)", p.state.stack[p.step.picked].card, won)   # what it takes
 
     def _fool_and_assassin(self, g: Game) -> None:
         """The full life of a card, from the deal to the result. 'Was the Fool worth keeping?' needs the
@@ -447,7 +468,16 @@ def write_csv(path: str, rows: List[dict]) -> None:
 def tables(s: Stats) -> Dict[str, List[dict]]:
     guess_rows = [{"corpus": s.name, "source": src, "guessed": nm, **dict(c)}
                   for (src, nm), c in s.guess.items()]
+    trade_rows = []
+    for (label, nm), c in s.stack_trade.items():
+        n, won = c["n"], c.get("won", 0)
+        p, lo, hi = wilson(won, n)                    # winrate OF THE ACTOR when they made this trade
+        trade_rows.append({"corpus": s.name, "trade": label, "card": nm, "n": n, "won": won,
+                           "winrate": round(won / n, 4) if n else 0.0,
+                           "ci95_lo": round(lo, 4), "ci95_hi": round(hi, 4)})
+    trade_rows.sort(key=lambda r: (r["trade"], -r["n"]))
     return {
+        "sentry_fool_trades": trade_rows,
         "turn_order": _rows_turn(s),
         "setup_hide": _rows_setup(s, s.hide, "hide"),
         "setup_discard": _rows_setup(s, s.discard, "discard"),
