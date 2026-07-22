@@ -224,17 +224,41 @@ def _owner_key(rec: PlyRecord) -> int:
     return rec.view.turn_player
 
 
+def _plays_card_from_hand(rec: PlyRecord) -> bool:
+    """A card left the HAND this ply, so it heads its own turn root: a normal play / king-flip / ascension
+    (a MAIN/ASCEND step), or a King's-Hand / Assassin REVEAL (a reaction card revealed from hand). A decline
+    or an ability sub-decision (guess, swap, choose-target...) is NOT a fresh card -- it continues the root."""
+    pending = getattr(rec.view, "pending", None)
+    phase = pending[-1].kind if pending else None
+    if phase in (StepKind.MAIN, StepKind.ASCEND):
+        return True
+    return rec.move.kind in (ActionKind.REVEAL_KINGSHAND, ActionKind.REVEAL_ASSASSIN)
+
+
+def _starts_root(traj: List[PlyRecord], i: int) -> bool:
+    """Does ply ``i`` begin a new turn root? SETUP has no real turn order, so split it by the actual mover;
+    otherwise a root begins at each card played from hand."""
+    pending = getattr(traj[i].view, "pending", None)
+    if pending and pending[-1].kind in _SETUP_KINDS:
+        return _owner_key(traj[i]) != _owner_key(traj[i - 1])
+    return _plays_card_from_hand(traj[i])
+
+
 def turns_of(traj: List[PlyRecord]) -> List[Tuple[int, int, int]]:
-    """Group plies into turns: maximal runs with the same owner (``turn_player`` normally; the mover
-    during setup, which has no real turn order). Returns ``[(start, end, owner), ...]``."""
+    """Group plies into turn ROOTS: a root begins whenever a card is played FROM HAND -- a normal play /
+    king-flip / ascension (MAIN/ASCEND), or a King's-Hand / Assassin reveal -- and runs until the next such
+    ply, so its ability sub-decisions and the opponent's declined reactions nest under it. A King's-Hand
+    counter, and the countered player's forced RE-PLAY, are therefore each their own root (both are fresh
+    cards from hand), instead of collapsing into the original play the way a constant ``turn_player`` would.
+    SETUP (no real turn order) stays one root per mover's hide/discard run. ``owner`` is the root's actor
+    (== ``rec.state.to_play`` -- the seat that searched there). Returns ``[(start, end, owner), ...]``."""
     out: List[Tuple[int, int, int]] = []
     i = 0
     while i < len(traj):
-        owner = _owner_key(traj[i])
         j = i
-        while j + 1 < len(traj) and _owner_key(traj[j + 1]) == owner:
+        while j + 1 < len(traj) and not _starts_root(traj, j + 1):
             j += 1
-        out.append((i, j, owner))
+        out.append((i, j, traj[i].seat))
         i = j + 1
     return out
 
@@ -320,6 +344,21 @@ def _headline_card(traj, start, end):
     return None
 
 
+_KH_ID = (cards.card_ids_for_name("KingsHand") or (None,))[0]
+_ASN_ID = (cards.card_ids_for_name("Assassin") or (None,))[0]
+
+
+def _reaction_card(traj, start):
+    """The reaction card revealed at this turn root -- King's Hand / Assassin -- else None. A reveal starts
+    its own root (see ``turns_of``), so the root's headline move IS the reveal."""
+    k = traj[start].move.kind
+    if k == ActionKind.REVEAL_KINGSHAND:
+        return _KH_ID
+    if k == ActionKind.REVEAL_ASSASSIN:
+        return _ASN_ID
+    return None
+
+
 def _turn_is_flip(traj, start, end) -> bool:
     """True if this turn was a king flip (its headline is FLIP_KING, not a card play)."""
     return any(traj[j].move.kind == ActionKind.FLIP_KING for j in range(start, end + 1))
@@ -346,11 +385,17 @@ def _draw_strip(surface, fonts, traj, turns, cursor):
         y = STRIP_TOP + (0 if is_cur else 6)
         rect = pygame.Rect(int(cx - cw / 2), int(y), cw, ch)
         card = _headline_card(traj, s, e)
+        react = _reaction_card(traj, s) if card is None else None
         if card is not None:
             try:
                 surface.blit(assets.card_surface(card, (cw, ch)), rect)
             except Exception:                          # missing art -> solid card-colored tile
                 pygame.draw.rect(surface, CARD_COLORS.get(cards.card_name(card), MUTE), rect)
+        elif react is not None:                        # King's Hand / Assassin revealed -> its art, UPSIDE-DOWN
+            try:                                       # 180° flip signals a reaction without leaving the portrait cell
+                surface.blit(pygame.transform.rotate(assets.card_surface(react, (cw, ch)), 180), rect)
+            except Exception:
+                pygame.draw.rect(surface, CARD_COLORS.get(cards.card_name(react), MUTE), rect)
         elif _turn_is_flip(traj, s, e):                # king flip -> white cell + upside-down crown
             pygame.draw.rect(surface, (245, 245, 245), rect)
             draw_crown(surface, rect, flipped=True)
