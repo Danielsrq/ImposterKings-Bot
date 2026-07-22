@@ -1,7 +1,8 @@
 """Sprite-axis attention heatmap for the explainability drawer (post-`explain` payload -> pygame).
 
-Draws the per-head ``S x S`` CLS/token attention as a small-multiples grid (2x2 for the default 4 heads)
-with **shared sprite axes** (one vertical strip per grid row, one horizontal strip per grid column -- the
+Draws the per-head ``S x S`` CLS/token attention as a small-multiples grid whose shape adapts to the head
+count (2x2 for 4 heads, 2x3 for 6, via ``_grid_shape``), with a per-head entropy caption and **shared sprite
+axes** (one vertical strip per grid row, one horizontal strip per grid column -- the
 tokens are identical on both axes, so a strip labels every box in its row/column). Row i = query, col j =
 key; row 0 is the CLS readout. At L=1 only row 0 (and the candidate row/col) is load-bearing, so other rows
 are drawn de-emphasized. Pure drawing + geometry (no torch); consumes an ``AttentionExplanation``.
@@ -26,6 +27,7 @@ GAP = 20           # gap between head boxes
 PAD = 8
 BOX_MAX = 520      # cap on a single head box (v2 is a fixed S=24: let the grid use the room it has)
 MIN_CELL = 6       # floor so big-S turns still tile (sprites just get tiny)
+CAP_H = 14         # caption band under each head box for the entropy label
 
 # Perceptual, colorblind-safe "viridis" ramp (purple -> blue -> green -> yellow). Applied to sqrt(weight);
 # unlike a navy->white ramp it keeps the low end visible (purple, not near-black), so faint cells still read.
@@ -91,6 +93,19 @@ def _grid_shape(n_heads: int) -> Tuple[int, int]:
     cols = int(math.ceil(math.sqrt(n_heads)))
     rows = int(math.ceil(n_heads / cols))
     return rows, cols
+
+
+def _head_entropy(mat: np.ndarray, rows: List[int], s: int) -> float:
+    """Fraction-of-uniform Shannon entropy (0 = one-hot, 1 = flat), averaged over `rows` of one head's
+    already-renormalized [s, s] attention matrix. Matches head_analysis.py:70 / inspect_activations.py:70
+    (natural log, normalized by log(s))."""
+    if s <= 1 or not rows:
+        return 0.0
+    tot = 0.0
+    for r in rows:
+        p = mat[r]
+        tot += float(-(p * np.log(p + 1e-12)).sum()) / math.log(s)
+    return tot / len(rows)
 
 
 def _abbrev(label: str) -> str:
@@ -232,15 +247,16 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
     if exclude_indices:                                                   # renormalize remaining rows
         sub = sub / np.maximum(sub.sum(axis=-1, keepdims=True), 1e-9)
 
+    LEGEND_H = 16                                                        # a shared entropy legend at the foot
     avail_w = (rw - AX - 2 * PAD - (cols - 1) * GAP) // cols
-    avail_h = (rh - AX - 2 * PAD - (rows - 1) * GAP) // rows
+    avail_h = (rh - LEGEND_H - AX - 2 * PAD - (rows - 1) * GAP - rows * CAP_H) // rows   # CAP_H per row for labels
     box = max(MIN_CELL * s, min(avail_w, avail_h, BOX_MAX))
     cell = max(MIN_CELL, box // s)
     box = cell * s
     grid_w = AX + cols * box + (cols - 1) * GAP
-    grid_h = AX + rows * box + (rows - 1) * GAP
+    grid_h = AX + rows * box + (rows - 1) * GAP + rows * CAP_H
     ox = rx + max(0, (rw - grid_w) // 2)
-    oy = ry + max(0, (rh - grid_h) // 2)
+    oy = ry + max(0, (rh - LEGEND_H - grid_h) // 2)
 
     # "signed" mode colors ROW 0 by the value-weighted signed contribution (diverging); falls back to the
     # attention view if attribution wasn't computed. Only meaningful when the DISPLAYED row 0 is the
@@ -252,10 +268,17 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
     cand_disp = disp.get(candidate_index) if candidate_index is not None else None
     hits: List[AttnHit] = []
     geoms: List[AttnGeom] = []
+    # per-head entropy, scoped to the load-bearing rows of THIS view: CLS row 0 when the card rows are dead
+    # (readout / l2), else the token rows (1..N) = token->token attention. Mirrors head_analysis.py's causal
+    # row selection; recomputed from `sub` so it tracks the token toggle + layer pill the user is on.
+    r0 = disp.get(0, 0)
+    ent_rows = [r0] if dead_rows else [p for p in range(s) if p != r0]
+    ent = [_head_entropy(sub[h], ent_rows, s) for h in range(heads)]
+    capfont = _tile_font()
     for h in range(heads):
         gr, gc = divmod(h, cols)
         bx = ox + AX + gc * (box + GAP)
-        by = oy + AX + gr * (box + GAP)
+        by = oy + AX + gr * (box + GAP + CAP_H)
         geoms.append(AttnGeom(h, bx, by, cell, s))
         row_max = sub[h].max(axis=1) if mode == "row_norm" else None
         for i in range(s):
@@ -286,7 +309,15 @@ def draw_attention(surface, fonts, payload, rect: Tuple[int, int, int, int], *,
         if gr == 0:
             for p in range(s):
                 _axis_tile(surface, payload, idx[p], bx + p * cell, oy, min(AX, cell))
+        # entropy caption under the box (gold when focused, muted when diffuse)
+        cap = f"H{h}  e {ent[h]:.2f}"
+        cw = capfont.size(cap)[0]
+        widgets.text(surface, capfont, cap, (bx + max(0, (box - cw) // 2), by + box + 2),
+                     GOLD if ent[h] < 0.5 else MUTE)
 
+    leg = ("e = attention entropy · fraction of uniform (lower = more focused) · "
+           + ("L2 view: CLS row" if dead_rows else "token rows"))
+    widgets.text(surface, capfont, leg, (rx + PAD, ry + rh - 13), MUTE)
     if hover is not None:
         _draw_crosshair(surface, payload, geoms, hover, disp)
     return hits
@@ -389,7 +420,7 @@ def draw_attention_drawer(surface, fonts, entries, mouse, *, mode="absolute", ho
     dim = pygame.Surface((W, H), pygame.SRCALPHA)
     dim.fill((0, 0, 0, 140))
     surface.blit(dim, (0, 0))
-    dw = int(0.52 * W if getattr(entries[0][1], "feat", "v1") == "v2" else 0.46 * W)   # v2: fixed S=24
+    dw = int(0.70 * W)                                                                 # ~70% of the window
     dx = W - dw
     pygame.draw.rect(surface, PANEL, (dx, 0, dw, H))
     pygame.draw.rect(surface, GOLD, (dx, 0, dw, H), 2)
