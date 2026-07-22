@@ -27,6 +27,7 @@ from .review import (DEFAULT_ATTN_CKPTS, PlyRecord, annotate_dual_evals, attn_ck
                      default_attn_ckpt, missing_dual_evals, run_review, set_seat_result, _result_eval,
                      _search_from)
 from .scenario_setup import run_setup
+from .game_recorder import GameRecorder
 
 # Opponent's setup hide/discard are private -- never reveal the card identity in the log.
 _PRIVATE_OPP_STEPS = (StepKind.SETUP_HIDE, StepKind.SETUP_DISCARD)
@@ -97,7 +98,7 @@ def _describe(seat: int, view, move, human_seat: int, state) -> str:
 
 def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, start=None,
         k: int = 100, l: int = 3, setup: bool = False, nn: str = None, nn_greedy: bool = False,
-        attn: str = None) -> None:
+        attn: str = None, record_dir: str = "datasets/human", no_record: bool = False) -> None:
     import os
     import pygame  # local import so the engine/tests never require pygame
 
@@ -213,6 +214,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
     knowledge_cache: dict = {"state": None, "val": None}   # [seat -> (has, lacks, level)], per state
     trajectory: list = []                          # per-ply PlyRecord(seat, move, view, result) for review
     game: dict = {}  # holds the resettable per-game state: state, rng, seed, bot
+    recorder = GameRecorder(out_dir=record_dir, enabled=not no_record)   # append finished human-vs-AI games
     # ALL searching happens on ONE background worker thread. Both searches used to run inline in the event
     # loop -- the bot's move AND the side panels' analysis (show_reasoning is on by default, so that one
     # fires on every turn, including yours). No events were pumped and no frames drawn for their duration,
@@ -235,6 +237,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         analysis["state"], analysis[0], analysis[1] = None, None, None
 
     def new_game(new_seed=None, initial_state=None):
+        if game.get("state") is not None:      # a finished-but-unwritten game (e.g. New Game after GAME OVER)
+            recorder.finalize(game["state"])
         s = int(np.random.default_rng().integers(0, 2**31)) if new_seed is None else new_seed
         rng = np.random.default_rng(s)
         st0 = initial_state if initial_state is not None else GameState.deal(rng, starting_player=start)
@@ -243,6 +247,12 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         work["thread"], work["out"] = None, None
         prefill["todo"], prefill["len"] = [], -1
         game.update(seed=s, rng=rng, state=st0, bot=_make_bot(random_bot, engine, nn_agent, ev))
+        recorder.start(seed=s, human_seat=human_seat, hotseat=hotseat,
+                       scenario=initial_state is not None,
+                       bot={"mode": engine["mode"], "N": engine["N"], "k": engine["k"], "l": engine["l"],
+                            "nn_ckpt": (nn_ckpt_path() if engine["mode"] == "nn" else None),
+                            "label": (f"mcts-{engine['N']}" if engine["mode"] == "mcts"
+                                      else f"{engine['mode']}-k{engine['k']}-l{engine['l']}")})
         log.clear()
         trajectory.clear()
         analysis["state"], analysis[0], analysis[1] = None, None, None
@@ -288,12 +298,17 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
         st = game["state"]
         persp = human_seat if perspective is None else perspective
         log.append(_describe(seat, st.information_set(persp), move, persp, st))
-        rec = PlyRecord(seat, move, st.information_set(seat), result, state=st)
+        iset = st.information_set(seat)
+        rec = PlyRecord(seat, move, iset, result, state=st)
         # Keep the live dual-analysis already computed for this position so the post-game review reuses it
         # instead of recomputing (it only re-searches seats whose panel was off during play).
         if analysis["state"] is st and (analysis[0] is not None or analysis[1] is not None):
             rec.result_by_seat = (analysis[0], analysis[1])
         trajectory.append(rec)
+        # dataset recorder: flag any assist visible at move time, and store the ply (bot plies carry the
+        # search's candidate stats; human plies stay policy-free).
+        recorder.snapshot_assists(show_hint, show_attn, show_reasoning)
+        recorder.log_ply(seat, iset, move, result if seat == bot_seat else None)
         game["state"] = st.apply(move)
 
     running = True
@@ -317,6 +332,7 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
 
         hover = _hover_index(pygame.mouse.get_pos(), len(legal)) if human_turn else None
         if state.is_terminal():
+            recorder.finalize(state)                    # append the finished game (idempotent)
             status = f"GAME OVER - Player {state.winner} wins"
         elif not human_turn:
             status = f"{bot.name} (seat {bot_seat}) is thinking..."
@@ -538,6 +554,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
                     show_reasoning = not show_reasoning
                 elif frame.hint_toggle and frame.hint_toggle.collidepoint(pos):
                     show_hint = not show_hint
+                    if show_hint:
+                        recorder.mark_hint()            # sticky: catches open-then-close before a move
                 elif human_turn:
                     for rect, move in frame.buttons:
                         if rect.collidepoint(pos):
@@ -636,6 +654,8 @@ def run(p1: str = "mcts", iters: int = 800, seed=None, human_seat: int = 0, star
 
         clock.tick(30)
 
+    if game.get("state") is not None:                   # flush a game that ended right as the user quit
+        recorder.finalize(game["state"])
     pygame.quit()
 
 
@@ -667,9 +687,14 @@ def main(argv=None) -> None:
                         help="attention checkpoint for the explainability 'Analysis' drawer (press A). "
                              f"Defaults to the first of {list(DEFAULT_ATTN_CKPTS)} that exists (the v2 net "
                              "gives fixed 18-card axes + zone posteriors).")
+    parser.add_argument("--record-dir", default="datasets/human",
+                        help="append finished human-vs-AI games here (JSONL, replayable by corpus_stats). "
+                             "hotseat/scenario games are not recorded.")
+    parser.add_argument("--no-record", action="store_true", help="disable human-vs-AI game recording")
     args = parser.parse_args(argv)
     run(p1=args.p1, iters=args.iters, seed=args.seed, human_seat=args.human_seat, start=args.start,
-        k=args.k, l=args.l, setup=args.setup, nn=args.nn, nn_greedy=args.nn_greedy, attn=args.attn)
+        k=args.k, l=args.l, setup=args.setup, nn=args.nn, nn_greedy=args.nn_greedy, attn=args.attn,
+        record_dir=args.record_dir, no_record=args.no_record)
 
 
 if __name__ == "__main__":
