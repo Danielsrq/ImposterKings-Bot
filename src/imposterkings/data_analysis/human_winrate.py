@@ -21,9 +21,13 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Human win-rate (P1/P2) over recorded human-vs-AI games.")
     p.add_argument("--data", nargs="+", default=["datasets/human"], help="dir(s) of recorded human games")
     p.add_argument("--include-assisted", action="store_true", help="include games where the Hint was used")
+    p.add_argument("--by-seat", action="store_true",
+                   help="also print the seat-independent turn-order table (first/second-mover win-rate, "
+                        "regardless of whether the human or the bot occupied the seat)")
     args = p.parse_args(argv)
 
     cells = {"first": [0, 0], "second": [0, 0]}        # [games, wins] for the human
+    seat_cells = {"first": [0, 0], "second": [0, 0]}   # [games, wins] by TURN ORDER, any occupant
     assisted = skipped = 0
     for g in replay_all(args.data, None):
         gen = g.gen or {}
@@ -40,6 +44,11 @@ def main(argv=None) -> None:
         went = "first" if seat == g.starting_player else "second"
         cells[went][0] += 1
         cells[went][1] += int(g.won(seat))
+        first_won = g.won(g.starting_player)           # winner by TURN ORDER (regardless of human/bot)
+        seat_cells["first"][0] += 1
+        seat_cells["first"][1] += int(first_won)
+        seat_cells["second"][0] += 1
+        seat_cells["second"][1] += int(not first_won)
 
     total_n = cells["first"][0] + cells["second"][0]
     total_w = cells["first"][1] + cells["second"][1]
@@ -59,6 +68,15 @@ def main(argv=None) -> None:
         print(f"  {'overall':>7} {total_n:>6} {total_w:>5} {pt*100:>7.1f}%  [{lo*100:>4.1f}, {hi*100:>4.1f}]%")
         print("\n(Human moves first in some deals and second in others; compare each seat to its own baseline "
               "-- a human 'better than the bot' shows as a P1 rate above ~41% or a P2 rate above ~59%.)")
+
+    if args.by_seat and total_n:
+        print(f"\nTURN ORDER (seat-independent -- winner by first/second mover, any occupant)")
+        print(f"  {'moved':>7} {'games':>6} {'wins':>5} {'winrate':>8}  {'95% CI':>15}   bot baseline")
+        for went in ("first", "second"):
+            n, w = seat_cells[went]
+            pt, lo, hi = wilson(w, n)
+            print(f"  {went:>7} {n:>6} {w:>5} {pt*100:>7.1f}%  [{lo*100:>4.1f}, {hi*100:>4.1f}]%   "
+                  f"P{'1' if went=='first' else '2'} ~{BOT_BASELINE[went]*100:.0f}%")
 
 
 if __name__ == "__main__":
