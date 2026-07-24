@@ -62,9 +62,18 @@ _LAB_DEFAULT = {"verb": "activated", "act": "Activated", "landed": "Landed",
 _LABELS = {
     "KingsHand": {"verb": "revealed", "act": "Revealed", "landed": "Counter landed",
                   "countered": "Countered", "declined": "Held back"},
-    "Assassin": {"verb": "launched", "act": "Launched the kill", "landed": "Killed the king",
+    "Assassin": {"verb": "launched", "act": "Assassination Attempts", "landed": "Success",
                  "countered": "Countered", "declined": "Never launched"},
+    # Judge: the guess is mandatory, so the CHOICE is whether to queue a hand card after a correct guess.
+    # activated = went for the queue (landed OR countered); declined = held the card back.
+    "Judge": {"verb": "queued", "act": "Queued a card", "landed": "Queued to antechamber",
+              "countered": "Countered", "declined": "Held it back"},
 }
+# The two passives recast as funnels (played as a plain value vs the special trigger firing).
+_OATH_LAB = {"verb": "overrode", "act": "Beat a bigger card", "landed": "Beat a bigger card",
+             "countered": "Countered", "declined": "Played as a plain 6"}
+_WAR_LAB = {"verb": "buffed", "act": "Royalty on the stack", "landed": "Royalty on the stack (+1)",
+            "countered": "Countered", "declined": "Played as a plain 7"}
 
 
 def build(stats_dir: str, out_path: str, assets_dir: str, art_width: int) -> str:
@@ -87,17 +96,91 @@ def build(stats_dir: str, out_path: str, assets_dir: str, art_width: int) -> str
             **{f"{o}_{w}_{s}": g(f"{o}_{w}_{s}") for o in ("landed", "countered", "declined")
                for w in ("won", "lost") for s in ("first", "second")},
         })
+    # Oathbound / Warlord are PASSIVES (passives.csv), recast as 2-arm funnels by mapping fired->the special
+    # trigger (a "landed" arm) and played-minus-fired->plain (a "declined" arm), so funnel() renders them as-is.
+    passive_rows = {r["card"]: r for r in _read(os.path.join(stats_dir, "passives.csv"))}
+
+    def _passive_card(name: str, lab: dict) -> dict:
+        r = passive_rows.get(name, {})
+        pg = lambda k: int(r[k]) if r.get(k) not in ("", None) else 0
+        played, fired = pg("played"), pg("fired")
+        card = {
+            "name": name, "val": NAME_VAL.get(name, 0), "color": colors.get(name, "#888"),
+            "window": played, "activated": fired, "declined": played - fired,
+            "landed": fired, "countered": 0,
+            "landed_won": pg("fired_won"), "landed_lost": pg("fired_lost"),
+            "countered_won": 0, "countered_lost": 0,
+            "declined_won": pg("won") - pg("fired_won"), "declined_lost": pg("lost") - pg("fired_lost"),
+            "forced": 0, "act_rate": fired / played if played else 0.0, "lab": lab,
+        }
+        for s in ("first", "second"):
+            card[f"landed_won_{s}"] = pg(f"fired_won_{s}")
+            card[f"landed_lost_{s}"] = pg(f"fired_lost_{s}")
+            card[f"declined_won_{s}"] = pg(f"won_{s}") - pg(f"fired_won_{s}")
+            card[f"declined_lost_{s}"] = pg(f"lost_{s}") - pg(f"fired_lost_{s}")
+            card[f"countered_won_{s}"] = card[f"countered_lost_{s}"] = 0
+        return card
+
+    cards.append(_passive_card("Oathbound", _OATH_LAB))
+    cards.append(_passive_card("Warlord", _WAR_LAB))
     cards.sort(key=lambda c: -c["act_rate"])
 
+    # Elder: a numbers-only card (no sankey) -- how often it trumped royalty, and losses while holding it.
+    er = next(iter(_read(os.path.join(stats_dir, "events_elder.csv"))), {})
+    eg = lambda k: int(er[k]) if er.get(k) not in ("", None) else 0
+    cards.append({
+        "name": "Elder", "val": NAME_VAL.get("Elder", 0), "color": colors.get("Elder", "#888"),
+        "type": "stat", "trumped": eg("trumped"), "trumped_won": eg("trumped_won"),
+        "trumped_lost": eg("trumped_lost"), "games": eg("games"),
+        "lost_in_hand": eg("lost_in_hand"), "won_in_hand": eg("won_in_hand"),
+    })
+
     # the King's Hand's "Counter landed" arm, decomposed by what it stopped (freq only) -> a treemap
-    kh_counters = [{"name": r["countered"], "n": int(r["n"]), "color": colors.get(r["countered"], "#888")}
+    kh_counters = [{"name": r["countered"], "n": int(r["n"]), "color": colors.get(r["countered"], "#888"),
+                    "nf": int(r.get("n_first") or 0), "ns": int(r.get("n_second") or 0)}
                    for r in _read(os.path.join(stats_dir, "events_kingshand.csv"))]
     kh_counters.sort(key=lambda d: -d["n"])
     for c in cards:
         if c["name"] == "KingsHand":
             c["counters"] = kh_counters
 
-    names = list(dict.fromkeys([c["name"] for c in cards] + [d["name"] for d in kh_counters]))
+    # the Mystic's arm: which BASE VALUE did it silence? Each value is a group of cards (never 9) -> a treemap
+    val_names: Dict[int, List[str]] = {}
+    for _nm, _v in NAME_VAL.items():
+        val_names.setdefault(_v, []).append(_nm)
+    mystic_mutes = [{"value": int(r["value"]), "n": int(r["n"]), "cards": val_names.get(int(r["value"]), []),
+                     "nf": int(r.get("n_first") or 0), "ns": int(r.get("n_second") or 0)}
+                    for r in _read(os.path.join(stats_dir, "events_mystic.csv"))]
+    mystic_mutes.sort(key=lambda d: -d["n"])
+    for c in cards:
+        if c["name"] == "Mystic":
+            c["mutes"] = mystic_mutes
+
+    def _leaf(rows, key):
+        out = [{"name": r[key], "n": int(r["n"]), "color": colors.get(r[key], "#888"),
+                "nf": int(r.get("n_first") or 0), "ns": int(r.get("n_second") or 0),
+                "value": int(r["value"]) if "value" in r else None} for r in rows]
+        out.sort(key=lambda d: -d["n"])
+        return out
+
+    # Judge: which cards it queued into the antechamber. Oathbound: the free follow-up card the override
+    # bought, restricted to value <= 6 (7+ could have beaten the card WITHOUT the override -- not a real combo).
+    judge_q = _leaf(_read(os.path.join(stats_dir, "events_judge.csv")), "queued")
+    oath_fu = [d for d in _leaf(_read(os.path.join(stats_dir, "events_oathbound.csv")), "followup")
+               if d["value"] is not None and d["value"] <= 6]
+    assassin_tl = [{"turn": int(r["turn"]), "outcome": r["outcome"], "seat": r["seat"], "n": int(r["n"])}
+                   for r in _read(os.path.join(stats_dir, "events_assassin_turn.csv"))]
+    for c in cards:
+        if c["name"] == "Judge":
+            c["queued"] = judge_q
+        elif c["name"] == "Oathbound":
+            c["followup"] = oath_fu
+        elif c["name"] == "Assassin":
+            c["timeline"] = assassin_tl
+
+    mystic_names = [nm for m in mystic_mutes for nm in m["cards"]]
+    leaf_names = [d["name"] for d in kh_counters + judge_q + oath_fu]
+    names = list(dict.fromkeys([c["name"] for c in cards] + leaf_names + mystic_names))
     art = _art_data_uris(assets_dir, art_width, names)
     data = {"cards": cards}
     html = _TEMPLATE.replace("/*__DATA__*/", json.dumps(data)).replace("/*__ART__*/", json.dumps(art))
@@ -158,6 +241,10 @@ h1 em{font-style:normal;color:var(--gold)}
 .tip{position:fixed;pointer-events:none;z-index:9;background:#0b0906;border:1px solid var(--edge);border-radius:8px;
   padding:9px 11px;font-size:12px;color:var(--cream);box-shadow:0 10px 30px rgba(0,0,0,.6);opacity:0;transition:opacity .12s;max-width:250px}
 .tip .tn{font-weight:700;margin-bottom:3px}
+.tip .sbar{display:flex;height:9px;border-radius:5px;overflow:hidden;margin-top:8px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.45)}
+.tip .sbar i{display:block;height:100%}
+.tip .sbl{display:flex;justify-content:space-between;gap:12px;margin-top:4px;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px}
 .rhs{flex:none;width:340px;display:flex;flex-direction:column;justify-content:center;align-items:center}
 .rhs.filled{border-left:1px solid var(--edge);padding-left:16px}
 .kh-tree{display:flex;flex-direction:column;gap:9px;align-items:center}
@@ -172,6 +259,25 @@ h1 em{font-style:normal;color:var(--gold)}
 .tile .tlab{position:relative;z-index:1;font-size:10px;color:#fff;text-align:center;padding:2px 3px;line-height:1.12;
   text-shadow:0 1px 2px #000,0 0 5px #000,0 0 5px #000}
 .tile .tlab b{display:block;font-size:11px}
+.mtile{position:absolute;overflow:hidden;box-shadow:inset 0 0 0 1px rgba(0,0,0,.6);display:flex;
+  align-items:center;justify-content:center;cursor:default;transition:filter .15s;background:#0a0805}
+.mtile:hover{filter:brightness(1.2)}
+.mtile .mbg{position:absolute;inset:0;display:flex}
+.mtile .mbg img{flex:1;min-width:0;height:100%;object-fit:cover;opacity:.5}
+.mtile .mlab{position:relative;z-index:1;text-align:center;color:#fff;line-height:1;
+  text-shadow:0 1px 2px #000,0 0 6px #000,0 0 6px #000}
+.mtile .mlab b{display:block;font-family:"Iowan Old Style",Palatino,Georgia,serif;font-size:26px;color:var(--gold)}
+.mtile .mn{font-size:10px;letter-spacing:.02em;color:#eee}
+.statpanel{flex:1;min-width:0;display:flex;gap:16px;align-items:stretch}
+.statpanel .stat{flex:1;display:flex;flex-direction:column;justify-content:center;text-align:center;
+  padding:12px 16px;border:1px solid var(--edge);border-radius:11px;
+  background:linear-gradient(180deg,rgba(31,24,16,.55),rgba(18,13,7,.4))}
+.statpanel .statn{font-family:"Iowan Old Style",Palatino,Georgia,serif;font-size:42px;line-height:1;color:var(--gold);
+  text-shadow:0 2px 20px rgba(232,180,74,.25)}
+.statpanel .statl{font-size:13.5px;color:var(--cream);margin-top:7px;line-height:1.4}
+.statpanel .statl b{color:var(--gold);font-weight:600}
+.statpanel .statsub{font-size:11.5px;color:var(--muted);margin-top:5px;line-height:1.4}
+@media (max-width:720px){ .statpanel{flex-direction:column} }
 @media (max-width:720px){ .fun{flex-direction:column} .who{flex-basis:auto;flex-direction:row;gap:12px;justify-content:flex-start}
   .rhs{width:auto} .rhs.filled{border-left:0;border-top:1px solid var(--edge);padding-left:0;padding-top:14px}
   .who img{width:54px;margin:0} .who .rate{font-size:28px} h1{font-size:32px} }
@@ -180,10 +286,11 @@ h1 em{font-style:normal;color:var(--gold)}
 <div class="stage">
   <div class="eyebrow" id="eyebrow"></div>
   <h1>When the game offers you a power,<br><em>do you take it?</em></h1>
-  <p class="dek">Seven abilities are a <b>choice</b> — use the power or hold it. Most can be foiled by a hidden
-    <b>King's Hand</b>; the Assassin's kill and the King's Hand's own reveal are funnels here too. Each is sorted
-    by how eagerly the bot uses it, and every ending splits into a <b style="color:#6ba2dd">P1</b> and a
-    <b style="color:#e8b44a">P2</b> column, each filled to how often <b>that seat won</b> from there.</p>
+  <p class="dek">Almost every card carries a power that's a <b>choice</b> — use it or hold it. Most can be foiled
+    by a hidden <b>King's Hand</b>; the Assassin's kill, the Oathbound's override and the Judge's schedule are
+    funnels here too. Each is sorted by how eagerly the bot uses it, and every ending splits into a
+    <b style="color:#6ba2dd">P1</b> and a <b style="color:#e8b44a">P2</b> column, each filled to how often
+    <b>that seat won</b> from there.</p>
 
   <div class="key">
     <div class="it"><span class="sw" style="background:var(--teal)"></span>Landed</div>
@@ -212,7 +319,7 @@ const hideTip=()=>tip.style.opacity=0;
 const dark=(hex,f)=>{const n=parseInt(hex.slice(1),16);const r=n>>16,g=n>>8&255,b=n&255;
   const m=v=>Math.round(v*(1-f));return `rgb(${m(r)},${m(g)},${m(b)})`;};
 
-$("#eyebrow").textContent="Imposter Kings · 5,000 self-play games · seven abilities, each a choice";
+$("#eyebrow").textContent="Imposter Kings · 5,000 self-play games · every power, choice by choice";
 $("#foot").textContent="ability_usage.csv — window_opened = activated + declined; activated = landed + countered (by a King's Hand). "
   +"Won/lost is the outcome of the game for the seat that faced the window.";
 
@@ -223,6 +330,12 @@ const RAW={landed:"#3fae9b",countered:"#d1504a",declined:"#8a7a5c"};
 const W=672,H=236,PY=20,IH=H-2*PY, NW=16, X0=8, X1=452, CW=17, CGAP=8, TW=CW*2+CGAP,
   LX=X1+TW+20, G1=20, G2=13, LBLH=48;
 const SEAT={first:"#6ba2dd",second:"#e8b44a"};
+// a shared P1|P2 split bar for a treemap leaf's hover card: who (first/second mover) made that selection
+const seatBar=(nf,ns)=>{const t=(nf+ns)||1,pf=Math.round(100*nf/t);
+  return `<div class="sbar"><i style="width:${pf}%;background:${SEAT.first}"></i>`
+    +`<i style="width:${100-pf}%;background:${SEAT.second}"></i></div>`
+    +`<div class="sbl"><span style="color:${SEAT.first}">P1 ${int(nf)} · ${pf}%</span>`
+    +`<span style="color:${SEAT.second}">P2 ${int(ns)} · ${100-pf}%</span></div>`;};
 
 function funnel(c){
   const svg=S("svg",{viewBox:`0 0 ${W} ${H}`,preserveAspectRatio:"xMinYMid meet"});
@@ -236,8 +349,12 @@ function funnel(c){
   const ribbon=(t0,b0,t1,b1,col)=>{const x0=X0+NW,x1=X1+TW,xm=(x0+x1)/2;   // reach behind BOTH seat columns
     svg.append(S("path",{d:`M${x0},${t0} C${xm},${t0} ${xm},${t1} ${x1},${t1} L${x1},${b1} C${xm},${b1} ${xm},${b0} ${x0},${b0} Z`,
       fill:col,opacity:.24}));};
-  ribbon(yAct, yAct+landH, yLand, yLand+landH, RAW.landed);              // Activated -> Landed
-  if(hasCnt) ribbon(yAct+landH+G2, yAct+actH, yCnt, yCnt+cntH, RAW.countered);   // Activated -> Countered (skip if none)
+  if(c.name==="Assassin"){                                              // one merged "launched" arm (killed = 100% win)
+    ribbon(yAct, yAct+actH, yAct, yAct+actH, RAW.landed);
+  } else {
+    ribbon(yAct, yAct+landH, yLand, yLand+landH, RAW.landed);            // Activated -> Landed
+    if(hasCnt) ribbon(yAct+landH+G2, yAct+actH, yCnt, yCnt+cntH, RAW.countered);  // Activated -> Countered (skip if none)
+  }
   ribbon(yDec, yDec+decH, yDec, yDec+decH, RAW.declined);               // Declined -> Declined
 
   // col0 source nodes: the choice
@@ -248,27 +365,52 @@ function funnel(c){
   source(yAct,actH,"#c99a42",c.lab.act,`${int(c.activated)}× — ${pc(c.activated,win)} of ${int(win)} chances${c.forced?` · ${int(c.forced)} forced`:""}`);
   source(yDec,decH,"#6c6046",c.lab.declined,`${int(c.declined)}× — ${pc(c.declined,win)} of ${int(win)} chances`);
 
-  // col1 terminals: each is TWO columns, P1 (blue border) and P2 (gold border), filled to that seat's winrate
-  const tot4=o=>(c[o+"_won_first"]||0)+(c[o+"_lost_first"]||0)+(c[o+"_won_second"]||0)+(c[o+"_lost_second"]||0);
-  const terms=[
-    {y:yLand,h:landH,key:"landed",name:c.lab.landed,o:"landed"},
-    {y:yCnt,h:cntH,key:"countered",name:c.lab.countered,o:"countered"},
-    {y:yDec,h:decH,key:"declined",name:c.lab.declined,o:"declined"},
-  ].filter(t=>tot4(t.o)>0);                                              // drop an empty arm (KH has no counter)
-  const seatWL=(t,s)=>[c[`${t.o}_won_${s}`]||0, c[`${t.o}_lost_${s}`]||0];
+  // col1 terminals: TWO columns each (P1 blue border, P2 gold), a bottom-up STACK of segments per column.
+  // Normal card: [won (bright RAW[key]) | lost (dark)]. The Assassin MERGES its launched arm into one
+  // terminal -- "Killed the king" is a 100% win by definition, so a plain won/lost column just reads as a
+  // full bar. Its stack is [killed (teal) | countered->won (crimson) | countered->lost (dark crimson)].
+  const wl=(o,s)=>[c[`${o}_won_${s}`]||0, c[`${o}_lost_${s}`]||0];
+  const twoSeg=(key,o)=>s=>{const [won,lost]=wl(o,s);
+    return {tot:won+lost, won, segs:[{v:won,fill:RAW[key]},{v:lost,fill:dark(RAW[key],.64)}]};};
+  let terms;
+  if(c.name==="Assassin"){
+    const launch=s=>{const [kw,kl]=wl("landed",s), kill=kw+kl,
+        cw=c[`countered_won_${s}`]||0, cl=c[`countered_lost_${s}`]||0;
+      return {tot:kill+cw+cl, won:kill+cw,
+        segs:[{v:kill,fill:RAW.landed,label:"Assassinated"},
+              {v:cw,fill:RAW.countered,label:"Countered — won"},
+              {v:cl,fill:dark(RAW.countered,.64),label:"Countered — lost"}]};};
+    terms=[
+      {y:yAct,h:actH,key:"landed",name:c.lab.act,seg:launch},
+      {y:yDec,h:decH,key:"declined",name:c.lab.declined,seg:twoSeg("declined","declined")},
+    ];
+  } else {
+    const tot4=o=>wl(o,"first")[0]+wl(o,"first")[1]+wl(o,"second")[0]+wl(o,"second")[1];
+    terms=[
+      {y:yLand,h:landH,key:"landed",name:c.lab.landed,seg:twoSeg("landed","landed"),o:"landed"},
+      {y:yCnt,h:cntH,key:"countered",name:c.lab.countered,seg:twoSeg("countered","countered"),o:"countered"},
+      {y:yDec,h:decH,key:"declined",name:c.lab.declined,seg:twoSeg("declined","declined"),o:"declined"},
+    ].filter(t=>tot4(t.o)>0);                                            // drop an empty arm (KH has no counter)
+  }
+  const defTip=(t,d1,d2)=>`<div class="tn" style="color:${RAW[t.key]}">${t.name}</div>`
+    +`<div class="mono"><span style="color:${SEAT.first}">P1 ${pc(d1.won,d1.tot)}</span> won of ${int(d1.tot)}</div>`
+    +`<div class="mono"><span style="color:${SEAT.second}">P2 ${pc(d2.won,d2.tot)}</span> won of ${int(d2.tot)}</div>`;
   terms.forEach(t=>{
-    const g=S("g",{class:"node"});
-    [["first",X1],["second",X1+CW+CGAP]].forEach(([s,x])=>{
-      const [won,lost]=seatWL(t,s), tot=won+lost, wonH=tot?t.h*won/tot:0;
-      g.append(S("rect",{x,y:t.y,width:CW,height:Math.max(1,t.h),rx:2,fill:dark(RAW[t.key],.64)}));       // lost
-      if(wonH>0.4) g.append(S("rect",{x,y:t.y+t.h-wonH,width:CW,height:wonH,rx:2,fill:RAW[t.key]}));        // won, rising from the floor
-      g.append(S("rect",{x,y:t.y,width:CW,height:Math.max(1,t.h),rx:2,fill:"none",stroke:SEAT[s],"stroke-width":1.2,opacity:.85}));
+    const g=S("g",{class:"node"}), d1=t.seg("first"), d2=t.seg("second");
+    const perSeg=d1.segs.some(sg=>sg.label);      // labelled stack (Assassin) -> hover each segment for its count/%
+    [["first",X1,d1],["second",X1+CW+CGAP,d2]].forEach(([s,x,d])=>{
+      let yy=t.y+t.h;                                                    // stack segments upward from the floor
+      d.segs.forEach(sg=>{const sh=d.tot?t.h*sg.v/d.tot:0; if(sh>0.4){ yy-=sh;
+        const rect=S("rect",{x,y:yy,width:CW,height:sh,rx:2,fill:sg.fill});
+        if(sg.label) rect.onmousemove=e=>showTip(`<div class="tn" style="color:${sg.fill}">${sg.label}</div>`
+          +`<div class="mono"><span style="color:${SEAT[s]}">${s==="first"?"P1":"P2"}</span> ${int(sg.v)} · ${pc(sg.v,d.tot)} of ${int(d.tot)} ${c.lab.verb}</div>`,e.clientX,e.clientY);
+        g.append(rect); }});
+      if(!d.tot) g.append(S("rect",{x,y:t.y,width:CW,height:Math.max(1,t.h),rx:2,fill:dark(RAW[t.key],.64)}));
+      g.append(S("rect",{x,y:t.y,width:CW,height:Math.max(1,t.h),rx:2,fill:"none",stroke:SEAT[s],"stroke-width":1.2,opacity:.85,"pointer-events":"none"}));
     });
-    const [w1,l1]=seatWL(t,"first"), [w2,l2]=seatWL(t,"second");
-    g.onmousemove=e=>showTip(`<div class="tn" style="color:${RAW[t.key]}">${t.name}</div>`
-      +`<div class="mono"><span style="color:${SEAT.first}">P1 ${pc(w1,w1+l1)}</span> won of ${int(w1+l1)}</div>`
-      +`<div class="mono"><span style="color:${SEAT.second}">P2 ${pc(w2,w2+l2)}</span> won of ${int(w2+l2)}</div>`,e.clientX,e.clientY);
-    g.onmouseleave=hideTip; svg.append(g); t.cy=t.y+t.h/2; t.w1=w1;t.l1=l1;t.w2=w2;t.l2=l2;});
+    if(!perSeg) g.onmousemove=e=>showTip(t.tip?t.tip(d1,d2):defTip(t,d1,d2),e.clientX,e.clientY);
+    g.onmouseleave=hideTip; svg.append(g);
+    t.cy=t.y+t.h/2; t.w1=d1.won; t.t1=d1.tot; t.w2=d2.won; t.t2=d2.tot;});
 
   // de-overlap the three right-hand labels: desired y = node centre, then keep >= LBLH apart within bounds
   const minY=PY+14, maxY=H-18, L=terms.slice().sort((a,b)=>a.cy-b.cy);
@@ -281,10 +423,10 @@ function funnel(c){
   terms.forEach(t=>{
     svg.append(S("polyline",{points:`${X1+TW},${t.cy} ${LX-12},${t.cy} ${LX-6},${t.ly}`,fill:"none",stroke:RAW[t.key],"stroke-width":1,opacity:.5}));
     const nm=S("text",{x:LX,y:t.ly-8,class:"ntext","font-size":15,"font-weight":600}); nm.textContent=t.name; svg.append(nm);
-    const s1=S("text",{x:LX,y:t.ly+9,"font-size":13,"font-weight":600,fill:SEAT.first}); s1.textContent=`P1 ${pc(t.w1,t.w1+t.l1)}`; svg.append(s1);
-    const s2=S("text",{x:LX+82,y:t.ly+9,"font-size":13,"font-weight":600,fill:SEAT.second}); s2.textContent=`P2 ${pc(t.w2,t.w2+t.l2)}`; svg.append(s2);
-    const n1=S("text",{x:LX,y:t.ly+22,"font-size":10.5,fill:"var(--faint)"}); n1.textContent=`${int(t.w1+t.l1)} games`; svg.append(n1);
-    const n2=S("text",{x:LX+82,y:t.ly+22,"font-size":10.5,fill:"var(--faint)"}); n2.textContent=`${int(t.w2+t.l2)} games`; svg.append(n2);});
+    const s1=S("text",{x:LX,y:t.ly+9,"font-size":13,"font-weight":600,fill:SEAT.first}); s1.textContent=`P1 ${pc(t.w1,t.t1)}`; svg.append(s1);
+    const s2=S("text",{x:LX+82,y:t.ly+9,"font-size":13,"font-weight":600,fill:SEAT.second}); s2.textContent=`P2 ${pc(t.w2,t.t2)}`; svg.append(s2);
+    const n1=S("text",{x:LX,y:t.ly+22,"font-size":10.5,fill:"var(--faint)"}); n1.textContent=`${int(t.t1)} games`; svg.append(n1);
+    const n2=S("text",{x:LX+82,y:t.ly+22,"font-size":10.5,fill:"var(--faint)"}); n2.textContent=`${int(t.t2)} games`; svg.append(n2);});
 
   // tiny P1/P2 headers over the two sub-columns
   svg.append(Object.assign(S("text",{x:X1+CW/2,y:11,"font-size":9,"text-anchor":"middle",fill:SEAT.first}),{textContent:"P1"}));
@@ -311,46 +453,128 @@ function squarify(items, W, H){
   }
   return out;
 }
-function tree(c, boxH){
-  const TW=320, TH=Math.max(90,Math.round(boxH)-32), tot=c.counters.reduce((a,d)=>a+d.n,0);
+// a card-art treemap over `leaves` [{name,n,color,nf,ns}] -- shared by King's Hand / Judge / Oathbound.
+// mkTitle(tot) makes the heading; `noun` is the hover verb ("countered", "queued", "played after").
+function treemap(leaves, boxH, mkTitle, noun){
+  const TW=320, TH=Math.max(90,Math.round(boxH)-32), tot=leaves.reduce((a,d)=>a+d.n,0);
   const box=el("div","kh-tree");
-  box.innerHTML=`<div class="kh-tt">Counter lands on <span class="mono">${int(tot)} cards</span></div>`;
+  box.innerHTML=`<div class="kh-tt">${mkTitle(tot)}</div>`;
   const map=el("div","kh-map"); map.style.width=TW+"px"; map.style.height=TH+"px";
-  squarify(c.counters,TW,TH).forEach(r=>{
+  squarify(leaves,TW,TH).forEach(r=>{
     const t=el("div","tile");
     t.style.cssText=`left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px;background:${r.d.color}`;
     t.innerHTML=`<img src="${ART[r.d.name]}" alt="${r.d.name}"><span class="tlab"><b>${r.d.name}</b>${int(r.d.n)}</span>`;
-    t.onmousemove=e=>showTip(`<div class="tn" style="color:${r.d.color}">${r.d.name}</div><div class="mono" style="color:var(--muted)">countered ${int(r.d.n)}× · ${pc(r.d.n,tot)} of the King's Hand's reveals</div>`,e.clientX,e.clientY);
+    t.onmousemove=e=>showTip(`<div class="tn" style="color:${r.d.color}">${r.d.name}</div><div class="mono" style="color:var(--muted)">${noun} ${int(r.d.n)}× · ${pc(r.d.n,tot)}</div>`+seatBar(r.d.nf,r.d.ns),e.clientX,e.clientY);
     t.onmouseleave=hideTip; map.append(t);
   });
   box.append(map); return box;
 }
+// the Mystic's "muted base value" arm -> a treemap keyed by VALUE (each tile a group of cards it silences)
+function mysticTree(c, boxH){
+  const TW=320, TH=Math.max(90,Math.round(boxH)-32), tot=c.mutes.reduce((a,d)=>a+d.n,0);
+  const box=el("div","kh-tree");
+  box.innerHTML=`<div class="kh-tt">Muted base value <span class="mono">${int(tot)} activations</span></div>`;
+  const map=el("div","kh-map"); map.style.width=TW+"px"; map.style.height=TH+"px";
+  squarify(c.mutes,TW,TH).forEach(r=>{
+    const t=el("div","mtile");
+    t.style.cssText=`left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px`;
+    t.innerHTML=`<div class="mbg">${r.d.cards.map(nm=>`<img src="${ART[nm]}" alt="${nm}">`).join("")}</div>`
+      +`<span class="mlab"><b>${r.d.value}</b><span class="mn">${int(r.d.n)} · ${pc(r.d.n,tot)}</span></span>`;
+    t.onmousemove=e=>showTip(`<div class="tn">Value ${r.d.value} — ${r.d.cards.join(", ")}</div>`
+      +`<div class="mono" style="color:var(--muted)">muted ${int(r.d.n)}× · ${pc(r.d.n,tot)} of the Mystic's ${int(tot)} activations</div>`+seatBar(r.d.nf,r.d.ns),e.clientX,e.clientY);
+    t.onmouseleave=hideTip; map.append(t);
+  });
+  box.append(map); return box;
+}
+// the Assassin's kill attempts over ROOT turns. A LINE graph -- each point is (turn, N launches) -- but every
+// point is drawn as a small floating bar split into killed% (teal) / countered% (crimson). P1 rides above the
+// zero line, P2 mirrored below. One tooltip per bar. Goes in the reserved RHS column.
+function assassinTimeline(c, boxH){
+  const TW=320, TH=Math.max(90,Math.round(boxH)-32), tot=c.timeline.reduce((a,d)=>a+d.n,0);
+  const box=el("div","kh-tree");
+  box.innerHTML=`<div class="kh-tt">Launched by turn <span class="mono">${int(tot)} kills</span></div>`;
+  const map=el("div","kh-map"); map.style.width=TW+"px"; map.style.height=TH+"px";
+  const svg=S("svg",{viewBox:`0 0 ${TW} ${TH}`,width:TW,height:TH,style:"display:block"});
+  const turns={}; let maxTurn=0, minTurn=99, maxN=1;
+  c.timeline.forEach(d=>{ maxTurn=Math.max(maxTurn,d.turn); minTurn=Math.min(minTurn,d.turn);
+    const v=turns[d.turn]=turns[d.turn]||{first:{killed:0,countered:0},second:{killed:0,countered:0}};
+    v[d.seat][d.outcome]+=d.n; });
+  Object.values(turns).forEach(v=>["first","second"].forEach(s=>{maxN=Math.max(maxN,v[s].killed+v[s].countered);}));
+  const X0=20, X1=TW-8, span=Math.max(1,maxTurn-minTurn+1), slot=(X1-X0)/span, xt=t=>X0+(t-minTurn+0.5)*slot;
+  const midY=TH/2, BH=48, BW=14, usable=TH/2-BH/2-8, ys=usable/maxN;   // count -> vertical offset from the axis
+  svg.append(S("line",{x1:X0-6,y1:midY,x2:X1,y2:midY,stroke:"var(--edge)","stroke-width":1}));
+  svg.append(Object.assign(S("text",{x:1,y:midY-4,"font-size":8,"font-weight":700,fill:SEAT.first}),{textContent:"P1"}));
+  svg.append(Object.assign(S("text",{x:1,y:midY+10,"font-size":8,"font-weight":700,fill:SEAT.second}),{textContent:"P2"}));
+  [["first",-1],["second",1]].forEach(([s,dir])=>{
+    const pts=[];
+    for(let t=minTurn;t<=maxTurn;t++){ const v=turns[t]&&turns[t][s]; if(!v) continue;
+      const n=v.killed+v.countered; if(!n) continue;
+      pts.push({t,n,killed:v.killed,countered:v.countered,x:xt(t),y:midY+dir*n*ys}); }
+    if(pts.length>1) svg.append(S("polyline",{points:pts.map(p=>`${p.x},${p.y}`).join(" "),
+      fill:"none",stroke:SEAT[s],"stroke-width":1,opacity:.4}));
+    pts.forEach(p=>{
+      const top=p.y-BH/2, killH=BH*p.killed/p.n;                       // killed at the bottom, countered on top
+      svg.append(S("rect",{x:p.x-BW/2,y:top+(BH-killH),width:BW,height:killH,rx:2,fill:RAW.landed}));
+      if(BH-killH>0.3) svg.append(S("rect",{x:p.x-BW/2,y:top,width:BW,height:BH-killH,rx:2,fill:RAW.countered}));
+      svg.append(S("rect",{x:p.x-BW/2,y:top,width:BW,height:BH,rx:2,fill:"none",stroke:SEAT[s],"stroke-width":1,opacity:.6}));
+      const hit=S("rect",{x:p.x-BW/2-3,y:top-3,width:BW+6,height:BH+6,fill:"transparent"});
+      hit.onmousemove=e=>showTip(`<div class="tn"><span style="color:${SEAT[s]}">${s==="first"?"P1":"P2"}</span> · turn ${p.t} · ${int(p.n)} launches</div>`
+        +`<div class="mono"><span style="color:${RAW.landed}">killed ${pc(p.killed,p.n)}</span> (${int(p.killed)})</div>`
+        +`<div class="mono"><span style="color:${RAW.countered}">countered ${pc(p.countered,p.n)}</span> (${int(p.countered)})</div>`,e.clientX,e.clientY);
+      hit.onmouseleave=hideTip; svg.append(hit);
+    });
+  });
+  for(let t=minTurn;t<=maxTurn;t++) if((t-minTurn)%2===0)
+    svg.append(Object.assign(S("text",{x:xt(t),y:TH-1.5,"font-size":6.5,"text-anchor":"middle",fill:"var(--faint)"}),{textContent:t}));
+  map.append(svg); box.append(map); return box;
+}
 
 const wrap=$("#funnels");
-const khRows=[];                           // King's Hand rows: size their treemap to the funnel height (below)
+const treeRows=[];                         // rows with a treemap: size it to the funnel height (below)
 DATA.cards.forEach(c=>{
   const row=el("div","fun");
   const who=el("div","who");
+  if(c.type==="stat"){                     // Elder: a numbers-only row, no sankey
+    const pct=Math.round(100*c.trumped/c.games);
+    who.innerHTML=`<img src="${ART[c.name]}" alt="${c.name}"><div class="nm">${c.name}</div>`
+      +`<div class="rate">${pct}%</div><div class="rl">of games</div>`
+      +`<div class="win">trumped royalty</div>`;
+    const panel=el("div","statpanel");
+    panel.innerHTML=
+      `<div class="stat"><div class="statn">${int(c.trumped)}</div>`
+      +`<div class="statl">times an <b>Elder trumped a royalty</b></div>`
+      +`<div class="statsub">won ${pc(c.trumped_won,c.trumped_won+c.trumped_lost)} of those games — a play, not a swing</div></div>`
+      +`<div class="stat"><div class="statn">${int(c.lost_in_hand)}</div>`
+      +`<div class="statl">games <b>lost holding an Elder</b></div>`
+      +`<div class="statsub">vs ${int(c.won_in_hand)} won with one in hand — dead weight when you're behind</div></div>`;
+    row.append(who, panel); wrap.append(row); return;
+  }
   who.innerHTML=`<img src="${ART[c.name]}" alt="${c.name}"><div class="nm">${c.name}</div>`
     +`<div class="rate">${Math.round(c.act_rate*100)}%</div><div class="rl">${c.lab.verb}</div>`
-    +`<div class="win">${int(c.window)} chances · v${c.val}</div>`;
+    +`<div class="win">${int(c.window)} chances </div>`;
   const fsvg=funnel(c);
   const rhs=el("div","rhs");               // a reserved right column on EVERY row keeps all funnels one width
-  if(c.counters){ rhs.classList.add("filled"); khRows.push({rhs,c,svg:fsvg}); }   // KH: treemap built once laid out
+  let make=null;
+  if(c.counters) make=h=>treemap(c.counters,h,tot=>`Counter lands on <span class="mono">${int(tot)} cards</span>`,"countered");
+  else if(c.mutes) make=h=>mysticTree(c,h);
+  else if(c.queued) make=h=>treemap(c.queued,h,tot=>`Queued to antechamber <span class="mono">${int(tot)} cards</span>`,"queued");
+  else if(c.followup) make=h=>treemap(c.followup,h,tot=>`Follow-up combo · value ≤6 <span class="mono">${int(tot)} plays</span>`,"then played");
+  else if(c.timeline) make=h=>assassinTimeline(c,h);
+  if(make){ rhs.classList.add("filled"); treeRows.push({rhs,svg:fsvg,make}); }
   row.append(who, fsvg, rhs);
   wrap.append(row);
 });
 
-// The treemap is the only child tall enough to stretch its row. Build it to the funnel's own rendered
-// height so the King's Hand row matches every other row instead of towering over them. (On mobile the
-// row stacks vertically, so keep the treemap tall there.)
+// A treemap is the only child tall enough to stretch its row. Build it to the funnel's own rendered
+// height so its row matches every other row instead of towering over them. (On mobile the row stacks
+// vertically, so keep the treemap tall there.)
 function fitTrees(){
   const wide=innerWidth>720;
-  khRows.forEach(r=>{
+  treeRows.forEach(r=>{
     const h=wide?r.svg.getBoundingClientRect().height:300;
     if(!h) return;
     r.rhs.innerHTML="";
-    r.rhs.appendChild(tree(r.c,h));
+    r.rhs.appendChild(r.make(h));
   });
 }
 requestAnimationFrame(fitTrees);
@@ -358,9 +582,13 @@ addEventListener("resize",fitTrees);
 
 $("#caption").innerHTML="The spread is a lesson in discipline. <b>The Inquisitor fires on sight (97%)</b> — its guess is free "
   +"information, so there's no reason to hold it — while the <b>Sentry is hoarded (21%)</b>. The <b>King's Hand is revealed only "
-  +"about half the times it could be</b>, kept back as a threat; and the <b>Assassin's kill wins outright whenever it lands</b> (both "
-  +"columns full). But look down every funnel: <b>the gold P2 column is fuller than the blue P1 column almost everywhere</b> — the same "
-  +"power, in the same spot, is simply worth more to whoever moves second. The ~59/41 seat edge, running through every ability.";
+  +"about half the times it could be</b>, kept back as a threat; and the <b>Assassin's kill wins outright whenever it lands</b> — its "
+  +"launched bar is nearly all teal, only the King's-Hand-countered sliver ever losing. But look down every funnel: "
+  +"<b>the gold P2 column is fuller than the blue P1 column almost everywhere</b> — the same "
+  +"power, in the same spot, is simply worth more to whoever moves second. The ~59/41 seat edge, running through every ability. "
+  +"Further down: the <b>Oathbound</b> mostly lands as a plain 6 and only sometimes spends itself to beat a bigger card; the "
+  +"<b>Judge</b> queues its catch into the antechamber more often than not; and the <b>Elder</b> — a 3 that only trumps royalty — "
+  +"is the deck's clearest dead weight, lost in hand more than any other card.";
 </script>
 """
 

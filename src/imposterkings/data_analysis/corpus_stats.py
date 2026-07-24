@@ -138,13 +138,19 @@ class Stats:
         self.combo: Dict[Tuple[str, ...], List[int]] = defaultdict(lambda: [0, 0, 0, 0])
         self.may = defaultdict(lambda: Counter())        # card name -> Counter of outcome buckets
         self.mystic_number: Counter = Counter()
+        self.mystic_number_seat: Counter = Counter()     # (muted value, "first"|"second") -> n
         self.passive = defaultdict(lambda: Counter())    # card name -> Counter
         self.kh: Counter = Counter()                     # countered card name -> n
+        self.kh_seat: Counter = Counter()                # (countered name, "first"|"second") -> n: WHO revealed
         self.kh_phase: Counter = Counter()
         self.guess = defaultdict(lambda: Counter())      # (source, guessed name) -> Counter
         self.stack_trade = defaultdict(lambda: Counter())  # (trade label, card name) -> Counter: which card
         self.fool = Counter()                            # Sentry swaps / Fool grabs, by NAME (index->card)
         self.assassin = Counter()
+        self.assassin_turn: Counter = Counter()          # (root turn, "killed"|"countered", seat) -> n launches
+        self.oathbound_followup: Counter = Counter()     # (Oathbound follow-up card name, seat) -> n
+        self.judge_queue: Counter = Counter()            # (queued card name, seat) -> n
+        self.in_hand_at_end: Counter = Counter()         # (card name, "won"|"lost") -> games held to the end
         self.reasons: Counter = Counter()
         self.reasons_seat: Counter = Counter()           # (reason, "first"|"second") -> n: HOW each seat wins
         self.last_pair: Counter = Counter()
@@ -154,6 +160,7 @@ class Stats:
     def add(self, g: Game) -> None:
         self.games += 1
         self._starter = g.starting_player                # who moved first this game (for per-seat outcomes)
+        self._root_turn = self._root_turns(g)            # ply.index -> root-turn number (for the Assassin timeline)
         if not g.gen.get("self_play", True):
             self.asymmetric = True           # the two seats are different bots -- policy tables are pooled
         self._turn_order(g)
@@ -161,6 +168,12 @@ class Stats:
         self._plies(g)
         self._fool_and_assassin(g)
         self._react_funnels(g)
+        self._judge_funnel(g)
+        if g.terminal is not None:                       # what's still in hand when the game ends, by outcome
+            for seat in (0, 1):
+                out = "won" if g.won(seat) else "lost"
+                for nm in {cards.card_name(c) for c in g.terminal.hands[seat]}:
+                    self.in_hand_at_end[(nm, out)] += 1
         reason = win_reason(g)
         self.reasons[reason] += 1
         self.reasons_seat[(reason, "first" if g.winner == g.starting_player else "second")] += 1
@@ -225,6 +238,9 @@ class Stats:
 
             if p.phase in PLAY_PHASES and p.action.kind == ActionKind.PLAY_CARD:
                 self._passive(p, won)
+                if p.phase == StepKind.OATHBOUND_SECOND:   # the free follow-up card the override bought
+                    seat = "first" if p.seat == self._starter else "second"
+                    self.oathbound_followup[(cards.card_name(p.action.card), seat)] += 1
 
             elif p.phase == StepKind.ABILITY_MAY:
                 self._may(p, nxt, won)
@@ -239,19 +255,23 @@ class Stats:
                 # WHAT it countered lives in the step, not the action. The nested anti-Assassin window
                 # carries no `source` at all (abilities.py:444) -- key it by phase or you will silently
                 # attribute the block to whatever card happened to be leading the stack.
-                if p.phase == StepKind.REACTION_KH_VS_ASSASSIN:
-                    self.kh["Assassin"] += 1
-                elif p.step.source is not None:
-                    self.kh[cards.card_name(p.step.source)] += 1
+                nm = "Assassin" if p.phase == StepKind.REACTION_KH_VS_ASSASSIN \
+                    else (cards.card_name(p.step.source) if p.step.source is not None else None)
+                if nm is not None:
+                    self.kh[nm] += 1
+                    self.kh_seat[(nm, "first" if p.seat == self._starter else "second")] += 1
                 self.kh_phase[p.phase.name] += 1
 
     def _passive(self, p: Ply, won: bool) -> None:
         st, card = p.state, p.action.card
         name = cards.card_name(card)
         muted = cards.card_value(card) in st.muted_values
+        seat = "first" if p.seat == self._starter else "second"   # per-seat so the funnel can split P1/P2
         row = self.passive[name]
         row["played"] += 1
+        row[f"played_{seat}"] += 1
         row["won" if won else "lost"] += 1
+        row[("won_" if won else "lost_") + seat] += 1
         if muted:
             row["muted_at_play"] += 1
             return                                   # a muted card has NO ability -- nothing could fire
@@ -259,10 +279,12 @@ class Stats:
             if st.royalty_present():                 # abilities.py:139 -- it lands at 9 instead of 7
                 row["fired"] += 1
                 row["fired_won" if won else "fired_lost"] += 1
+                row[("fired_won_" if won else "fired_lost_") + seat] += 1
             return
         if override_fired(st, p.seat, card, ascended=p.phase == StepKind.ASCEND):
             row["fired"] += 1
             row["fired_won" if won else "fired_lost"] += 1
+            row[("fired_won_" if won else "fired_lost_") + seat] += 1
 
     def _may(self, p: Ply, nxt: Optional[Ply], won: bool) -> None:
         source = p.step.source
@@ -282,6 +304,7 @@ class Stats:
             row["activated"] += 1
             if cards.card_ability(source) == Ability.MYSTIC:
                 self.mystic_number[p.action.number] += 1
+                self.mystic_number_seat[(p.action.number, seat)] += 1
             # The King's-Hand window opens on the DECLARATION, so the very next ply decides whether the
             # ability actually happened. (An Inquisitor whose guess MISSES gets no window at all -- there
             # is no effect to counter -- so 'no window' means it landed unopposed, not that it was skipped.)
@@ -405,6 +428,8 @@ class Stats:
                 asn[key] += 1
                 asn[f"{key}_won" if aw else f"{key}_lost"] += 1
                 asn[(f"{key}_won_" if aw else f"{key}_lost_") + s] += 1
+                self.assassin_turn[(self._root_turn.get(p.index, 0),
+                                    "countered" if revealed else "killed", s)] += 1
         for seat in (0, 1):                                   # held the Assassin into play but never launched
             if assassin not in g.dealt.hands[seat] or seat in tried:
                 continue
@@ -417,6 +442,57 @@ class Stats:
             asn["declined"] += 1
             asn["declined_won" if aw else "declined_lost"] += 1
             asn[("declined_won_" if aw else "declined_lost_") + s] += 1
+
+    def _root_turns(self, g: Game) -> Dict[int, int]:
+        """Map every ply.index to its ROOT-turn number (1..~16), comparable across games. A turn starts with
+        the single MAIN/ASCEND step _begin_turn pushes; the King's-Hand resume pushes an extra MAIN for the
+        SAME player (abilities.py:360), so only a CHANGE of turn_player counts as a new turn (real turns
+        alternate). Sub-plies (reactions, ability steps) inherit the turn in progress."""
+        turns: Dict[int, int] = {}
+        turn, last = 0, None
+        for p in g.plies:
+            if p.phase in (StepKind.MAIN, StepKind.ASCEND) and p.state.turn_player != last:
+                turn += 1
+                last = p.state.turn_player
+            turns[p.index] = turn
+        return turns
+
+    def _judge_funnel(self, g: Game) -> None:
+        """Judge recast as an activate/decline funnel (beside the optional abilities). The guess itself is
+        mandatory, so the CHOICE is the follow-up: given a correct, uncountered guess, do you schedule a hand
+        card into your antechamber? Arms: countered (a King's Hand stopped the guess), landed (scheduled a
+        card -> judge_queue), declined (reached the step but passed). A missed guess has no ability -> no window."""
+        row = self.may["Judge"]
+        for i, p in enumerate(g.plies):
+            if p.phase != StepKind.ABILITY_GUESS or cards.card_ability(p.step.source) != Ability.JUDGE:
+                continue
+            guesser = p.step.actor
+            held = any(cards.card_name(c) == p.action.name for c in p.state.hands[1 - guesser])
+            if not held:
+                continue                                  # a miss -> no schedule offered -> no window
+            won = g.won(guesser)
+            seat = "first" if guesser == self._starter else "second"
+            row["window_opened"] += 1
+            nxt = g.plies[i + 1] if i + 1 < len(g.plies) else None
+            countered = (nxt is not None and nxt.phase == StepKind.REACTION_KINGSHAND
+                         and nxt.action.kind == ActionKind.REVEAL_KINGSHAND)
+            if countered:
+                arm = "countered"
+            else:
+                sched = next((q for q in g.plies[i + 1:i + 5]
+                              if q.phase == StepKind.ABILITY_HAND_CARD and q.step.guess is not None
+                              and q.seat == guesser), None)
+                if sched is not None and sched.action.kind == ActionKind.CHOOSE_HAND_CARD \
+                        and sched.action.card is not None:
+                    arm = "landed"
+                    self.judge_queue[(cards.card_name(sched.action.card), seat)] += 1
+                else:
+                    arm = "declined"
+            if arm != "declined":                         # activated = went for the queue (landed OR countered)
+                row["activated"] += 1
+            row[arm] += 1
+            row[f"{arm}_won" if won else f"{arm}_lost"] += 1
+            row[(f"{arm}_won_" if won else f"{arm}_lost_") + seat] += 1
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -540,7 +616,31 @@ def tables(s: Stats) -> Dict[str, List[dict]]:
         "hand_combos": _rows_combo(s),
         "ability_usage": _rows_counter(s, s.may, "card"),
         "passives": _rows_counter(s, s.passive, "card"),
-        "events_kingshand": [{"corpus": s.name, "countered": k, "n": v} for k, v in s.kh.most_common()],
+        "events_kingshand": [{"corpus": s.name, "countered": k, "n": v,
+                              "n_first": s.kh_seat[(k, "first")], "n_second": s.kh_seat[(k, "second")]}
+                             for k, v in s.kh.most_common()],
+        "events_mystic": [{"corpus": s.name, "value": k, "n": v,
+                           "n_first": s.mystic_number_seat[(k, "first")],
+                           "n_second": s.mystic_number_seat[(k, "second")]}
+                          for k, v in sorted(s.mystic_number.items())],
+        "events_assassin_turn": [{"corpus": s.name, "turn": t, "outcome": o, "seat": st, "n": v}
+                                 for (t, o, st), v in sorted(s.assassin_turn.items())],
+        "events_oathbound": [{"corpus": s.name, "followup": nm,
+                              "value": cards.card_value(cards.card_ids_for_name(nm)[0]),
+                              "n": s.oathbound_followup[(nm, "first")] + s.oathbound_followup[(nm, "second")],
+                              "n_first": s.oathbound_followup[(nm, "first")],
+                              "n_second": s.oathbound_followup[(nm, "second")]}
+                             for nm in sorted({k[0] for k in s.oathbound_followup})],
+        "events_judge": [{"corpus": s.name, "queued": nm,
+                          "n": s.judge_queue[(nm, "first")] + s.judge_queue[(nm, "second")],
+                          "n_first": s.judge_queue[(nm, "first")],
+                          "n_second": s.judge_queue[(nm, "second")]}
+                         for nm in sorted({k[0] for k in s.judge_queue})],
+        "events_elder": [{"corpus": s.name, "trumped": s.passive["Elder"]["fired"],
+                          "trumped_won": s.passive["Elder"]["fired_won"],
+                          "trumped_lost": s.passive["Elder"]["fired_lost"], "games": s.games,
+                          "lost_in_hand": s.in_hand_at_end[("Elder", "lost")],
+                          "won_in_hand": s.in_hand_at_end[("Elder", "won")]}],
         "events_guess": sorted(guess_rows, key=lambda r: -r["n"]),
         "events_fool": [{"corpus": s.name, "bucket": k, "n": v} for k, v in sorted(s.fool.items())],
         "events_assassin": [{"corpus": s.name, "bucket": k, "n": v} for k, v in sorted(s.assassin.items())],
