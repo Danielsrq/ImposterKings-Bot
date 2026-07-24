@@ -125,6 +125,9 @@ def lr_lambda(step: int, total: int, warmup: int) -> float:
 def run(rows: TokenRows, cfg: AttnConfig, hp: Dict) -> Dict:
     torch.manual_seed(hp["seed"])
     device = resolve_device(hp.get("device", "auto"))
+    lam = float(hp.get("value_lambda", 0.0))               # value target = (1-lam)*q + lam*z (game outcome)
+    if lam and rows.y is not None and rows.z is not None:  # z is already stored per row; blend ONCE, in place,
+        rows.y = ((1.0 - lam) * rows.y + lam * rows.z).astype(np.float32)   # so every downstream read uses it
     tr, va = game_split(rows.game_id, hp["val_frac"], hp["seed"])
     tri, vai = np.where(tr)[0], np.where(va)[0]
 
@@ -232,6 +235,9 @@ def main(argv=None) -> None:
     p.add_argument("--patience", type=int, default=5, help="early stopping; --schedule constant only")
     p.add_argument("--val-frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--value-lambda", type=float, default=0.0,
+                   help="blend the value target: (1-lambda)*q + lambda*z, where z is the game outcome "
+                        "(+-1) already stored per row. 0 = pure MCTS q (current default); 1 = pure outcome.")
     p.add_argument("--d-model", type=int, default=64)
     p.add_argument("--n-layers", type=int, default=1)
     p.add_argument("--n-heads", type=int, default=4)
@@ -246,8 +252,10 @@ def main(argv=None) -> None:
                      ffn_hidden=args.ffn_hidden, dropout=args.dropout,
                      feat=rows.feat)                    # featurization follows the dataset (v1/v2)
     hp = {k: getattr(args, k) for k in ("epochs", "batch", "lr", "patience", "val_frac", "seed", "device",
-                                        "schedule", "warmup_frac")}
-    print(f"loaded {len(rows)} rows; cfg={cfg}; target=q; device={resolve_device(args.device)}", flush=True)
+                                        "schedule", "warmup_frac", "value_lambda")}
+    tgt_label = "q" if not args.value_lambda else f"blend-z{args.value_lambda:g}"
+    print(f"loaded {len(rows)} rows; cfg={cfg}; target={tgt_label}; device={resolve_device(args.device)}",
+          flush=True)
 
     r = run(rows, cfg, hp)
     print(f"\nparams {r['params']}  epochs {r['epochs']}  steps {r['total_steps']} "
@@ -292,7 +300,7 @@ def main(argv=None) -> None:
     out = os.path.join(args.out_dir, f"attn_d{cfg.d_model}_L{cfg.n_layers}.pt")
     keys = ("train_mse", "val_mse", "final_val_mse", "best_val_mse", "tail3_val_mse", "val_mae",
             "baseline_mse", "top1_bestq", "top1_chosen", "recall2", "spearman")
-    save_attention(out, r["model"], meta={"target": "q", "npz": args.npz, "seconds": r["seconds"],
+    save_attention(out, r["model"], meta={"target": tgt_label, "npz": args.npz, "seconds": r["seconds"],
                    "config": vars(args), "metrics": {k: r[k] for k in keys},
                    "by_corpus": r["by_corpus"],
                    "history": r["history"]})       # loss-vs-step travels WITH the checkpoint
