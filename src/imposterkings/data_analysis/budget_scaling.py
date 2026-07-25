@@ -52,7 +52,7 @@ Spec = Tuple  # ("fixed", n) | ("hybrid", k, l) | ("branching", k, l)
 # --- spec -> agent / label / root-budget ----------------------------------------------
 
 def _lo_hi(spec: Spec):
-    return (spec[3] if len(spec) > 3 else 64, spec[4] if len(spec) > 4 else 4096)
+    return (spec[3] if len(spec) > 3 else 256, spec[4] if len(spec) > 4 else 4096)
 
 
 def _budget_of(spec: Spec):
@@ -193,7 +193,7 @@ def _chunks(deals: int, size: int) -> List[List[int]]:
 
 def run_study(k_values: List[int], l: int, baselines: List[Spec], deals: int, base_seed: int,
               workers: int, independent_rng: bool, collect_eval: bool, chunk: int = 10,
-              lo: int = 64, hi: int = 4096) -> Dict:
+              lo: int = 256, hi: int = 4096) -> Dict:
     from joblib import Parallel, delayed
     from tqdm import tqdm
 
@@ -402,7 +402,7 @@ def main(argv=None) -> None:
     p.add_argument("--chunk", type=int, default=10,
                    help="deals per parallel job (default 10 = 20 mirrored games/job)")
     p.add_argument("--hi", type=int, default=4096, help="per-decision iteration clamp ceiling")
-    p.add_argument("--lo", type=int, default=64, help="per-decision iteration clamp floor")
+    p.add_argument("--lo", type=int, default=256, help="per-decision iteration clamp floor")
     p.add_argument("--out-dir", default=os.path.join("results", "budget_scaling"))
     p.add_argument("--no-plot", action="store_true")
     p.add_argument("--no-eval", action="store_true")

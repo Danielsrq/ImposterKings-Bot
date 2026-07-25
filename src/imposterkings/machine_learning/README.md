@@ -19,9 +19,35 @@ python -m imposterkings.machine_learning.train --npz ... --sweep "16,16;32,32;64
 
 The output neuron predicts the **MCTS action-value `q`** (`mean_q` of that action). `z` (game outcome) is a
 **state** value — identical for every candidate of a decision — so it can't rank *actions*; `q` differs per
-action and is the whole point of a move-evaluator. (`z` is kept in the npz for later `λ·z+(1−λ)·q` blend
-experiments.) Loss is MSE **weighted by `visit_share`** so well-searched (reliable) `q`'s dominate; the
+action and is the whole point of a move-evaluator. (`z` is kept in the npz for the `λ·z+(1−λ)·q` blend
+experiment below.) Loss is MSE **weighted by `visit_share`** so well-searched (reliable) `q`'s dominate; the
 train/val split is **by game** (rows within a game are correlated).
+
+### Verdict on the `z` blend (2026-07)
+
+We ran the controlled A/B: gen2.5's exact 6k-game tensor, one net at **λ=0** (pure `q`, the deployed gen2.5)
+vs one at **λ=0.5** (`models/v3c_gen25_z50`) — only λ differs. Against a fixed hybrid-k20-l3 opponent the two
+were a wash (63.0% vs 62.5%), so the decider was a **direct head-to-head, 200 mirrored deals**: pure-`q` beat
+the blend **56.2% vs 43.8%** (Wilson CI [52.3, 60.1], excludes 50). **Keep λ=0.** Two structural reasons it
+underperforms here, independent of tuning:
+
+- **This is an action-in model, so `z` can't teach it to rank.** Each row is `(state, action)` and the value
+  head *is* the Q head (policy = `softmax(Q)` at inference). But `z` is the *same* number for every candidate
+  action of a decision — feeding the action in doesn't change the target. Blending `z` in therefore pulls all
+  of a decision's candidate values toward one shared outcome, **flattening the within-decision spread the
+  policy is built on**. It recalibrates value *levels*, never *rankings* — and the ranking is the whole
+  product. (`q`, by contrast, differs per action, which is why it can supervise a move-evaluator at all.)
+- **`z` is high-variance and would need far more data.** `q` is a bootstrapped, low-variance (if biased)
+  estimate; `z` is a single ±1 Monte-Carlo sample of the outcome — unbiased but very noisy, and with the
+  ~75% deal-variance in this game one game's `z` is a near-coin-flip label for the state. MC variance falls
+  as ~1/N, so recovering the true expectation from `z` needs **many** more games covering the same states
+  than `q` does. At 6k games `z` is mostly noise; it *might* help at a much larger corpus, but only as a
+  *level* correction (see above), never to sharpen action ranking.
+
+Caveat that keeps the door ajar: the offline ranking metrics (top-1 / top-2 recall) implicitly treat MCTS
+`q` as ground truth, so they *cannot* credit `z` for correcting search bias — which is exactly why the
+head-to-head, not val-MSE, was the arbiter. If the search were later shown to be materially biased, a
+small-λ blend (e.g. 0.25) on a **much** larger corpus is the only version worth revisiting.
 
 ## Components
 

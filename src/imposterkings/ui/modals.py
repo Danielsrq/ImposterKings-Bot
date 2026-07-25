@@ -116,11 +116,11 @@ def draw_settings_overlay(surface, fonts, engine, mouse, nn_available=True,
     else:
         sliders = [slider_row(by + 130, "k"), slider_row(by + 196, "l")]
         if engine["mode"] == "nn":
-            preview = "NN eval-head + hybrid clamp(k * eff_n(l) * (1 + opp_cards), 64, 4096)"
+            preview = "NN eval-head + hybrid clamp(k * eff_n(l) * (1 + opp_cards), 256, 4096)"
         elif engine["mode"] == "hybrid":
-            preview = "clamp(k * eff_n(l) * (1 + opp_cards), 64, 4096)"
+            preview = "clamp(k * eff_n(l) * (1 + opp_cards), 256, 4096)"
         else:
-            preview = "clamp(k * eff_n(l), 64, 4096)"
+            preview = "clamp(k * eff_n(l), 256, 4096)"
     if show_ckpt:                                     # WHICH net drives NN+MCTS (MLP or attention)
         cy = by + 246
         widgets.text(surface, small, "NN checkpoint:", (bx + 20, cy - 22), GOLD)

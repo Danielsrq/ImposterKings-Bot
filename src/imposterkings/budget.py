@@ -61,7 +61,7 @@ def fixed(n: int) -> Budget:
     return f
 
 
-def branching(k: int, l: int = 3, lo: int = 64, hi: int = 4096) -> Budget:
+def branching(k: int, l: int = 3, lo: int = 256, hi: int = 4096) -> Budget:
     """``clamp(k * effective_n, lo, hi)`` -- ~k simulations per legal option (a sub-decision card counts as
     ``l``), so a 15-way guess and a Soldier/Mystic card selection both get a real budget. ``k`` is the
     primary strength knob; ``l`` funds sub-decision subtrees at card selection."""
@@ -71,7 +71,7 @@ def branching(k: int, l: int = 3, lo: int = 64, hi: int = 4096) -> Budget:
     return f
 
 
-def hybrid(k1: int, l: int = 3, lo: int = 64, hi: int = 4096) -> Budget:
+def hybrid(k1: int, l: int = 3, lo: int = 256, hi: int = 4096) -> Budget:
     """``clamp(k1 * effective_n * (1 + opp_cards), lo, hi)`` -- branching (a sub-decision card counts as
     ``l``) AND opponent-card uncertainty, so the budget is highest early and on high-branching /
     sub-decision decisions, tapering late."""
@@ -81,7 +81,7 @@ def hybrid(k1: int, l: int = 3, lo: int = 64, hi: int = 4096) -> Budget:
     return f
 
 
-def make_budget(mode: str, k: int = 100, l: int = 3, lo: int = 64, hi: int = 4096) -> Budget:
+def make_budget(mode: str, k: int = 100, l: int = 3, lo: int = 256, hi: int = 4096) -> Budget:
     """Build a budget from a mode name (for CLI / benchmark specs)."""
     if mode == "hybrid":
         return hybrid(k, l, lo, hi)
