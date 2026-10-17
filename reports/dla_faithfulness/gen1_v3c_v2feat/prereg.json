@@ -1,0 +1,109 @@
+{
+ "tag": "gen1_v3c_v2feat",
+ "ckpt": "models/gen1_v3c_v2feat/attn_d64_L2.pt",
+ "ckpt_sha256": "35e57f5d7c4750473de46bf43afac96cdd8ebfef5d440d2b53faef2cdeb710f6",
+ "npz": "datasets/tensors/gen1_v3c_tokens_v2.npz",
+ "npz_sha256": "5512a5ac2f65b6beb478b69975969ad96279d0f2074adcf21ea5654ebd9af258",
+ "means_sha256": "df6d9e6e9fe0f4553d07b0692bc074332080a04e8723e6a580a9ed1588f71740",
+ "git_head": "adf9fffa2452ab1615500f5a63578f06ba151bf0",
+ "created": "2026-10-17 21:41:12",
+ "selection_evidence": {
+  "ptop_assassin_per_L_last_head": [
+   0.14671063757821748,
+   0.12751564349737865,
+   0.19583967529173008,
+   0.14975477760865888
+  ],
+  "flip_minus_best_assassin_dla_per_L_last_head": {
+   "0": -0.0033755129458398992,
+   "1": -0.0002632073164733501,
+   "2": -0.002708722807428249,
+   "3": -9.700018344290004e-05
+  },
+  "l0_assassin_mass_per_head": [
+   0.050462067920613085,
+   0.013028627819171698,
+   0.028156078619909618,
+   0.2239739607233289
+  ]
+ },
+ "heads": {
+  "H_obs": [
+   1,
+   2
+  ],
+  "H_con": [
+   1,
+   0
+  ],
+  "H_L0": [
+   0,
+   3
+  ],
+  "README_head4_L0": [
+   0,
+   3
+  ],
+  "README_head4_L1": [
+   1,
+   3
+  ]
+ },
+ "targets": [
+  {
+   "layer": 1,
+   "head": 2,
+   "names": [
+    "H_obs"
+   ]
+  },
+  {
+   "layer": 1,
+   "head": 0,
+   "names": [
+    "H_con"
+   ]
+  },
+  {
+   "layer": 0,
+   "head": 3,
+   "names": [
+    "H_L0",
+    "README_head4_L0"
+   ]
+  },
+  {
+   "layer": 1,
+   "head": 3,
+   "names": [
+    "README_head4_L1"
+   ]
+  }
+ ],
+ "thresholds": {
+  "coverage_adequate_r2": 0.5,
+  "coverage_adequate_sign": 0.8,
+  "coverage_minority_r2": 0.25,
+  "const_rho": 0.1,
+  "null_ratio": 0.5,
+  "cf_spearman": 0.3,
+  "cf_sign": 0.7,
+  "sanity_spearman": 0.2,
+  "P1_pp": 0.02,
+  "P3_recovery": 0.25,
+  "alpha": 0.05
+ },
+ "predictions": {
+  "P1": "mean-ablating the head raises P(F>0) in the threat stratum by >= 2pp (val-B)",
+  "P2": "dF_threat - dF_safe > 0 (game-bootstrap CI excludes 0, Holm) AND the head ranks 1st on it",
+  "P3": "E[dF ablation] / E[dF lacks-CF] >= 0.25 in the threat stratum",
+  "G": "greedy games: paired d(assassin_death) > 0 at Holm p<.05, largest of all heads, specific; falsified if the 95% CI upper bound < +2pp",
+  "null_from_1b": "Assassin DLA varies across candidates"
+ },
+ "games": {
+  "deals": null,
+  "base_seed": 90000000,
+  "opponent": "intact copy (greedy)",
+  "mode": "mean"
+ }
+}
