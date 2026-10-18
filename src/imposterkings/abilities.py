@@ -255,14 +255,19 @@ def _after_guess_kingshand_declined(state: GameState, step: PendingStep) -> Game
     defender = step.actor
     ability = cards.card_ability(source)
     if ability == Ability.INQUISITOR:
-        held = tuple(c for c in state.hands[defender] if cards.card_name(c) == name)
-        new_def = tuple(c for c in state.hands[defender] if c not in held)
-        new_ante = state.antechambers[defender] + held
-        # All copies of the name are extracted to the (public) antechamber -> the hand now lacks it.
+        # Exactly ONE copy is forced into the (public) antechamber, even when the defender holds two
+        # (copies are functionally identical; take the lowest id). The hand provably lacks the name
+        # only for a single-copy name -- with a duplicate, the other copy may still be in hand. The
+        # 'has' fact for the name is voided by the hand-diff reconciliation in with_.
+        taken = next(c for c in state.hands[defender] if cards.card_name(c) == name)
+        new_def = tuple(c for c in state.hands[defender] if c != taken)
+        new_ante = state.antechambers[defender] + (taken,)
+        lacks = (_know_add(state.hand_lacks, owner, name) if len(cards.card_ids_for_name(name)) == 1
+                 else state.hand_lacks)
         return state.advance(
             hands=_set_index(state.hands, defender, new_def),
             antechambers=_set_index(state.antechambers, defender, new_ante),
-            hand_lacks=_know_add(state.hand_lacks, owner, name),
+            hand_lacks=lacks,
         )
     if ability == Ability.JUDGE:
         return state.advance(PendingStep(StepKind.ABILITY_HAND_CARD, owner, source=source, guess=name))

@@ -107,14 +107,24 @@ def test_landed_guess_records_has():
     assert "Queen" in st2.hand_has[0] and "Queen" not in st2.hand_lacks[0]
 
 
-def test_inquisitor_extract_records_lacks():
+def test_inquisitor_forces_one_copy_of_a_duplicate():
     st = _guessstate(0, cid("Inquisitor"),
                      hand0=(cid("Inquisitor"),), hand1=(cid("Elder"), cid("Elder", 1), cid("Fool")))
     st2 = st.apply(Action(ActionKind.GUESS_CARD, name="Elder"))     # held -> King's-Hand window
     st3 = st2.apply(Action(ActionKind.DECLINE_REACTION))            # no KH -> effect applies
-    assert "Elder" in st3.hand_lacks[0]                             # all copies extracted
-    assert all(card_name(c) != "Elder" for c in st3.hands[1])
-    assert any(card_name(c) == "Elder" for c in st3.antechambers[1])
+    assert st3.antechambers[1] == (cid("Elder"),)                   # exactly one copy is forced
+    assert st3.hands[1] == (cid("Elder", 1), cid("Fool"))           # the other stays in hand
+    assert "Elder" not in st3.hand_lacks[0]                         # so the hand may still hold one
+    assert "Elder" not in st3.hand_has[0]                           # and >=1 is no longer proven
+
+
+def test_inquisitor_extract_of_a_single_copy_records_lacks():
+    st = _guessstate(0, cid("Inquisitor"),
+                     hand0=(cid("Inquisitor"),), hand1=(cid("Warlord"), cid("Fool")))
+    st2 = st.apply(Action(ActionKind.GUESS_CARD, name="Warlord"))
+    st3 = st2.apply(Action(ActionKind.DECLINE_REACTION))
+    assert st3.antechambers[1] == (cid("Warlord"),)
+    assert "Warlord" in st3.hand_lacks[0]                           # the only Warlord is gone
 
 
 # --- pruning as cards move (reconciliation in with_) -------------------------------------

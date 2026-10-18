@@ -78,7 +78,7 @@ CARD_TEXT: Dict[str, str] = {
         f"+{rules.SOLDIER_BONUS} automatically (leading at {5 + rules.SOLDIER_BONUS}), and you MAY then "
         f"disgrace up to {rules.SOLDIER_DISGRACE_CAP} cards on the throne -- the Soldier included.",
     "Inquisitor":
-        "You MAY name a card. If your opponent holds it, they MUST queue it into THEIR antechamber. Any "
+        "You MAY name a card. If your opponent holds it, they MUST queue ONE copy into THEIR antechamber. Any "
         "value -- even the Fool, which the Judge cannot touch.",
     "Elder":
         "May be played over ANY royalty, whatever its value.",
