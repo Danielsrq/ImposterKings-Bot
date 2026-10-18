@@ -98,6 +98,8 @@ def build(data_dir, out_path: str, limit: Optional[int] = None, feat: str = "v1"
     variable-length path, byte-identical."""
     if feat == "v2":
         return _build_v2(data_dir, out_path, limit)
+    if feat == "v3":
+        return _build_v3(data_dir, out_path, limit)
     dirs, caps, preds = _parse_data(data_dir)
     files = _shards(dirs)
     try:
@@ -274,6 +276,128 @@ def _build_v2(data_dir, out_path: str, limit: Optional[int]) -> Dict:
     return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
 
 
+def _build_v3(data_dir, out_path: str, limit: Optional[int]) -> Dict:
+    """The v3 (late-fusion, Study 11) build: ONE row per DECISION -- the candidate-independent state once
+    (``features3.tokenize_state3``) + its candidates as pointer records padded to ``MAX_CANDS`` (kind = -1
+    on padding), with per-candidate labels ``y`` (mean_q) / ``w`` (visit share). Same replay, caps,
+    predicates and desync skip as v2, so the same games (and ``game_split``) come out. Each decision's
+    recorded candidates are checked against ``legal_moves()``; mismatches are counted, not hidden."""
+    from . import features3 as F3
+    dirs, caps, preds = _parse_data(data_dir)
+    files = _shards(dirs)
+    try:
+        from tqdm import tqdm
+        files = tqdm(files, desc="shards", unit="shard")
+    except Exception:
+        pass
+
+    K = F3.MAX_CANDS
+    cols: Dict[str, list] = {k: [] for k in ("cards", "card_depth", "hands", "kings", "decision", "src_ptr",
+                                             "cand_kind", "cand_ptr_a", "cand_ptr_b", "cand_name",
+                                             "cand_number", "y", "w", "z", "chosen", "game_id")}
+    n_games = n_skipped = n_cand_mismatch = 0
+    seen: set = set()
+    per_dir: Dict[str, int] = {}
+    for src, f in files:
+        if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
+            continue
+        for rec in read_jsonl(f):
+            if caps.get(src) and per_dir.get(src, 0) >= caps[src]:
+                break
+            if not _match(rec, preds.get(src, {})):
+                continue
+            g = rec["deal_seed"]
+            _guard_seed(g, seen, f, paired=bool((rec.get("gen") or {}).get("paired_deals")))
+            rewards = rec["rewards"]
+            st = GameState.deal(np.random.default_rng(g), rec.get("starting_player"))
+            mark = len(cols["game_id"])
+            desynced = False
+            for d in rec["decisions"]:
+                a = dict_to_action(d["chosen"])
+                legal = st.legal_moves()
+                if a not in legal:
+                    desynced = True
+                    break
+                cands = d.get("candidates") or []
+                if cands:
+                    moves = [dict_to_action(c["move"]) for c in cands]
+                    if set(moves) != set(legal):
+                        n_cand_mismatch += 1
+                    view = st.information_set(d["seat"])
+                    s = F3.tokenize_state3(view, legal_moves=legal)
+                    c = F3.encode_candidates(view, s, moves)
+                    n = len(moves)
+
+                    def pad(x, fill, dtype):
+                        out = np.full(K, fill, dtype)
+                        out[:n] = x
+                        return out
+
+                    cols["cards"].append(s.cards); cols["card_depth"].append(s.card_depth)
+                    cols["hands"].append(s.hands); cols["kings"].append(s.kings)
+                    cols["decision"].append(s.decision); cols["src_ptr"].append(s.src_ptr)
+                    cols["cand_kind"].append(pad(c.kind, -1, np.int8))
+                    cols["cand_ptr_a"].append(pad(c.ptr_a, -1, np.int8))
+                    cols["cand_ptr_b"].append(pad(c.ptr_b, -1, np.int8))
+                    cols["cand_name"].append(pad(c.name, -1, np.int8))
+                    cols["cand_number"].append(pad(c.number, -1, np.int8))
+                    cols["y"].append(pad([cc["mean_q"] for cc in cands], 0.0, np.float32))
+                    cols["w"].append(pad([cc["visit_share"] for cc in cands], 0.0, np.float32))
+                    cols["z"].append(rewards[d["seat"]])
+                    cols["chosen"].append(moves.index(a))
+                    cols["game_id"].append(g)
+                st = st.apply(a)
+            if desynced:
+                for lst in cols.values():
+                    del lst[mark:]
+                n_skipped += 1
+                continue
+            n_games += 1
+            per_dir[src] = per_dir.get(src, 0) + 1
+            if limit and n_games >= limit:
+                break
+        if limit and n_games >= limit:
+            break
+    if n_skipped:
+        print(f"  WARNING: skipped {n_skipped} desynced game(s) (corpus predates a rules change)")
+    if n_cand_mismatch:
+        print(f"  NOTE: {n_cand_mismatch} decision(s) whose recorded candidates != legal_moves()")
+
+    D = len(cols["game_id"])
+    arrs = dict(
+        cards=np.asarray(cols["cards"], np.float32).reshape(D, 18, F3.CARD_DIM),
+        card_depth=np.asarray(cols["card_depth"], np.int8).reshape(D, 18),
+        hands=np.asarray(cols["hands"], np.float32).reshape(D, 2, F3.HAND_DIM),
+        kings=np.asarray(cols["kings"], np.float32).reshape(D, 2, F3.KING_DIM),
+        decision=np.asarray(cols["decision"], np.float32).reshape(D, F3.DECISION_DIM),
+        src_ptr=np.asarray(cols["src_ptr"], np.int8),
+        **{k: np.asarray(cols[k], np.int8).reshape(D, K) for k in
+           ("cand_kind", "cand_ptr_a", "cand_ptr_b", "cand_name", "cand_number")},
+        y=np.asarray(cols["y"], np.float32).reshape(D, K), w=np.asarray(cols["w"], np.float32).reshape(D, K),
+        z=np.asarray(cols["z"], np.float32), chosen=np.asarray(cols["chosen"], np.int8),
+        game_id=np.asarray(cols["game_id"], np.int64), decision_id=np.arange(D, dtype=np.int64),
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    tmp = out_path + ".tmp.npz"
+    np.savez_compressed(tmp, **arrs)
+    os.replace(tmp, out_path)
+    n_rows = int((arrs["cand_kind"] >= 0).sum())
+    meta = {"feat": "v3", "card_dim": F3.CARD_DIM, "hand_dim": F3.HAND_DIM, "king_dim": F3.KING_DIM,
+            "decision_dim": F3.DECISION_DIM, "max_cands": K, "target": "q", "layout": "per-decision",
+            "n_rows": n_rows, "n_games": n_games, "n_skipped_desynced": n_skipped, "n_decisions": D,
+            "n_cand_mismatch": n_cand_mismatch, "total_card_tokens": D * 18, "source": dirs,
+            "caps": caps, "preds": preds, "games_per_source": dict(per_dir)}
+    with open(out_path + ".meta.json", "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=1)
+    return {k: meta[k] for k in ("n_rows", "n_games", "n_decisions", "total_card_tokens")}
+
+
+def load_v3(path: str) -> Dict[str, np.ndarray]:
+    """A v3 (per-decision) dataset as a dict of arrays; ``cand_kind < 0`` marks padding."""
+    with np.load(path) as npz:
+        return {k: npz[k] for k in npz.files}
+
+
 def build_belief(data_dir, out_path: str, limit: Optional[int] = None) -> Dict:
     """Belief-net dataset (Study 7): ONE state-only row per searched decision, labelled with the TRUE zone
     of every card (``features2.true_zones``, read off the omniscient replay). No candidate loop, no q/w/z --
@@ -401,8 +525,9 @@ def main(argv=None) -> None:
                         "datasets/selfplay_gen1_v3c:1000")
     p.add_argument("--out", default=os.path.join("datasets", "tensors", "k20l3_tokens.npz"))
     p.add_argument("--limit", type=int, default=None, help="only process the first N games (smoke)")
-    p.add_argument("--feat", default="v1", choices=["v1", "v2"],
-                   help="featurization version (v2 = fixed-18 instance tokens + zone posteriors)")
+    p.add_argument("--feat", default="v1", choices=["v1", "v2", "v3"],
+                   help="featurization version (v2 = fixed-18 instance tokens + zone posteriors; v3 = the "
+                        "late-fusion per-decision layout, Study 11)")
     p.add_argument("--target", default="q", choices=["q", "belief"],
                    help="q = action-in value labels (mean_q); belief = per-card true-zone labels, one "
                         "state-only row per decision (Study 7, always v2)")

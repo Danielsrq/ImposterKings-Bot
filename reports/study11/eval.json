@@ -1,0 +1,157 @@
+{
+ "meta": {
+  "inputs": {
+   "datasets\\tensors\\v3c_gen25_tokens_v3.npz": "bd3eae83236ff958a253533d929a7b359f3c3674b730660f8c219bd7fb32abbe",
+   "datasets\\tensors\\v3c_gen25_tokens_v2.npz": "b727b27cc1bcb8a4c7b3dc0a4e6808db0e3e20ed3b16f59eeb65b0a7b89a7df6",
+   "models\\v3c_gen25\\attn_d96_L2.pt": "e555232592a64bc901d50be3cf2fd354a846bb124f55b46265e838db217660f6",
+   "models\\study11\\LF-A.pt": "221ea0fad51ed8e263af340a1ee19b55a80c438820335049b6df32afd615e086",
+   "models\\study11\\LF-B-beta0.pt": "494d33f0d4665b2e9ed8057714f91701cd47f9016b4f39fb06291f3e6e3f1bdb",
+   "models\\study11\\LF-B.pt": "1a63c2c706099b442efea7aa00105709c07016f4d409d88d2926d60df182d661",
+   "models\\study11\\LF-C.pt": "9bc87aa19f4d4af9393adab8000dd125176fba0fc207e64a4ee87de6374eeeb4"
+  },
+  "params": {
+   "arms": [
+    "models\\study11\\LF-A.pt",
+    "models\\study11\\LF-B-beta0.pt",
+    "models\\study11\\LF-B.pt",
+    "models\\study11\\LF-C.pt"
+   ]
+  },
+  "git_head": "18b15d8be878af4b8d868ef27d3977821be0d892",
+  "seconds": 9.9,
+  "finished": "2026-10-18 11:58:01"
+ },
+ "result": {
+  "val_decisions": 11419,
+  "val_games_match_d96": true,
+  "arms": {
+   "LF-A": {
+    "val_mse": 0.024133088067173958,
+    "val_mae": 0.09143219143152237,
+    "top1_bestq": 0.6452403888256415,
+    "top1_chosen": 0.5919082231368772,
+    "recall2": 0.8365005692267273,
+    "spearman": 0.628862128763606,
+    "n_decisions": 11419,
+    "policy_top1_visits": 0.7269463175409405,
+    "policy_top1_chosen": 0.6392854015237761,
+    "policy_ce": 1.1559898853302002,
+    "params": 283496,
+    "cfg": {
+     "d_model": 96,
+     "n_self": 1,
+     "n_cross": 1,
+     "n_heads": 6,
+     "ffn_hidden": 384,
+     "dropout": 0.1,
+     "feat": "v3"
+    },
+    "beta": 1.0,
+    "ckpt": "models\\study11\\LF-A.pt",
+    "O2": {
+     "maxQ_vs_root_mae": 0.08656779676675797,
+     "maxQ_vs_root_bias": 0.03368835151195526,
+     "label_max_vs_root_bias": 0.02889680489897728
+    }
+   },
+   "LF-B-beta0": {
+    "val_mse": 0.02550153061747551,
+    "val_mae": 0.09064427763223648,
+    "top1_bestq": 0.6497066293020405,
+    "top1_chosen": 0.5936596899903669,
+    "recall2": 0.8516507575094141,
+    "spearman": 0.6325385330727246,
+    "n_decisions": 11419,
+    "policy_top1_visits": 0.20203170155004815,
+    "policy_top1_chosen": 0.20054295472458183,
+    "policy_ce": 1.8025084733963013,
+    "params": 395336,
+    "cfg": {
+     "d_model": 96,
+     "n_self": 2,
+     "n_cross": 1,
+     "n_heads": 6,
+     "ffn_hidden": 384,
+     "dropout": 0.1,
+     "feat": "v3"
+    },
+    "beta": 0.0,
+    "ckpt": "models\\study11\\LF-B-beta0.pt",
+    "O2": {
+     "maxQ_vs_root_mae": 0.07648021727800369,
+     "maxQ_vs_root_bias": 0.03300540894269943,
+     "label_max_vs_root_bias": 0.02889680489897728
+    }
+   },
+   "LF-B": {
+    "val_mse": 0.02310669794678688,
+    "val_mae": 0.08747272938489914,
+    "top1_bestq": 0.6828093528329976,
+    "top1_chosen": 0.6216831596462037,
+    "recall2": 0.8591820649794203,
+    "spearman": 0.6702699167604086,
+    "n_decisions": 11419,
+    "policy_top1_visits": 0.7317628513880374,
+    "policy_top1_chosen": 0.6452403888256415,
+    "policy_ce": 1.1535946130752563,
+    "params": 395336,
+    "cfg": {
+     "d_model": 96,
+     "n_self": 2,
+     "n_cross": 1,
+     "n_heads": 6,
+     "ffn_hidden": 384,
+     "dropout": 0.1,
+     "feat": "v3"
+    },
+    "beta": 1.0,
+    "ckpt": "models\\study11\\LF-B.pt",
+    "O2": {
+     "maxQ_vs_root_mae": 0.08090284466743469,
+     "maxQ_vs_root_bias": 0.033909302204847336,
+     "label_max_vs_root_bias": 0.02889680489897728
+    }
+   },
+   "LF-C": {
+    "val_mse": 0.021324917674064636,
+    "val_mae": 0.08459064364433289,
+    "top1_bestq": 0.6678343112356598,
+    "top1_chosen": 0.6074087047902619,
+    "recall2": 0.8519134775374376,
+    "spearman": 0.664739924815232,
+    "n_decisions": 11419,
+    "policy_top1_visits": 0.7326385848147824,
+    "policy_top1_chosen": 0.6447149487695946,
+    "policy_ce": 1.1546622514724731,
+    "params": 507374,
+    "cfg": {
+     "d_model": 96,
+     "n_self": 2,
+     "n_cross": 2,
+     "n_heads": 6,
+     "ffn_hidden": 384,
+     "dropout": 0.1,
+     "feat": "v3"
+    },
+    "beta": 1.0,
+    "ckpt": "models\\study11\\LF-C.pt",
+    "O2": {
+     "maxQ_vs_root_mae": 0.08014150708913803,
+     "maxQ_vs_root_bias": 0.030618514865636826,
+     "label_max_vs_root_bias": 0.02889680489897728
+    }
+   }
+  },
+  "d96": {
+   "val_mse": 0.029707234352827072,
+   "params": 236833,
+   "top1_bestq": 0.6395481215517996,
+   "top1_chosen": 0.5809615553025659,
+   "recall2": 0.8393904895349855,
+   "spearman": 0.6132458931149648,
+   "n_decisions": 11419
+  },
+  "selected": "LF-B",
+  "O1_verdict": "pass"
+ }
+}

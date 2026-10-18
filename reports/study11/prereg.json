@@ -1,0 +1,53 @@
+{
+ "selected_arm": "LF-B",
+ "selected_ckpt": "models\\study11\\LF-B.pt",
+ "selected_sha256": "1a63c2c706099b442efea7aa00105709c07016f4d409d88d2926d60df182d661",
+ "d96": "models\\v3c_gen25\\attn_d96_L2.pt",
+ "d96_sha256": "e555232592a64bc901d50be3cf2fd354a846bb124f55b46265e838db217660f6",
+ "npz3_sha256": "bd3eae83236ff958a253533d929a7b359f3c3674b730660f8c219bd7fb32abbe",
+ "thresholds": {
+  "O1_top1_margin": 0.01,
+  "O1_top1_fail_margin": 0.02,
+  "O1_spearman": 0.6,
+  "S1_pass_ratio": 2.0,
+  "S1_fail_ratio": 1.2,
+  "G_noninferior_lo": 0.47,
+  "G_superior_lo": 0.5,
+  "G_fail_hi": 0.5,
+  "A1_r2": 0.5,
+  "A1_sign": 0.8,
+  "A1_fail_r2": 0.25,
+  "A1_d96_share": 0.47,
+  "A2_spearman": 0.3,
+  "A2_sign": 0.7,
+  "G1_deals": 2000,
+  "G2_margin": 0.03,
+  "G2_power": 0.8,
+  "G2_alpha": 0.05,
+  "G2_min": 400,
+  "G2_max": 1500,
+  "select_tie_pp": 0.005
+ },
+ "G1_deals": 2000,
+ "G2_deals": 491,
+ "pilot": {
+  "deals": 60,
+  "games": 120,
+  "winrate": 0.475,
+  "sd_per_deal": 0.26720461276846585,
+  "ci95": 0.06761209566509524,
+  "lo": 0.40738790433490474,
+  "hi": 0.5426120956650953,
+  "splits": 43,
+  "sec_per_deal_worker": 134.99373030666757
+ },
+ "seed_base": {
+  "G1": 91000000,
+  "G2": 92000000,
+  "pilot": 80000000
+ },
+ "budget": "hybrid-k20-l3",
+ "prior": "softmax(policy logit)",
+ "git_head": "18b15d8be878af4b8d868ef27d3977821be0d892",
+ "written": "2026-10-18 11:58:09"
+}

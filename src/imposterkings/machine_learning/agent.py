@@ -37,6 +37,10 @@ class NNPolicy:
     @classmethod
     def from_checkpoint(cls, path: str, device: str = "cpu") -> "NNPolicy":
         blob = torch.load(path, map_location=device, weights_only=False)
+        if blob.get("model_type") == "latefusion":
+            from .latefusion_model import load as load_lf
+            model, _ = load_lf(path, device)
+            return cls(model, device)
         if blob.get("model_type") == "attention":
             from .attention_model import load as load_attn
             model, _ = load_attn(path, device)
@@ -49,6 +53,9 @@ class NNPolicy:
             x = torch.from_numpy(np.stack([features.encode(view, m) for m in moves])).to(self.device)
             with torch.no_grad():
                 return self.model(x).squeeze(-1).cpu().numpy()
+
+        if getattr(self.model, "is_latefusion", False):     # late fusion: one state encode, all moves
+            return self.model.q_moves(view, moves)
 
         if self.feat == "v2":
             from .attention_model import collate2

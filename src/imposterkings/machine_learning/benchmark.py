@@ -71,6 +71,8 @@ def _evaluator_for(ckpt: str):
     mt = torch.load(ckpt, map_location="cpu", weights_only=False).get("model_type")
     if mt == "attention":
         from .attention_model import build_evaluator as be
+    elif mt == "latefusion":
+        from .latefusion_model import build_evaluator as be
     else:
         from .evaluator import build_evaluator as be
     return be(ckpt)
