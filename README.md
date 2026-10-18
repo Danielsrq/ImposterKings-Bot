@@ -177,6 +177,27 @@ Transformers with Vector Norms, Kobayashi et al (2020)* and *A Mathematical Fram
 The model has 4 attention heads and hence 4 boxes in the attention panel. This is just what the model sees to compute its evaluation. A word of caution: it offers some interprebilty but is still quite opaque. This was nevertheless still a fun project for explainable AI. Just because the model looks at the token doesn't mean it will play that token, just that it factored them into consideration.
 In particular attention head 4 (bottom right corner) seems to be the "fear" attention head. It is very weary of potential threats especially of the unknown. From the screenshot the two rightmost column represent the (unseen) assassin and fool and they have the brightest column.
 Other notable behaviours are that in general the assassin, princess and queen are the brightest tokens on the heat map which probably alludes to its strength in the game.
+
+**How far can you trust these readings?** Study 10 tested this with a pre-registered causal study (head and
+token ablations, counterfactuals, and ~90k greedy games). The details are in
+[`attention_exploration.md`](src/imposterkings/machine_learning/attention_exploration.md).
+
+- **What the signed bars faithfully show.** Each bar is that card's *direct* contribution through the last
+  layer. Knocking out that path agrees with the bar at rank correlation ≈ 0.8.
+  - For the shipped d64 net, that path carries most of what separates the chosen move from the runner-up.
+  - For the newer d96 net, the final feed-forward layer carries about 40% of it as well, and the drawer does not
+    show that part.
+- **"The Assassin is always the brightest" is real**, not a scaling artifact.
+- **But the Assassin's bright bar is not the bot's fear of the Assassin.** Ablating the head where the Assassin
+  tops the signed view barely changes how often the bot dies to it.
+- **The causal "fear head" sits in layer 0.** Its effect reaches the output only through layer 1, so a last-layer
+  attribution cannot show it.
+  - In the d96 net, layer-0 head 1 (labelled "head 1 = threat" in the study log) was confirmed: ablating it
+    raises Assassin deaths from 14% to 19%, the largest effect of any head.
+  - For the shipped net, "head 4" read as layer-0 head 3 is the most Assassin-specific head, with a significant
+    but not the largest effect, so the result there is inconclusive.
+
+In short: read the bars as *what the final readout used*, not *why the bot played this*.
 Note also that behaviour of the attention heads are emergent i.e. I did not (could not) dictate how each attention head should specialise; it learnt entirely from a dataset of played games.
 
 The full experimental record, including the runs that failed and why, is in

@@ -836,6 +836,301 @@ Code: `godmode.py` (solver + `GodmodeAgent`), `mcts.py` (`SearchConfig.true_stat
 
 ---
 
+## Study 10 — is the drawer's DLA faithful? A pre-registered verification (2026-10-17)
+
+The drawer's signed mode is **direct logit attribution (DLA)** on the **last layer's attention path**:
+`Δq(j) = Σₕ Aʰ[0][j]·(uʰ·vⱼʰ)` (see "Value-weighted attribution" below). Until now it was tested only for
+arithmetic (`test_explain`): the numbers are computed correctly. Nothing tested whether they are *faithful*,
+i.e. whether they reflect what the model actually uses. Meanwhile the README and Study 5 make head-role claims
+("head 4 = fear head", "d96 head 1 = threat") that rest only on **attention mass**. Prompting observation (user,
+from the viewer): *the Assassin always tops at least one head's signed DLA*. Hypothesis: ablate that head and the
+bot stops respecting the Assassin, so it dies to it more often.
+
+Subjects: shipped **d64** (`gen1_v3c_v2feat`, L2/h4) and newest **d96** (`v3c_gen25`, L2/h6).
+
+**Design.**
+- Every prediction can fail, and thresholds were fixed in code first.
+- Data hygiene:
+  - TRAIN rows supply only the ablation means.
+  - Each model's own val split is halved by game. val-A is for exploration and head selection; val-B is untouched until `confirm`.
+- Head selection and N (from a base-arm pilot) were **committed (18b15d8) before** val-B or any ablated game ran.
+- The analysis is in pre-tanh logit space.
+- Code: `interventions.py`, `dla_faithfulness.py` and `dla_ablation_games.py` (all resumable). Results: `reports/dla_faithfulness/<tag>/`.
+
+### The exact decomposition (and a correction to the obvious ablation logic)
+
+There is no final LayerNorm (`q = tanh(head(seq[:,0]))`), so the logit is exactly a sum over the CLS residual
+stream:
+
+`logit = const + Σ_{L,h,j} A^{L,h}[0,j]·(u_L^h·v^{L,h}_j) + Σ_L w·FFN_L[CLS]`, with `u_L = head.w @ Wo_L`.
+
+It closes to 5e-7 on every val row. The drawer shows one of the five components, `attn_L1`. **Layer 0's
+attention term attributes to *unmixed* card embeddings**, so it has a clean per-card meaning.
+
+Correction found while unit-testing: ablating a *last-layer* head is **not** an algebraic identity. The last
+layer's FFN reads the CLS row *after* attention, so every head has an indirect path. Only the head's direct
+term is an identity, and that identity is what `tests/test_interventions.py` pins.
+
+### Phase 1: coverage, constancy, nulls, the P0 gate (val-A)
+
+**How much of the decision does the drawer's component carry?** The contrastive metric is
+`logit(top-1) − logit(runner-up)`:
+
+| | d64 attn_L1 (drawer) | d64 ffn_L1 | d96 attn_L1 (drawer) | d96 ffn_L1 |
+|---|---:|---:|---:|---:|
+| share of \|contrast\| | **61%** | 21% | **47%** | **42%** |
+| R² of the contrast | **0.77** | 0.28 | **0.49** | 0.78 |
+| sign agreement | 0.88 | 0.50 | 0.87 | 0.66 |
+| verdict (pre-stated) | **adequate** | | **partial** (just under the 0.5 bar) | |
+
+Layer-0 components carry under 10% each in both nets. Read: in d64 the drawer shows most of what decides a move.
+In d96, **the final FFN carries almost as much as the attention the drawer shows**, so the drawer is a partial
+explanation there.
+
+**Is the Assassin's DLA a constant offset?** No. The within-decision contrast ratio ρ in threat positions reaches
+0.43 (d64) and **0.84** (d96). In d96, the last-layer Assassin terms favour "don't flip" by up to −0.096 logits
+per head.
+
+**The observation against null baselines.** The Assassin is the argmax of the signed DLA on at least one
+last-layer head in **41% (d64) / 39% (d96)** of rows, the highest of all 23 tokens. Untrained nets of the same
+architecture: 11% / 14%. So it is **not a feature-scale artifact**. The user's observation is real.
+
+**P0 gate** (does the model have Assassin "fear" at all?):
+- **Threat stratum:** MAIN phase, flip legal, the Assassin unseen with mass in their hand.
+- **F** = logit(flip) − best non-flip logit.
+- **The test:** tell the model the Assassin is *not* in their hand.
+
+| | threat decisions | ΔF (95% game-bootstrap CI) | P(flip is the argmax): base → counterfactual |
+|---|---:|---|---|
+| d64 | 229 | **+0.114 [+0.100, +0.127]** | 1.3% → 4.4% |
+| d96 | 592 | **+0.477 [+0.417, +0.536]** | 4.6% → 27.2% |
+
+Both pass. d96's fear is about 4× stronger.
+
+### Phase 2: the causal battery (val-A)
+
+**Per-token bars track their own direct path.**
+- Knocking out CLS→Assassin in the last layer (K1) moves the logit in agreement with the bar:
+  - Spearman(−DLA, K1 effect) = **0.80** in both nets;
+  - sign agreement 0.79 (d64) / 0.86 (d96).
+- Per-row ranking of the 18 cards by |DLA| vs |K1 effect|: median Spearman 0.62 / 0.65, top-3 overlap 63% / 64%.
+
+So the bars faithfully rank the **direct** last-layer path.
+
+**But does the Assassin bar carry the Assassin *fear*? This depends on the model.**
+
+| | d64 | d96 |
+|---|---|---|
+| "lacks" counterfactual mediated by the Assassin's own terms / other tokens / FFN | 7% / **75%** / 17% | 31% / 42% / 27% |
+| drawer's Assassin bar predicts the counterfactual effect (threat; need ρ ≥ 0.3 and sign ≥ 0.7) | ρ = 0.15, sign 0.57: **FAIL** | ρ = 0.76, sign 0.73: **PASS** |
+| ΔF from knocking out CLS→Assassin in the **last** layer only (K1) | **−0.002** (none) | **+0.42** (≈ all of it) |
+| ΔF from knocking out CLS→Assassin in **both** layers (K2) | **+0.114** (= all of it) | +0.44 |
+| ΔF from resample-patching the Assassin's last-layer slot | +0.002 (none) | +0.42 |
+
+In **d64** the fear is read by the **layer-0** CLS row and then routed through *other* tokens' terms (action,
+king:mine, Fool, Inquisitor). The drawer's Assassin bar is the wrong place to look: removing exactly that path
+changes nothing about flipping. In **d96** the last-layer Assassin path carries essentially the whole effect,
+and the bar is faithful to it.
+
+**Head ablation (mean-ablation, all heads).** Layer-0 heads act about **86-99% indirectly**, i.e. through layer
+1. Their effect is invisible to any last-layer DLA. Last-layer heads act 17-49% indirectly, through the final
+FFN.
+
+**Sanity (cascading weight randomisation, |rank corr| vs the trained map; need < 0.2 after randomising the last
+layer):**
+- d64 **passes** (0.16). The Assassin-tops rate falls to 0.6%.
+- d96 **fails narrowly** (0.21). The Assassin-tops rate **survives randomising both attention layers** (57% → 49%)
+  and collapses only when the **embedding** is re-initialised (3%).
+
+So in d96, "the Assassin tops a head" is mostly a property of the learned Assassin *embedding* (a large value
+vector aligned with the readout). It is not something the attention computes.
+
+### Phase 3 + 4: pre-registered heads, val-B confirmation, and 90k greedy games
+
+The selection rules were fixed in code and run on val-A:
+
+| Rule | d64 | d96 |
+|---|---|---|
+| **H_obs**: the user's head, i.e. the last-layer head the Assassin tops most often | L1h2 | L1h4 |
+| **H_con**: the last-layer head whose Assassin term most penalises flipping | L1h0 | L1h4 |
+| **H_L0**: the layer-0 head with the most attention on the unseen Assassin | L0h3, which is also the README's "head 4" | **L0h1**, which is Study 5's "threat head" (48% of its card-row attention) |
+| README "head 4" read as a last-layer head | L1h3 | – |
+
+**val-B (offline).** The pre-registered predictions:
+- **P1:** ablating the head raises P(F > 0) in the threat stratum by at least 2pp.
+- **P2:** the threat-minus-safe ΔF difference is > 0 (Holm-corrected) and the head ranks first on it.
+- **P3:** ablation recovers at least 25% of the counterfactual's ΔF.
+
+| head | P1 | P2 (rank) | P3 |
+|---|---|---|---|
+| d64 L1h2 (H_obs) | ✗ (+0.0pp) | ✗ (3rd) | ✓ |
+| d64 L1h0 (H_con) | ✓ (+2.6pp) | ✗ (2nd) | ✓ |
+| d64 **L0h3** (H_L0, "head 4") | ✗ | **✓ (1st)** | ✓ (0.43) |
+| d64 L1h3 | ✗ | ✗ | ✓ (0.27) |
+| d96 L1h4 (H_obs = H_con) | ✗ (+0.0pp) | ✗ (4th) | ✓ (0.28) |
+| d96 **L0h1** (H_L0) | **✓ (+4.4pp)** | ✗ (2nd, behind L0h5) | ✓ (0.59) |
+
+**Games.** The primary endpoint is the change in Assassin deaths: the ablated net plays an intact copy of
+itself, greedily, on mirrored deals, with each game paired against the intact-vs-intact game on the same deal.
+- **Deals:** d64 2,000 (8 head arms); d96 2,181 (12 head arms).
+- **Base death rate:** 10.1% (d64) / 14.0% (d96).
+- **Opponent reveal rate when holding the Assassin:** 100%, so the endpoint is valid.
+
+| head | Δ Assassin deaths [95% CI] | rank of 8 / 12 | Δ win | pre-registered verdict |
+|---|---|---:|---|---|
+| d64 L1h2 (H_obs) | +0.8pp [+0.0, +1.6] | 5 | −2.6pp | **falsified** (CI upper bound < +2pp) |
+| d64 L1h0 (H_con) | −0.1pp [−0.9, +0.6] | 6 | −0.2pp | **falsified** |
+| d64 L0h3 (H_L0, "head 4") | **+2.1pp** [+1.3, +3.0] | 2 | −2.7pp | inconclusive (significant and specific, but the unselected L0h2 is larger at +2.7pp) |
+| d64 L1h3 | +1.9pp [+1.0, +2.9] | 3 | −3.5pp | inconclusive (same reason) |
+| d96 L1h4 (H_obs = H_con) | +0.9pp [+0.3, +1.6] | 5 | −2.2pp | **falsified** (detectable but below the +2pp materiality bound) |
+| d96 **L0h1** (H_L0, "threat") | **+5.4pp** [+4.4, +6.3], 14.0% → 19.3% | **1** | −5.8pp | **CONFIRMED**: largest of all 12 heads; 93% of the extra losses are Assassin deaths; unsafe flips +11.8pp |
+
+### Verdict
+
+1. **The drawer's per-token bars are faithful to what they claim to measure:** the direct last-layer path.
+   Knockouts agree with the bars at ρ ≈ 0.8. As an explanation of the *decision* they are adequate for d64
+   (contrastive R² 0.77) and only partial for d96, where the final FFN carries about 42% of the contrast.
+2. **"The Assassin tops a head" is real, not a feature-scale artifact.** But in d96 it is mostly a property of the
+   learned embedding: it survives randomising the attention layers. In d64, the Assassin bar is *not* where the
+   Assassin fear flows. That fear enters through layer 0 and travels via other tokens.
+3. **The user's hypothesis is falsified for the head the drawer highlights** (d64 L1h2, d96 L1h4). Ablating it
+   barely changes Assassin deaths, because the Assassin term is spread redundantly over several last-layer heads.
+4. **The "fear head" exists, and it is a layer-0 head the drawer cannot show.** d96 L0h1, Study 5's "threat head",
+   selected purely by attention mass, is **causally confirmed** by pre-registered games: ablating it raises
+   Assassin deaths from 14% to 19%, the largest effect of all 12 heads, and the effect is specific. d64's L0h3 (the
+   README's "head 4") is the most Assassin-specific head offline (P2 rank 1) with a significant +2.1pp in games,
+   but it is not the largest, so it is inconclusive under the pre-stated rule. Both act more than 90% indirectly,
+   so last-layer DLA is blind to them by construction.
+
+**What this means for the drawer:** read the signed bars as "what the final readout used directly", not "why the
+bot played this". For threat reasoning, the informative signal is layer-0 attention plus causal ablation.
+
+**Follow-ups:**
+- A contrastive drawer mode that shows the full decomposition (L0 / L1 / FFN shares).
+- Explicit 0-based (layer, head) captions. The causal-routing panel H{h} mixes L1 row 0 of head h with L0 card rows of head h, which are two different heads.
+
+**Deviations from the plan, recorded honestly:**
+- The sanity metric was switched to |Spearman| after a 3k-row smoke run, before any full run. Re-initialising only
+  the readout flips signs and would otherwise "pass" at ρ = −0.65.
+- The "last-layer ablation = identity" premise was wrong (see above), so last-layer ablations became real tests
+  rather than hook checks.
+- P1 turned out to be a coarse threshold metric. Base P(F > 0) is only 1-5%, so continuous ΔF (P2/P3) and the games
+  are the better instruments.
+
+---
+
+## Study 11 — late fusion: encode the state once, let every move cross-attend (2026-10-18)
+
+**Why.** Both shipped nets are *early fusion*: the candidate move is an input token from layer 0 (plus an
+`is_candidate_action` stamp on the card it uses), so every candidate re-encodes the whole state and the card
+representations differ per candidate. Study 10 showed what that costs the drawer (d64's Assassin fear routes
+around it; d96's drawer covers 47% of the move-to-move contrast). The user's Tetris net *Attentris* does it the
+other way: the board self-attends once and each legal move is a token that cross-attends to it.
+
+**Model** (`latefusion_model.py`). The v3 tokens (`features3.py`):
+- **State, 23 tokens:**
+  - cards ×18: v2 minus `base` and the candidate stamp, plus a `picked_target` flag and an embedded court depth;
+  - hands ×2 and kings ×2;
+  - one **decision** token: step kind, reactor role, guess / number / picks payload, and a pointer to the source card.
+- **Dropped:** `is_my_turn`, which was 1.0 in all 657,735 training rows.
+- **Candidates:** pointers into the layer-0 state embeddings, plus a learned self-reference attention bias.
+- **Hidden information:** `PendingStep.picked` is encoded only where it is a public stack position (Fool, Sentry). The
+  Princess give-card at `ABILITY_SWAP_RESPOND` is hidden from the responder and is never encoded; a test enforces this.
+- **Encoder and heads:** `n_self` self-attention blocks, then `n_cross` cross blocks (no candidate↔candidate
+  attention), then per-candidate `q = tanh(w_q·y)` and a policy logit. V(s) = max_a q, with no CLS token.
+- **Training loss:** the d96 recipe's visit-weighted MSE on `mean_q`, plus β × listwise cross-entropy against the
+  search's visit shares.
+
+**Data.** The same 6,000 games re-tokenised per decision (`token_dataset --feat v3`): 115,841 decisions and 657,735
+candidate rows. Validation games are identical to d96's (asserted). 3 decisions had recorded candidates ≠ legal moves.
+
+**Pre-registration.** Code plus `prereg.json` were committed in `255a42b` before any LF game. The rule was "highest
+val top-1, ties within 0.5pp to fewer params", which selected **LF-B**.
+
+### Offline (same 11,419 val decisions as d96)
+
+| net | blocks | params | val MSE | top-1 vs best q | top-1 vs played | Spearman |
+|---|---|---|---|---|---|---|
+| d96 (early fusion) | 2 self | 237k | 0.0297 | 63.95% | 58.1% | 0.613 |
+| LF-A | 1 self + 1 cross | 283k | 0.0241 | 64.5% | 59.2% | 0.629 |
+| **LF-B** | 2 self + 1 cross | 395k | 0.0231 | **68.3%** | **62.2%** | **0.670** |
+| LF-C | 2 self + 2 cross | 507k | 0.0213 | 66.8% | 60.7% | 0.665 |
+| LF-B, β=0 (no policy loss) | 2 self + 1 cross | 395k | 0.0255 | 65.0% | 59.4% | 0.633 |
+
+- **O1 passes.** Of the +4.3pp, about +1pp is the architecture (β=0 vs d96) and about +3.3pp is the listwise policy
+  loss, which also sharpens the Q head's ranking.
+- **The policy head** matches the most-visited move 73% of the time.
+- **O2.** max_a q sits 0.034 above the search's root value, almost exactly the labels' own max-vs-root bias (0.029).
+
+### Strength
+
+| match | deals (games) | LF-B score | 95% CI | pre-registered verdict |
+|---|---|---|---|---|
+| **G1** greedy vs d96 greedy | 2,000 (4,000) | **56.2%** | [55.0, 57.4] | stronger |
+| **G2** LF-B@k20 vs d96@k20 | 491 (982) | **55.9%** | [53.7, 58.1] | stronger |
+| LF-B@k20 vs vanilla MCTS@k20 *(secondary)* | 100 (200) | 72.0% | ±5.3 | — |
+| d96@k20 vs vanilla MCTS@k20 *(same seeds)* | 100 (200) | 66.5% | ±5.0 | — |
+
+G2's N (491) came from a d96-vs-d96 pilot (60 deals: per-deal SD 0.267) for a −3pp non-inferiority margin. It was
+fixed before any LF game. Evaluation seeds sit outside every corpus seed range (G1 91M, G2 92M).
+
+### Speed (S1): fail
+
+Both leaf evaluators cost about 1.6-1.8 ms on CPU (median 1.73 ms LF vs 1.57 ms d96; ratio 0.91, below the 2× bar).
+Profiling shows about 1.5 ms of each is PyTorch per-call overhead on tiny tensors. d96 does ~6× more arithmetic than
+LF in the same wall time. Encoding the state once saves nothing until the forward pass leaves PyTorch. A Rust
+forward pass, built later, does about 0.43 ms for LF-B (measured with the machine under load).
+
+### Attribution (A1-A3): the attention term does not carry more of the decision than d96's drawer
+
+These are quantitative criteria only: how much of the move-to-move difference the cross-attention term accounts for,
+and whether its Assassin bar predicts a counterfactual. Whether the attention *looks* sensible move by move is a
+separate, qualitative judgement. The "LF-B Attention Court" viewer (self-play games, per-head and mean
+cross-attention for every legal action, from either seat or as an observer) is there for that.
+
+| | LF-B cross-attention term | d96 drawer (Study 10) |
+|---|---|---|
+| A1 contrastive share (top-1 vs runner-up) | 40.6% | 46.5% |
+| A1 R² / sign agreement | 0.33 / 0.81 → **partial** | 0.49 / 0.87 |
+| A2 "lacks" counterfactual raises F | +0.44 [0.40, 0.49] ✓ | +0.48 ✓ |
+| A2 Assassin bar predicts the effect: Spearman / sign | 0.58 / **0.69** (bar 0.3 / 0.7) → **fail by a hair** | 0.76 / 0.73 |
+| A3 mediation: own Assassin term / other tokens / FFN | 34% / 42% / 24% (+ candidate embedding 0%) | 31% / 42% / 27% |
+
+- **The cross block's FFN carries 43% of the move-to-move contrast** (R² 0.75 on its own). This is the same side path
+  that limited d96's drawer. Late fusion did not remove it.
+- **Knocking out every candidate's attention to the Assassin** reproduces 77% of the lacks effect, so the Assassin
+  route is real. It is just not *only* attention.
+- **Mediation is nearly identical to d96.** What matters is the structure "one attention read followed by an FFN on
+  the readout stream", not where the move enters.
+
+### Learning curve (LF-A, equal updates)
+
+| train data | val MSE | gap | top-1 |
+|---|---|---|---|
+| 25% | 0.0318 | 0.0126 | 60.0% |
+| 50% | 0.0269 | 0.0075 | 63.2% |
+| 100% | 0.0241 | 0.0028 | 64.5% |
+
+The model is still improving at 100% data, but with diminishing returns: about −0.0015 MSE and +0.5-1pp top-1 are
+expected per further doubling. About 6k unused labelled games already exist on disk: 5k `selfplay_gen25` (d96-guided
+k20) and 1k `selfplay_gen1_v3c`.
+
+**Verdict.** Late fusion is clearly **stronger**: +4.3pp offline and about +6pp in both head-to-heads with d96
+(G1 greedy, G2 at k20). Most of that comes from training on the search's visit distribution, which this design makes
+natural. It is **not faster under PyTorch**. On the pre-registered attribution criteria its cross-attention term
+carries **no more** of the decision than d96's drawer (A1 partial, A2 short of its sign bar by 0.01), because the
+cross block's FFN still carries about as much of the contrast as the attention does. Whether the per-action
+attention is more *readable* is left to visual inspection. The FFN side path would need an attention-only readout
+or a contrastive full-decomposition view to close.
+
+**Deviations, recorded honestly:**
+- G1 and G2 seeds moved from 60M/70M to 91M/92M before prereg.json was written, because `selfplay_gen25` occupies 60M.
+- The speed and attribution steps ran before the pre-registration, with the selected arm overridden by hand (`--arm-ckpt`).
+  They are offline and do not touch the games.
+- The vs-vanilla matches are secondary and not pre-registered.
+
+---
+
 ## Metric glossary
 
 - **winrate** — fraction of games the challenger wins vs the stated opponent (mirrored; 200 games unless
