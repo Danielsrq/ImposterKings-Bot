@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -43,6 +43,12 @@ def _weighted_perm(items: List[int], weight_of: Callable[[int], float], srng) ->
         keyed.append((math.log(u) / w, it))
     keyed.sort(reverse=True)                            # largest key (highest weight) first
     return [it for _, it in keyed]
+
+
+def _is_opp_princess_pick(step: PendingStep, opp: int) -> bool:
+    """The opponent's Princess give-card, waiting for the observer's answer at ABILITY_SWAP_RESPOND.
+    It is HIDDEN: neither player knows what the other will give until the swap resolves (ruling 2026-10-18)."""
+    return step.kind == StepKind.ABILITY_SWAP_RESPOND and (1 - step.actor) == opp
 
 
 @dataclass
@@ -89,7 +95,8 @@ class InformationSet:
             to_play=state.to_play,
             turn_player=state.turn_player,
             starting_player=state.starting_player,
-            pending=state.pending,
+            pending=tuple(replace(s, picked=None) if _is_opp_princess_pick(s, opp) else s
+                          for s in state.pending),        # the opponent's Princess give-card is hidden
             history=state.history,
             opp_hand_lacks=state.hand_lacks[observer],
             opp_hand_has=state.hand_has[observer],
@@ -120,19 +127,11 @@ class InformationSet:
         return [c for c in range(cards.DECK_SIZE) if c not in seen]
 
     def _pinned_opp_cards(self) -> set:
-        """Hidden cards the resolution stack has committed to the OPPONENT's hand.
-
-        A pending step can pin a still-hidden card to a player (e.g. Princess's chosen give-card,
-        held by ``1 - ABILITY_SWAP_RESPOND.actor`` until the responder answers). Determinize must
-        keep such cards in that hand, otherwise it can build a world the committed action can't apply.
-        """
+        """Hidden cards the resolution stack has committed to the OPPONENT's hand. ``from_state`` masks the
+        only such card (the opponent's Princess give-card), so this is empty for a projected view; it still
+        honours a pick on a hand-built InformationSet."""
         opp = 1 - self.observer
-        pinned = set()
-        for step in self.pending:
-            if step.kind == StepKind.ABILITY_SWAP_RESPOND and step.picked is not None:
-                if (1 - step.actor) == opp:
-                    pinned.add(step.picked)
-        return pinned
+        return {s.picked for s in self.pending if _is_opp_princess_pick(s, opp) and s.picked is not None}
 
     def _consistent(self, opp_hand: Tuple[int, ...]) -> bool:
         """True if ``opp_hand`` respects the guess-leaked knowledge: none of the lacked names and at
@@ -232,6 +231,11 @@ class InformationSet:
         leftover_facedown = rest[1] if len(rest) > 1 else (rest[0] if rest else self.leftover_faceup)
 
         observer, opp = self.observer, 1 - self.observer
+        # The opponent's masked Princess give-card: sample it uniformly from their sampled hand (it is
+        # still in that hand until the swap resolves), so the search can't see what it will receive.
+        pending = tuple(replace(s, picked=opp_hand[srng.pick(len(opp_hand))])
+                        if _is_opp_princess_pick(s, opp) and s.picked is None and opp_hand else s
+                        for s in self.pending)
         hands = [(), ()]
         hands[observer] = self.own_hand
         hands[opp] = opp_hand
@@ -261,7 +265,7 @@ class InformationSet:
             muted_values=self.muted_values,
             turn_player=self.turn_player,
             starting_player=self.starting_player,
-            pending=self.pending,
+            pending=pending,
             history=self.history,
             winner=None,
             setup_discard=tuple(setup_discard),
