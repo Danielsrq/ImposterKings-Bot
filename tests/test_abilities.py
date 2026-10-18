@@ -76,6 +76,23 @@ def test_sentry_swaps_exact_position_not_top():
     assert next(s for s in st.stack if cards.card_name(s.card) == "Sentry").disgraced
 
 
+def _sentry_has_no_window(st):
+    st = run(st, _play(cid("Sentry")))
+    assert st.to_play == 1 and st.phase != StepKind.ABILITY_MAY   # turn passes, no "Use ability?"
+    assert not st.stack[-1].disgraced                              # Sentry stays live, leading at 8
+
+
+def test_sentry_with_an_empty_hand_has_no_window():
+    # Ruling 2026-10-18: with nothing to swap, the Sentry can't disgrace itself for nothing.
+    _sentry_has_no_window(mainstate(hand0=(cid("Sentry"),), hand1=(cid("Fool"),), stack=(sc("Warlord"),)))
+
+
+def test_sentry_with_no_target_has_no_window():
+    # Only royalty and a disgraced card (leading at 0) beneath: nothing the Sentry may grab.
+    _sentry_has_no_window(mainstate(hand0=(cid("Sentry"), cid("Fool")), hand1=(cid("Elder"),),
+                                    stack=(sc("Queen"), StackCard(cid("Soldier"), disgraced=True))))
+
+
 def test_soldier_guess_is_mandatory_no_decline():
     # Playing a Soldier goes straight to the guess -- there is no declare/decline step.
     st = mainstate(hand0=(cid("Soldier"),), hand1=(cid("Warlord"),), stack=(sc("Fool"),))

@@ -32,7 +32,8 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
         pass
 
     X, y, w, z, gid, did, chosen = [], [], [], [], [], [], []
-    n_games = dec_id = 0
+    cols = (X, y, w, z, gid, did, chosen)
+    n_games = n_skipped = dec_id = 0
     for f in files:
         for rec in read_jsonl(f):
             g = rec["deal_seed"]
@@ -40,7 +41,12 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
             st = GameState.deal(np.random.default_rng(g),      # honour the RECORDED starter: a no-op for a
                                 rec.get("starting_player"))   # normal deal, but a mirrored corpus
                                                               # forces it and would otherwise desync
+            mark, dec_mark, desynced = len(X), dec_id, False
             for d in rec["decisions"]:
+                a = dict_to_action(d["chosen"])
+                if a not in st.legal_moves():              # recorded under older rules (apply() doesn't
+                    desynced = True                        # validate) -> drop the game, as token_dataset does
+                    break
                 cands = d.get("candidates") or []
                 if cands:                                  # a real (searched) decision
                     view = st.information_set(d["seat"])
@@ -49,13 +55,22 @@ def build(data_dir: str, out_path: str, limit: Optional[int] = None) -> Dict:
                         y.append(c["mean_q"]); w.append(c["visit_share"]); z.append(rewards[d["seat"]])
                         gid.append(g); did.append(dec_id); chosen.append(int(c["move"] == d["chosen"]))
                     dec_id += 1
-                st = st.apply(dict_to_action(d["chosen"]))
+                st = st.apply(a)
+            if desynced:                                   # roll this game's rows back entirely
+                for col in cols:
+                    del col[mark:]
+                dec_id = dec_mark
+                n_skipped += 1
+                continue
             n_games += 1
             if limit and n_games >= limit:
                 break
         if limit and n_games >= limit:
             break
 
+    if n_skipped:
+        print(f"  WARNING: skipped {n_skipped} game(s) whose recorded actions are no longer legal "
+              f"(corpus predates an engine rules change)")
     arrs = dict(
         X=np.asarray(X, np.float32), y=np.asarray(y, np.float32), w=np.asarray(w, np.float32),
         z=np.asarray(z, np.float32), game_id=np.asarray(gid, np.int64),

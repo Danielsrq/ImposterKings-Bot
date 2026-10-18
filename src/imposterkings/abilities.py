@@ -155,6 +155,8 @@ def _land(state: GameState, card: int, actor: int, *, ascended: bool, v_top: Opt
     if ability in _OPTIONAL_ONPLAY:
         if ability == Ability.PRINCESS and not (st.hands[actor] and st.hands[1 - actor]):
             return st, ()   # a swap needs a card from EACH side -> no "Use ability?" window at all
+        if ability == Ability.SENTRY and not (st.hands[actor] and _sentry_targets(st, card)):
+            return st, ()   # nothing to swap -> the Sentry can't disgrace itself for nothing (ruling 2026-10-18)
         return st, (PendingStep(StepKind.ABILITY_MAY, actor, source=card),)
     return st, ()
 

@@ -84,7 +84,8 @@ def build(
         hands=(_to_ids(hand0), _to_ids(hand1)),
         hidden=(_opt(hidden[0]), _opt(hidden[1])),
         kings=kings,
-        antechambers=(_to_ids(antechambers[0]), _to_ids(antechambers[1])),
+        antechambers=(tuple(_to_id(c) for c in antechambers[0]),   # FIFO: keep the given order (no sort)
+                      tuple(_to_id(c) for c in antechambers[1])),
         stack=_to_stack(stack),
         discard=tuple(_to_id(c) for c in discard),
         leftover_faceup=leftover_faceup,
