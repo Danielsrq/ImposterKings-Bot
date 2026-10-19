@@ -1,0 +1,468 @@
+<title>LF-B Attention Court</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Marcellus&family=Source+Sans+3:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a card table at night. Controls, then the game's eval graph, then the board from the viewing
+   seat (opponent + unseen pool on top, the court, your row, out of play) beside the actions + ranking. */
+:root {
+  --bg: #f1f0f4; --panel: #ffffff; --line: #d9d6e0; --fg: #1c1924; --muted: #6b6578; --chip: #ebe8f0;
+  --heat: 196, 132, 0; --cold: 0, 128, 118; --accent: #8a5a00; --p1: #c4482f; --p2: #2d6fb8; --grid: #e4e1ea;
+  --display: "Marcellus", "Trajan Pro", Georgia, serif;
+  --body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #121019; --panel: #1b1824; --line: #2e2a3a; --fg: #ece7dc; --muted: #9d95ab; --chip: #262232;
+  --heat: 242, 181, 68; --cold: 79, 195, 176; --accent: #f2b544; --p1: #ee8a72; --p2: #79b4f0; --grid: #24202e; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #121019; --panel: #1b1824; --line: #2e2a3a; --fg: #ece7dc; --muted: #9d95ab; --chip: #262232;
+  --heat: 242, 181, 68; --cold: 79, 195, 176; --accent: #f2b544; --p1: #ee8a72; --p2: #79b4f0; --grid: #24202e; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15px; line-height: 1.45; }
+.wrap { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 18px 40px; max-width: 1380px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+header h1 { font-family: var(--display); font-weight: 400; font-size: 1.9rem; margin: 0; letter-spacing: .02em; text-wrap: balance; }
+header p { margin: 4px 0 0; color: var(--muted); max-width: 82ch; }
+.bar { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px 12px; position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20;
+  box-shadow: 0 6px 16px -10px rgba(0, 0, 0, .45); }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 30; background: var(--bg); }
+.group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.glabel { font-size: .72rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); margin-right: 2px; }
+.pill { font: 600 .82rem var(--body); border: 1px solid var(--line); background: var(--chip); color: var(--fg); border-radius: 999px;
+  padding: 4px 11px; cursor: pointer; }
+.pill[aria-pressed="true"] { background: rgb(var(--heat)); border-color: rgb(var(--heat)); color: #1a1408; }
+.pill .res { font-family: var(--mono); font-weight: 400; opacity: .8; margin-left: 4px; font-size: .74rem; }
+.pill:focus-visible, button:focus-visible, .act:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.nav { display: flex; gap: 6px; align-items: center; }
+.nav button { font: 600 .9rem var(--body); background: var(--chip); color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 4px 10px; cursor: pointer; }
+.nav input[type=range] { width: 160px; accent-color: rgb(var(--heat)); }
+.stepinfo { font-family: var(--mono); font-size: .82rem; color: var(--muted); min-width: 12ch; }
+.graph { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px 6px; }
+.graph .gh { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; font-size: .8rem; color: var(--muted); }
+.graph .gh b { font-family: var(--display); font-weight: 400; font-size: 1rem; color: var(--fg); }
+.graph svg { width: 100%; height: 130px; display: block; overflow: visible; }
+.key { display: inline-flex; gap: 5px; align-items: center; }
+.key i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; }
+main { display: grid; grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; min-width: 0; }
+.panel h2 { font-family: var(--display); font-weight: 400; font-size: 1.05rem; margin: 0 0 8px; letter-spacing: .03em; }
+.zone { display: flex; flex-direction: column; gap: 6px; padding: 9px 0; border-top: 1px dashed var(--line); }
+.zone:first-child { border-top: 0; padding-top: 0; }
+.zone.sub { border-top: 0; padding-top: 0; margin-left: 14px; padding-left: 10px; border-left: 2px solid var(--line); }
+.zhead { display: flex; gap: 8px 10px; align-items: baseline; flex-wrap: wrap; }
+.zname { font-size: .72rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.znote { font-size: .8rem; color: var(--muted); }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.row.court { min-height: 140px; align-items: flex-end; }
+.events { display: flex; flex-wrap: wrap; gap: 5px; }
+.ev { font-size: .78rem; border-radius: 6px; padding: 2px 8px; background: var(--chip); border: 1px solid var(--line); }
+.ev b { font-weight: 700; }
+.ev.react { border-color: rgb(var(--heat)); background: rgba(var(--heat), .14); }
+.ev.react::after { content: "reaction"; font-size: .64rem; letter-spacing: .08em; text-transform: uppercase; margin-left: 6px; color: var(--muted); }
+.tile { position: relative; width: 74px; display: flex; flex-direction: column; gap: 3px; align-items: center; }
+.card { position: relative; width: 74px; aspect-ratio: 700/955; max-width: 100%; border-radius: 6px; overflow: hidden;
+  background: var(--chip); border: 1px solid var(--line); transition: box-shadow .15s; }
+.card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.card .veil, .tokenbox .veil { position: absolute; inset: 0; pointer-events: none; }
+.tile.dim .card img { filter: grayscale(1) brightness(.55); }
+.tile.unseen .card img { filter: saturate(.25) brightness(.7); }
+.tile.lead .card { outline: 2px solid var(--fg); outline-offset: 1px; }
+/* player rows: king | hidden + setup discard, a gap, then hand | antechamber (nudged toward the court) */
+/* player rows stay on ONE line (so the antechamber sits at the row's end, nudged toward the court): cards shrink
+   a little to fit instead of wrapping; only a phone-width screen wraps */
+.row.player { flex-wrap: nowrap; gap: 8px; align-items: flex-start; }   /* card tops line up whatever the caption length */
+.tokenbox.compact { min-width: 0; padding: 7px 8px; font-size: .74rem; }
+.row.player > .tile { flex: 0 1 74px; min-width: 48px; width: auto; }
+.row.player > .tile .card { width: 100%; }
+.row.player > .tokenbox, .row.player > .spacer { flex: 0 0 auto; }
+@media (max-width: 700px) { .row.player { flex-wrap: wrap; } }
+.spacer { width: 14px; flex: 0 0 auto; align-self: stretch; border-right: 1px dashed var(--line); margin-right: 4px; }
+.tile.ante.up { transform: translateY(-8px); }
+.tile.ante.down { transform: translateY(8px); }
+.tile.ante .cap { font-weight: 700; color: var(--fg); }
+.tile.owned .card { box-sizing: border-box; border: 3px solid var(--owner); }   /* court: who played it */
+.tile.hiddenfrom .card { border: 2px dashed var(--muted); }
+.tile.hiddenfrom .cap { font-style: italic; }
+.zname .mover { color: rgb(var(--heat)); letter-spacing: .04em; margin-left: 6px; }
+.slotph { width: 74px; aspect-ratio: 700/955; border: 1px dashed var(--line); border-radius: 6px; display: grid; place-items: center;
+  color: var(--muted); font-size: .72rem; text-align: center; padding: 4px; }
+.badge { font: 600 .72rem var(--mono); padding: 1px 5px; border-radius: 4px; background: var(--chip); color: var(--fg);
+  font-variant-numeric: tabular-nums; min-width: 4.5ch; text-align: center; position: relative; }
+.cap { font-size: .7rem; color: var(--muted); text-align: center; line-height: 1.15; max-width: 74px; overflow-wrap: anywhere; }
+.post { display: flex; width: 74px; height: 6px; border-radius: 3px; overflow: hidden; background: var(--chip); }
+.post span { display: block; height: 100%; }
+.tokenbox { min-width: 74px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--chip);
+  font-size: .8rem; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; position: relative; overflow: hidden; }
+.tokenbox b, .tokenbox .tsub { position: relative; }
+.tsub { color: var(--muted); font-size: .74rem; }
+.acts { display: flex; flex-direction: column; gap: 6px; max-height: 470px; overflow-y: auto; padding-right: 2px; }
+.act { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; text-align: left; font: inherit; color: var(--fg);
+  background: var(--chip); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; cursor: pointer; }
+/* the selected action takes the DECIDING player's colour (set as --who on #acts) */
+.act[aria-pressed="true"] { border-color: var(--who, rgb(var(--heat))); box-shadow: inset 3px 0 0 var(--who, rgb(var(--heat))); }
+.act .lbl { font-weight: 600; overflow-wrap: anywhere; }
+.act .played { font: 600 .68rem var(--body); text-transform: uppercase; letter-spacing: .08em; color: var(--who, rgb(var(--heat))); }
+.act .nums { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.num { display: flex; flex-direction: column; gap: 2px; }
+.num small { font-size: .66rem; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+.num .bar2 { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.num .bar2 span { display: block; height: 100%; background: rgb(var(--heat)); }
+.num code { font: .75rem var(--mono); font-variant-numeric: tabular-nums; }
+.rank { display: grid; grid-template-columns: 9.5ch minmax(0, 1fr) 6ch; gap: 4px 8px; align-items: center; font-size: .8rem; }
+.rank .rb { height: 8px; border-radius: 4px; background: var(--chip); overflow: hidden; position: relative; }
+.rank .rb span { position: absolute; top: 0; bottom: 0; }
+.rank code { font: .75rem var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+.log { font-size: .84rem; display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
+.log .cur { font-weight: 700; }
+.log .old { color: var(--muted); }
+.legend { display: flex; align-items: center; gap: 8px; font-size: .75rem; color: var(--muted); }
+.legend .ramp { width: 120px; height: 8px; border-radius: 4px; }
+.side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.empty { color: var(--muted); font-size: .85rem; }
+.over { font-size: .95rem; padding: 10px 12px; border-radius: 8px; background: var(--chip); border: 1px solid var(--line); }
+@media (prefers-reduced-motion: reduce) { .card { transition: none; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1 id="title">LF-B Attention Court</h1>
+    <p id="intro">Study 11's late-fusion net (LF-B) playing itself at k20. View each game from either seat, or as an observer who sees every
+      card and steps through both players' decisions. At every decision, pick a legal action to see where that action's candidate
+      token looked: its cross-attention over the 23 state tokens, always computed from the deciding player's own view. In observer
+      mode each card shows the attention of the token that stands for it; dashed cards are hidden from the deciding player.
+      Heat is normalised to the brightest token in the current view; badges show the raw weight.</p>
+  </header>
+
+  <div class="bar" role="toolbar" aria-label="Viewer controls">
+    <div class="group" id="games"><span class="glabel">Game</span></div>
+    <div class="group" id="seats"><span class="glabel">View as</span></div>
+    <div class="nav">
+      <button id="prev" type="button" aria-label="Previous decision">◀</button>
+      <input id="step" type="range" min="0" max="0" value="0" aria-label="Decision">
+      <button id="next" type="button" aria-label="Next decision">▶</button>
+      <span class="stepinfo" id="stepinfo"></span>
+    </div>
+    <div class="group" id="heads"><span class="glabel">Heads</span></div>
+    <div class="group" id="modes"><span class="glabel">Show</span></div>
+  </div>
+
+  <section class="graph" aria-label="Evaluation over the game">
+    <div class="gh"><b>Evaluation</b><span>each seat's search value at its own decisions (+1 = winning for that seat)</span>
+      <span class="key"><i style="background:var(--p1)"></i>P1 (moves first)</span><span class="key"><i style="background:var(--p2)"></i>P2</span>
+      <span>hollow = no search (a forced move, or a human's move): the net's own value</span><span>click a point to jump there</span></div>
+    <svg id="graph" role="img" aria-label="Evaluation graph"></svg>
+  </section>
+
+  <main>
+    <section class="panel" aria-label="Board"><div id="board"></div></section>
+    <div class="side">
+      <section class="panel" aria-label="Legal actions"><h2 id="actsh">Legal actions</h2><div class="acts" id="acts"></div></section>
+      <section class="panel" aria-label="Most attended tokens">
+        <h2 id="rankh">Most attended</h2><div class="legend" id="legend"></div><div class="rank" id="rank" style="margin-top:8px"></div>
+      </section>
+      <section class="panel" aria-label="Game log"><h2>Game log</h2><div class="log" id="log"></div></section>
+    </div>
+  </main>
+</div>
+
+<script type="application/json" id="data">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+// list each decision's legal actions by policy probability (softmax of the policy logits), highest first; stable, so ties keep legal-move order
+D.games.forEach(g => g.steps.forEach(s => s.cands.sort((a, b) => b.pi - a.pi)));
+// Who placed each court card. Every step's truth is the table BEFORE that step's move, and steps cover every
+// decision (forced ones too), so a card that is new on the court at step k was placed by step k-1's mover
+// (a play, an ascension, an Oathbound follow-up or a Sentry swap-in). Stored per court position.
+D.games.forEach(g => {
+  const owner = {}; let prev = new Set();
+  g.steps.map(s => s.truth.court).concat([g.final_truth.court]).forEach((court, k) => {
+    court.forEach(c => { if (k > 0 && !prev.has(c.card)) owner[c.card] = g.steps[k - 1].seat; });
+    const own = court.map(c => owner[c.card]);
+    if (k < g.steps.length) g.steps[k].court_owner = own; else g.final_owner = own;
+    prev = new Set(court.map(c => c.card));
+  });
+});
+const courtOwner = (cur, i) => { const o = (cur.st.final ? cur.g.final_owner : cur.st.court_owner) || []; return o[i] == null ? null : pcolor(cur.g, o[i]); };
+const T = D.tokens;
+const HAND_MINE = 18, HAND_THEIRS = 19, KING_MINE = 20, KING_THEIRS = 21, DECISION = 22;
+const ZCOL = ['rgb(var(--heat))', 'rgba(var(--heat), .5)', 'rgba(var(--cold), .5)', 'rgba(var(--cold), .9)'];
+const S = { g: 0, seat: null, s: 0, a: null, head: 'mean', mode: 'attn' };
+try { const z = JSON.parse(localStorage.getItem('lfviewer2') || '{}'); if (z.head != null) S.head = z.head; if (z.mode) S.mode = z.mode; } catch (e) {}
+const save = () => { try { localStorage.setItem('lfviewer2', JSON.stringify({ head: S.head, mode: S.mode })); } catch (e) {} };
+const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+const pct = v => (v * 100).toFixed(1) + '%';
+const G = () => D.games[S.g];
+const pname = (g, seat) => seat === g.starter ? 'P1' : 'P2';
+const who = (g, seat) => (g.who && g.who[seat] ? ' · ' + g.who[seat] : '');     // e.g. 'you' / the bot, in recorded games
+const pcolor = (g, seat) => seat === g.starter ? 'var(--p1)' : 'var(--p2)';
+
+function seatSteps(g, seat) {          // this seat's decisions (or every decision, as observer) + a "game over" step
+  if (seat === 'obs') return g.steps.concat([{ final: true, seat: 'obs', ply: g.moves.length, truth: g.final_truth, cands: [] }]);
+  const st = g.steps.filter(x => x.seat === seat);
+  return st.concat([{ final: true, seat, ply: g.moves.length, state: g.finals[seat], cands: [] }]);
+}
+function ensureSeat() { if (S.seat == null) S.seat = 'obs'; }          // open every game in observer mode
+
+function pill(label, pressed, onClick, extra) {
+  const b = el('button', 'pill', label); b.type = 'button'; b.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+  if (extra) b.appendChild(el('span', 'res', extra)); b.addEventListener('click', onClick); return b;
+}
+function buildControls() {
+  const clear = id => { const n = document.getElementById(id); n.querySelectorAll('.pill').forEach(p => p.remove()); return n; };
+  const gs = clear('games');
+  D.games.forEach((g, i) => gs.appendChild(pill('G' + (i + 1), i === S.g, () => { S.g = i; S.seat = null; S.s = 0; S.a = null; render(); }, (g.who && g.who[g.winner] ? g.who[g.winner] : pname(g, g.winner)) + ' won')));
+  const ss = clear('seats'); const g = G();
+  [g.starter, 1 - g.starter].forEach(seat => ss.appendChild(pill(pname(g, seat) + who(g, seat), seat === S.seat, () => { jumpSeat(seat, null); }, seat === g.winner ? 'won' : 'lost')));
+  ss.appendChild(pill('Observer', S.seat === 'obs', () => { jumpSeat('obs', null); }, 'both'));
+  const hs = clear('heads');
+  hs.appendChild(pill('Mean', S.head === 'mean', () => { S.head = 'mean'; save(); render(); }));
+  for (let h = 0; h < D.heads; h++) hs.appendChild(pill('H' + h, S.head === h, () => { S.head = h; save(); render(); }));
+  const ms = clear('modes');
+  ms.appendChild(pill('Attention', S.mode === 'attn', () => { S.mode = 'attn'; save(); render(); }));
+  ms.appendChild(pill('Δ vs played', S.mode === 'delta', () => { S.mode = 'delta'; save(); render(); }));
+}
+function jumpSeat(seat, ply) {          // switch viewing seat, keeping the position in the game
+  const g = G(); const old = seatSteps(g, S.seat)[S.s];
+  S.seat = seat; const steps = seatSteps(g, seat); const target = ply != null ? ply : (old ? old.ply : 0);
+  let k = steps.findIndex(x => x.ply >= target); if (k < 0) k = steps.length - 1; S.s = k; S.a = null; render();
+}
+
+function vecFor(c) {
+  if (S.head === 'mean') { const v = new Array(23).fill(0); c.attn.forEach(h => h.forEach((x, j) => v[j] += x / c.attn.length)); return v; }
+  return c.attn[S.head].slice();
+}
+function current() {
+  const g = G(), steps = seatSteps(g, S.seat), st = steps[S.s];
+  if (st.final) return { g, steps, st, shown: new Array(23).fill(0), scale: 1, chosen: -1, final: true };
+  const chosen = st.cands.findIndex(c => c.chosen);
+  if (S.a == null || S.a >= st.cands.length) S.a = chosen >= 0 ? chosen : 0;
+  const v = vecFor(st.cands[S.a]); let shown = v, scale;
+  if (S.mode === 'delta') { const base = vecFor(st.cands[chosen]); shown = v.map((x, j) => x - base[j]); scale = Math.max(1e-6, ...shown.map(Math.abs)); }
+  else scale = Math.max(1e-6, ...v);
+  return { g, steps, st, shown, scale, chosen, final: false };
+}
+
+function veil(x, scale) {
+  const t = Math.min(1, Math.abs(x) / scale), c = x >= 0 ? 'var(--heat)' : 'var(--cold)';
+  return { bg: `rgba(${c}, ${(0.62 * t).toFixed(3)})`,
+           glow: t > 0.04 ? `0 0 0 2px rgba(${c}, ${(0.35 + 0.65 * t).toFixed(2)}), 0 0 ${Math.round(18 * t)}px rgba(${c}, ${(0.8 * t).toFixed(2)})` : 'none' };
+}
+const fmt = x => (S.mode === 'delta' && x > 0 ? '+' : '') + pct(x);
+
+function cardTile(slot, cur, o = {}) {
+  const t = el('div', 'tile' + (o.dim ? ' dim' : '') + (o.unseen ? ' unseen' : '') + (o.lead ? ' lead' : ''));
+  const c = el('div', 'card'); const img = el('img'); img.alt = T[slot].label; img.src = D.images[T[slot].name]; c.appendChild(img);
+  const v = el('div', 'veil'); const vs = veil(cur.shown[slot], cur.scale); v.style.background = vs.bg; c.style.boxShadow = vs.glow;
+  c.appendChild(v); t.appendChild(c); t.title = `${T[slot].label}: ${fmt(cur.shown[slot])}`;
+  if (!cur.final) t.appendChild(el('span', 'badge', fmt(cur.shown[slot])));
+  if (o.post) { const p = el('div', 'post'); o.post.forEach((w, i) => { const s = el('span'); s.style.width = (w * 100) + '%'; s.style.background = ZCOL[i]; p.appendChild(s); }); t.appendChild(p); }
+  if (o.cls) t.classList.add(...o.cls.split(' '));
+  if (o.owner) { t.classList.add('owned'); t.style.setProperty('--owner', o.owner); }
+  t.appendChild(el('span', 'cap', o.cap || T[slot].label)); return t;
+}
+function tokenBox(idx, title, sub, cur, img) {
+  const b = el('div', 'tokenbox'); const v = el('div', 'veil'); const vs = veil(cur.shown[idx], cur.scale);
+  v.style.background = vs.bg; b.style.boxShadow = vs.glow; b.appendChild(v);
+  if (img) { const c = el('div', 'card'); c.style.width = '52px'; const i = el('img'); i.src = img; i.alt = title; c.appendChild(i); b.appendChild(c); }
+  b.appendChild(el('b', null, title)); if (sub) b.appendChild(el('span', 'tsub', sub));
+  if (!cur.final) b.appendChild(el('span', 'badge', fmt(cur.shown[idx]))); b.title = T[idx].label; return b;
+}
+function zone(name, note, kids, opts = {}) {
+  const z = el('div', 'zone' + (opts.sub ? ' sub' : '')); const h = el('div', 'zhead');
+  h.appendChild(el('span', 'zname', name)); if (note) h.appendChild(el('span', 'znote', note)); z.appendChild(h);
+  if (opts.events) z.appendChild(opts.events);
+  const r = el('div', 'row' + (opts.court ? ' court' : '') + (opts.player ? ' player' : '')); kids.forEach(c => r.appendChild(c)); z.appendChild(r); return z;
+}
+function moveText(g, m, seat) { return seat === 'obs' || m.seat === seat ? m.own : m.other; }
+function recentMoves(cur) {           // from this seat's previous move up to (not including) this decision
+  const prev = S.s > 0 ? cur.steps[S.s - 1].ply : 0;
+  return cur.g.moves.filter(m => m.ply >= prev && m.ply < cur.st.ply);
+}
+
+function eventChips(cur, viewer) {
+  const g = cur.g, ev = el('div', 'events');
+  recentMoves(cur).forEach(m => { const c = el('span', 'ev' + (m.reaction ? ' react' : '')); const who = el('b', null, pname(g, m.seat) + ' ');
+    who.style.color = pcolor(g, m.seat); c.appendChild(who); c.appendChild(document.createTextNode(moveText(g, m, viewer))); ev.appendChild(c); });
+  if (!ev.children.length) ev.appendChild(el('span', 'znote', 'No moves yet'));
+  return ev;
+}
+
+function cardTileFor(engineId, slot, cur, o) {   // a card tile drawn as engine card `engineId`, heat from token `slot`
+  const t = cardTile(slot, cur, o); const img = t.querySelector('img'); img.src = D.images[D.engine_names[engineId]]; img.alt = D.engine_names[engineId];
+  return t;
+}
+
+function renderObserver(cur) {
+  const g = cur.g, st = cur.st, tr = st.truth, B = document.getElementById('board'); B.replaceChildren();
+  const mover = st.final ? null : st.seat;
+  const slotOf = {}; if (!st.final) st.slot_engine.forEach((e, sl) => { slotOf[e] = sl; });
+  const hidden = {}; if (!st.final) st.state.unseen.forEach(u => { hidden[st.slot_engine[u.slot]] = u.p; });
+  const mname = mover == null ? '' : pname(g, mover);
+  const tile = (e, cap, o = {}) => {
+    const sl = st.final ? D.tokens.findIndex(k => k.name === D.engine_names[e]) : slotOf[e];
+    const shown = new Array(23).fill(0); if (!st.final) shown[sl] = cur.shown[sl];
+    const fake = { shown, scale: cur.scale, final: cur.final };
+    const isHid = e in hidden;
+    const t = cardTileFor(e, sl, fake, Object.assign({}, o, { post: isHid ? hidden[e] : null, cap: cap + (isHid ? ' · hidden from ' + mname : '') }));
+    if (isHid) t.classList.add('hiddenfrom');
+    return t;
+  };
+  const tok = (mineIdx, theirsIdx, seat) => (mover === seat ? mineIdx : theirsIdx);
+  const row = seat => {
+    const kids = [tokenBox(tok(KING_MINE, KING_THEIRS, seat), pname(g, seat) + ' king', tr.kings[seat] ? 'flipped' : 'not flipped', cur, D.images.King)];
+    if (tr.hidden[seat] != null) kids.push(tile(tr.hidden[seat], 'hidden card'));
+    if (tr.setup[seat] != null) kids.push(tile(tr.setup[seat], 'setup discard', { dim: true }));
+    kids.push(el('div', 'spacer'));
+    const hb = tokenBox(tok(HAND_MINE, HAND_THEIRS, seat), pname(g, seat) + ' hand', tr.hands[seat].length + ' cards', cur, null);
+    hb.classList.add('compact'); kids.push(hb);
+    tr.hands[seat].forEach(e => kids.push(tile(e, D.engine_names[e])));
+    const toward = seat === g.starter ? 'ante up' : 'ante down';   // P1 sits below the court, P2 above
+    tr.ante[seat].forEach(e => kids.push(tile(e, 'antechamber', { cls: toward })));
+    const z = zone(pname(g, seat) + who(g, seat), null, kids, { player: true });
+    if (mover === seat) z.querySelector('.zname').appendChild(el('span', 'mover', '· deciding'));
+    return z;
+  };
+  B.appendChild(row(1 - g.starter));
+  const court = tr.court.map((c, i) => tile(c.card, (c.disgraced ? 'disgraced' : 'power ' + c.power) + (i === tr.court.length - 1 ? ' · top' : ''),
+    { dim: c.disgraced, lead: i === tr.court.length - 1, owner: courtOwner(cur, i) }));
+  if (!court.length) court.push(el('div', 'slotph', 'court is empty'));
+  B.appendChild(zone('Court', 'bottom → top · border = who played it' + (tr.muted.length ? ' · muted value ' + tr.muted.join(', ') : '') + ' · recent moves:', court, { court: true, events: eventChips(cur, 'obs') }));
+  B.appendChild(row(g.starter));
+  const other = [];
+  tr.discard.forEach(e => other.push(tile(e, 'discard', { dim: true })));
+  if (tr.faceup != null && tr.faceup >= 0) other.push(tile(tr.faceup, 'face-up leftover'));
+  if (tr.facedown != null && tr.facedown >= 0) other.push(tile(tr.facedown, 'face-down leftover', { dim: true }));
+  other.push(tokenBox(DECISION, 'Decision', st.final ? 'game over' : mname + ': ' + st.state.step.replaceAll('_', ' ').toLowerCase(), cur, null));
+  B.appendChild(zone('Out of play & decision', mover == null ? null : 'attention is ' + mname + "'s, from " + mname + "'s own view", other));
+}
+
+function renderBoard(cur) {
+  if (S.seat === 'obs') return renderObserver(cur);
+  const s = cur.st.state, g = cur.g, me = S.seat, B = document.getElementById('board'); B.replaceChildren();
+  const opp = 1 - me;
+  const theirs = [tokenBox(KING_THEIRS, 'Their king', s.kings.theirs ? 'flipped' : 'not flipped', cur, D.images.King),
+    tokenBox(HAND_THEIRS, 'Their hand', `${s.opp_hand} cards` + (s.opp_hidden ? ' + hidden' : ''), cur, D.images.Back)];
+  theirs[1].classList.add('compact');
+  s.their_ante.forEach(sl => theirs.push(cardTile(sl, cur, { cap: 'their antechamber', cls: 'ante down' })));
+  const known = [s.lacks.length ? 'lacks ' + s.lacks.join(', ') : '', s.has.length ? 'holds ' + s.has.join(', ') : ''].filter(Boolean).join(' · ');
+  B.appendChild(zone(g.who ? pname(g, opp) + who(g, opp) : 'Opponent · ' + pname(g, opp), known, theirs, { player: true }));
+  const un = s.unseen.map(u => cardTile(u.slot, cur, { unseen: true, post: u.p, cap: T[u.slot].label + ' · ' + Math.round(u.p[0] * 100) + '% hand' }));
+  B.appendChild(zone('Unseen (most likely theirs)', 'bar: P(their hand · their hidden · their setup discard · face-down)',
+    un.length ? un : [el('span', 'empty', 'Nothing unseen')], { sub: true }));
+  const ev = eventChips(cur, me);
+  const court = s.court.map((c, i) => cardTile(c.slot, cur, { dim: c.disgraced, lead: i === s.court.length - 1, owner: courtOwner(cur, i),
+    cap: (c.disgraced ? 'disgraced' : 'power ' + c.power) + (i === s.court.length - 1 ? ' · top' : '') }));
+  if (!court.length) court.push(el('div', 'slotph', 'court is empty'));
+  B.appendChild(zone('Court', 'bottom → top · border = who played it' + (s.muted.length ? ' · muted value ' + s.muted.join(', ') : '') + ' · moves since your last move:', court, { court: true, events: ev }));
+  const mine = [tokenBox(KING_MINE, 'My king', s.kings.mine ? 'flipped' : 'not flipped', cur, D.images.King)];
+  if (s.my_hidden != null) mine.push(cardTile(s.my_hidden, cur, { cap: 'my hidden card' }));
+  if (s.my_setup != null) mine.push(cardTile(s.my_setup, cur, { cap: 'my setup discard', dim: true }));
+  mine.push(el('div', 'spacer'));
+  mine.push(tokenBox(HAND_MINE, 'My hand', `${s.my_hand.length} cards`, cur, null)); mine[mine.length - 1].classList.add('compact');
+  s.my_hand.forEach(sl => mine.push(cardTile(sl, cur, { cap: T[sl].label })));
+  s.my_ante.forEach(sl => mine.push(cardTile(sl, cur, { cap: 'my antechamber', cls: 'ante up' })));
+  B.appendChild(zone(g.who ? pname(g, me) + who(g, me) + ' · viewing' : 'You · ' + pname(g, me), null, mine, { player: true }));
+  const other = [];
+  s.discard.forEach(sl => other.push(cardTile(sl, cur, { cap: 'discard', dim: true })));
+  if (s.faceup != null) other.push(cardTile(s.faceup, cur, { cap: 'face-up leftover' }));
+  other.push(tokenBox(DECISION, 'Decision', cur.final ? 'game over' : s.step.replaceAll('_', ' ').toLowerCase() + (s.reactor ? ' (reacting)' : ''), cur, null));
+  B.appendChild(zone('Out of play & decision', null, other));
+}
+
+function renderActs(cur) {
+  const A = document.getElementById('acts'); A.replaceChildren();
+  if (cur.final) {
+    const g = cur.g; const box = el('div', 'over');
+    box.textContent = `Game over: ${pname(g, g.winner)} won. ` + (g.reason.kind === 'assassin'
+      ? `${pname(g, g.reason.kind === 'assassin' ? g.loser : g.loser)}'s flipped king was killed by the Assassin.`
+      : `${pname(g, g.loser)} had no legal move on their turn.`);
+    A.appendChild(box); document.getElementById('actsh').textContent = 'Result'; return;
+  }
+  document.getElementById('actsh').textContent = 'Legal actions · by policy';
+  A.style.setProperty('--who', pcolor(cur.g, cur.st.seat));
+  cur.st.cands.forEach((c, i) => {
+    const b = el('button', 'act'); b.type = 'button'; b.setAttribute('aria-pressed', i === S.a ? 'true' : 'false');
+    b.appendChild(el('span', 'lbl', c.label)); b.appendChild(el('span', 'played', c.chosen ? 'played' : ''));
+    const nums = el('div', 'nums');
+    [['q', (c.q >= 0 ? '+' : '') + c.q.toFixed(3), (c.q + 1) / 2], ['policy', pct(c.pi), c.pi], ['search', c.visits == null ? '—' : pct(c.visits), c.visits || 0]].forEach(([k, txt, w]) => {
+      const n = el('div', 'num'); n.appendChild(el('small', null, k)); const bar = el('div', 'bar2'); const sp = el('span');
+      sp.style.width = Math.max(0, Math.min(1, w)) * 100 + '%'; bar.appendChild(sp); n.appendChild(bar); n.appendChild(el('code', null, txt)); nums.appendChild(n); });
+    b.appendChild(nums); b.addEventListener('click', () => { S.a = i; render(); }); A.appendChild(b);
+  });
+}
+function renderRank(cur) {
+  const R = document.getElementById('rank'); R.replaceChildren(); const L = document.getElementById('legend'); L.replaceChildren();
+  document.getElementById('rankh').textContent = (S.mode === 'delta' ? 'Biggest change vs the played move' : 'Most attended') + ' · ' + (S.head === 'mean' ? 'mean of 6 heads' : 'head ' + S.head);
+  if (cur.final) { R.appendChild(el('span', 'empty', 'No decision at game end.')); return; }
+  cur.shown.map((x, j) => [x, j]).sort((a, b) => Math.abs(b[0]) - Math.abs(a[0])).slice(0, 10).forEach(([x, j]) => {
+    R.appendChild(el('span', null, T[j].label)); const rb = el('div', 'rb'); const sp = el('span'); const w = Math.abs(x) / cur.scale * 100;
+    if (S.mode === 'delta') { sp.style.left = x >= 0 ? '50%' : (50 - w / 2) + '%'; sp.style.width = w / 2 + '%'; } else { sp.style.left = '0'; sp.style.width = w + '%'; }
+    sp.style.background = x >= 0 ? 'rgb(var(--heat))' : 'rgb(var(--cold))'; rb.appendChild(sp); R.appendChild(rb); R.appendChild(el('code', null, fmt(x)));
+  });
+  const ramp = el('span', 'ramp');
+  ramp.style.background = S.mode === 'delta' ? 'linear-gradient(90deg, rgb(var(--cold)), transparent, rgb(var(--heat)))' : 'linear-gradient(90deg, transparent, rgb(var(--heat)))';
+  L.appendChild(el('span', null, S.mode === 'delta' ? 'Colour scale: less than the played move' : 'Colour scale: 0'));
+  L.appendChild(ramp); L.appendChild(el('span', null, S.mode === 'delta' ? 'more' : pct(cur.scale) + ' = brightest token'));
+}
+function renderLog(cur) {
+  const L = document.getElementById('log'); L.replaceChildren(); const g = cur.g; const recent = new Set(recentMoves(cur).map(m => m.ply));
+  g.moves.filter(m => m.ply <= cur.st.ply && (cur.final || m.ply < cur.st.ply + 1)).forEach(m => {
+    const isNow = m.ply === cur.st.ply; const line = el('span', recent.has(m.ply) || isNow ? 'cur' : 'old');
+    const who = el('b', null, pname(g, m.seat) + ' '); who.style.color = pcolor(g, m.seat); line.appendChild(who);
+    line.appendChild(document.createTextNode(moveText(g, m, S.seat) + (isNow && !cur.final ? '  ← this decision' : ''))); L.appendChild(line);
+  });
+  if (cur.final) L.appendChild(el('span', 'cur', `${pname(g, g.winner)} won: ` + (g.reason.kind === 'assassin' ? 'the Assassin struck the flipped king.' : `${pname(g, g.loser)} had no legal move.`)));
+  L.scrollTop = L.scrollHeight;
+}
+
+function renderGraph(cur) {
+  const svg = document.getElementById('graph'); svg.replaceChildren(); const g = cur.g;
+  const W = svg.clientWidth || 900, H = 130, padL = 30, padR = 10, padT = 8, padB = 18, n = Math.max(1, g.moves.length);
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const x = p => padL + (W - padL - padR) * p / n, y = v => padT + (H - padT - padB) * (1 - v) / 2;
+  const ns = 'http://www.w3.org/2000/svg', mk = (t, a) => { const e = document.createElementNS(ns, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
+  [1, 0, -1].forEach(v => { svg.appendChild(mk('line', { x1: padL, x2: W - padR, y1: y(v), y2: y(v), stroke: 'var(--grid)', 'stroke-width': v === 0 ? 1.5 : 1 }));
+    const t = mk('text', { x: padL - 6, y: y(v) + 4, 'text-anchor': 'end', 'font-size': 11, fill: 'var(--muted)', 'font-family': 'var(--mono)' }); t.textContent = (v > 0 ? '+' : '') + v; svg.appendChild(t); });
+  const xl = mk('text', { x: W - padR, y: H - 3, 'text-anchor': 'end', 'font-size': 11, fill: 'var(--muted)' }); xl.textContent = 'ply →'; svg.appendChild(xl);
+  svg.appendChild(mk('line', { x1: x(cur.st.ply), x2: x(cur.st.ply), y1: padT - 4, y2: H - padB + 2, stroke: 'rgb(var(--heat))', 'stroke-width': 2 }));
+  [g.starter, 1 - g.starter].forEach(seat => {
+    // forced plies skip search, so they carry only the net's value; plot it (hollow) so the line doesn't skip them
+    const val = s => (s.value != null ? s.value : s.net_value);
+    const pts = g.steps.filter(s => s.seat === seat && val(s) != null);
+    if (pts.length > 1) svg.appendChild(mk('polyline', { points: pts.map(p => `${x(p.ply)},${y(val(p))}`).join(' '), fill: 'none', stroke: pcolor(g, seat), 'stroke-width': 2, 'stroke-linejoin': 'round' }));
+    pts.forEach(p => {
+      const v = val(p), forced = p.value == null, why = p.forced ? 'forced' : 'no search';
+      const c = mk('circle', { cx: x(p.ply), cy: y(v), r: p === cur.st ? 5.5 : 3.5, fill: forced ? 'var(--panel)' : pcolor(g, seat), stroke: forced ? pcolor(g, seat) : 'var(--panel)', 'stroke-width': forced ? 2 : 1.5, style: 'cursor:pointer' });
+      const tt = mk('title', {}); tt.textContent = `${pname(g, seat)} · move ${p.ply + 1} · ${forced ? why + ', net value' : 'search value'} ${v >= 0 ? '+' : ''}${v.toFixed(3)}`; c.appendChild(tt);
+      c.addEventListener('click', () => jumpSeat(S.seat === 'obs' ? 'obs' : seat, p.ply)); svg.appendChild(c);
+    });
+  });
+  const end = mk('text', { x: x(n), y: padT + 2, 'text-anchor': 'end', 'font-size': 11, fill: pcolor(g, g.winner) }); end.textContent = pname(g, g.winner) + ' won'; svg.appendChild(end);
+}
+
+function render() {
+  ensureSeat(); buildControls();
+  const cur = current(); const r = document.getElementById('step'); r.max = cur.steps.length - 1; r.value = S.s;
+  document.getElementById('stepinfo').textContent = cur.final ? `end / ${cur.steps.length - 1}` : `${S.s + 1} / ${cur.steps.length - 1}` + (S.seat === 'obs' ? '' : ` · move ${cur.st.ply + 1}`) +
+    (S.seat === 'obs' ? ' · ' + pname(cur.g, cur.st.seat) : '') + (cur.st.forced ? ' · forced' : '');
+  renderGraph(cur); renderBoard(cur); renderActs(cur); renderRank(cur); renderLog(cur);
+}
+document.getElementById('prev').addEventListener('click', () => { if (S.s > 0) { S.s--; S.a = null; render(); } });
+document.getElementById('next').addEventListener('click', () => { if (S.s < seatSteps(G(), S.seat).length - 1) { S.s++; S.a = null; render(); } });
+document.getElementById('step').addEventListener('input', e => { S.s = +e.target.value; S.a = null; render(); });
+if (D.title) { document.getElementById('title').textContent = D.title; document.title = D.title; }
+if (D.intro) document.getElementById('intro').textContent = D.intro;
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return; const st = seatSteps(G(), S.seat)[S.s]; const n = st.cands.length;
+  if (e.key === 'ArrowRight') { document.getElementById('next').click(); e.preventDefault(); }
+  if (e.key === 'ArrowLeft') { document.getElementById('prev').click(); e.preventDefault(); }
+  if (n && e.key === 'ArrowDown') { S.a = Math.min(n - 1, (S.a ?? 0) + 1); render(); e.preventDefault(); }
+  if (n && e.key === 'ArrowUp') { S.a = Math.max(0, (S.a ?? 0) - 1); render(); e.preventDefault(); }
+});
+window.addEventListener('resize', () => renderGraph(current()));
+render();
+</script>

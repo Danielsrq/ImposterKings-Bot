@@ -203,6 +203,29 @@ Note also that behaviour of the attention heads are emergent i.e. I did not (cou
 The full experimental record, including the runs that failed and why, is in
 [`machine_learning/attention_exploration.md`](src/imposterkings/machine_learning/attention_exploration.md).
 
+## Late-fusion attention viewer
+The newer late-fusion net (LF-B, Study 11) encodes the table once, and then every legal move cross-attends to it. So each
+candidate move has its own attention map: where that move looked before the net scored it. The viewer is a standalone
+HTML page built from recorded games, outside the pygame app:
+
+```bash
+# your games against the bot (the app records them to datasets/human)
+python -m imposterkings.machine_learning.lf_viewer datasets/human --out reports/viewer/human.html --open
+# or LF-B playing itself
+python -m imposterkings.machine_learning.lf_attention_export --games 10 --out reports/viewer/selfplay.html
+```
+
+![LF-B attention viewer](imgs/lf-attention-viewer.png)
+
+The page steps through a game from either seat, or as an observer who sees every card:
+- **Legal actions:** each one is listed with the net's q, its policy and the recorded search's visit share.
+- **Heat:** clicking an action lights the cards by that action's attention, either the mean of the 6 heads or one head at a time.
+
+In the screenshot the bot (P1) is weighing up flipping its king. With the Assassin still unseen and most likely in my
+hand, the "flip king" candidate puts half its attention on the Assassin. The net rates the flip at −0.46 and gives it a 0.1%
+policy, and the bot plays Mystic instead. As with the drawer, attention shows what the move looked at, not the whole of
+why it scored that way: in Study 11 the cross block's feed-forward layer carried about 40% of the move-to-move contrast.
+
 ### Layout
 
 | Module | Role |

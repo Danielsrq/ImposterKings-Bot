@@ -163,6 +163,56 @@ def _slot_engine(st: F3.State3, state) -> List[int]:
     return out
 
 
+def decision_step(model, view, move, state, seat: int, ply: int, visits=None, value=None) -> dict:
+    """One decision for the viewer: every legal action's q / policy / search share and its cross-attention
+    over the 23 state tokens, computed from ``view`` (the decider's information set). ``visits`` maps a move
+    to its search visit share and ``value`` is the search's root value; both stay ``None`` when no search
+    ran (a forced ply, or a human's move in a recorded game)."""
+    import torch
+    from . import latefusion_model as LF
+    legal = view.legal_moves()
+    st, cd = F3.tokenize3(view, legal)
+    with torch.no_grad():
+        out = model(LF.collate([st], [cd]))
+    attn = out["attn_cross"][0][0].numpy()                 # [H, N, 23]
+    q = out["q"][0, :len(legal)].numpy()
+    lg = out["logit"][0, :len(legal)].numpy()
+    pi = np.exp(lg - lg.max())
+    pi /= pi.sum()
+    cands = [{"label": imperative(describe(m, view, own=True)), "q": round(float(q[i]), 4), "pi": round(float(pi[i]), 4),
+              "visits": None if visits is None else round(float(visits.get(m, 0.0)), 4), "chosen": m == move,
+              "attn": [[round(float(a), 4) for a in attn[h, i]] for h in range(attn.shape[0])]}
+             for i, m in enumerate(legal)]
+    return {"seat": seat, "ply": ply, "state": _state(view, st), "cands": cands,
+            "truth": _truth(state), "slot_engine": _slot_engine(st, state),
+            "forced": len(legal) == 1,
+            "value": None if value is None else round(float(value), 4),
+            "net_value": round(float(q.max()), 4)}
+
+
+def move_entry(view, move, seat: int, ply: int) -> dict:
+    """The move as each seat saw it (the log), plus whether it answered a reaction window."""
+    return {"ply": ply, "seat": seat, "own": describe(move, view, own=True),
+            "other": describe(move, view, own=False), "kind": move.kind.name,
+            "reaction": bool(view.pending) and view.pending[-1].kind in (
+                StepKind.REACTION_KINGSHAND, StepKind.REACTION_ASSASSIN, StepKind.REACTION_KH_VS_ASSASSIN)}
+
+
+def finish_game(steps: List[dict], moves: List[dict], final, **extra) -> dict:
+    """A finished game: the winner, how it ended, each seat's final board and the full final table."""
+    winner = final.winner
+    if moves and moves[-1]["kind"] == "DECLINE_REACTION" and len(moves) > 1 and moves[-2]["kind"] == "REVEAL_ASSASSIN":
+        reason = {"kind": "assassin", "text": "the Assassin struck the flipped king"}
+    else:
+        reason = {"kind": "stuck", "text": "had no legal move on their turn"}
+    finals = {}
+    for seat in (0, 1):
+        v = final.information_set(seat)
+        finals[seat] = _state(v, F3.tokenize_state3(v, legal_moves=[]))
+    return {**extra, "starter": final.starting_player, "winner": winner, "loser": 1 - winner, "reason": reason,
+            "steps": steps, "moves": moves, "finals": finals, "final_truth": _truth(final)}
+
+
 def play_one(lf_path: str, seed: int) -> dict:
     import torch
     torch.set_num_threads(1)
@@ -178,43 +228,40 @@ def play_one(lf_path: str, seed: int) -> dict:
     moves: List[dict] = []
 
     def on_decision(s, view, move, agent, state):
-        legal = view.legal_moves()
-        st, cd = F3.tokenize3(view, legal)
-        with torch.no_grad():
-            out = model(LF.collate([st], [cd]))
-        attn = out["attn_cross"][0][0].numpy()                 # [H, N, 23]
-        q = out["q"][0, :len(legal)].numpy()
-        lg = out["logit"][0, :len(legal)].numpy()
-        pi = np.exp(lg - lg.max())
-        pi /= pi.sum()
         res = agent.last_result
-        share = {x.move: x.visit_share for x in res.stats} if res is not None else {}
-        cands = [{"label": imperative(describe(m, view, own=True)), "q": round(float(q[i]), 4), "pi": round(float(pi[i]), 4),
-                  "visits": round(float(share.get(m, 0.0)), 4), "chosen": m == move,
-                  "attn": [[round(float(a), 4) for a in attn[h, i]] for h in range(attn.shape[0])]}
-                 for i, m in enumerate(legal)]
-        steps.append({"seat": s, "ply": len(moves), "state": _state(view, st), "cands": cands,
-                      "truth": _truth(state), "slot_engine": _slot_engine(st, state),
-                      "forced": len(legal) == 1,
-                      "value": round(float(res.root_value()), 4) if res is not None else None,
-                      "net_value": round(float(q.max()), 4)})
-        moves.append({"ply": len(moves), "seat": s, "own": describe(move, view, own=True),
-                      "other": describe(move, view, own=False), "kind": move.kind.name,
-                      "reaction": bool(view.pending) and view.pending[-1].kind in (
-                          StepKind.REACTION_KINGSHAND, StepKind.REACTION_ASSASSIN, StepKind.REACTION_KH_VS_ASSASSIN)})
+        share = {x.move: x.visit_share for x in res.stats} if res is not None else None
+        steps.append(decision_step(model, view, move, state, s, len(moves), share,
+                                   res.root_value() if res is not None else None))
+        moves.append(move_entry(view, move, s, len(moves)))
 
-    winner, _, final = play_game(agents, np.random.default_rng(seed), on_decision=on_decision)
-    loser = 1 - winner
-    if moves and moves[-1]["kind"] == "DECLINE_REACTION" and len(moves) > 1 and moves[-2]["kind"] == "REVEAL_ASSASSIN":
-        reason = {"kind": "assassin", "text": "the Assassin struck the flipped king"}
-    else:
-        reason = {"kind": "stuck", "text": "had no legal move on their turn"}
-    finals = {}
-    for seat in (0, 1):
-        v = final.information_set(seat)
-        finals[seat] = _state(v, F3.tokenize_state3(v, legal_moves=[]))
-    return {"seed": seed, "starter": final.starting_player, "winner": winner, "loser": loser, "reason": reason,
-            "steps": steps, "moves": moves, "finals": finals, "final_truth": _truth(final)}
+    _, _, final = play_game(agents, np.random.default_rng(seed), on_decision=on_decision)
+    return finish_game(steps, moves, final, seed=seed)
+
+
+TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lf_viewer_template.html")
+
+
+def make_blob(games: List[dict], lf: str, budget: str, title: str = None, intro: str = None) -> dict:
+    tokens = [{"label": lab, "name": nm} for lab, nm in zip(F3.INSTANCE_LABELS, F3.INSTANCE_NAMES)]
+    tokens += [{"label": lab, "name": None} for lab in F3.STATE_LABELS[18:]]
+    blob = {"tokens": tokens, "heads": 6, "images": _card_images(), "games": games, "lf": lf,
+            "engine_names": [cards.card_name(c) for c in range(cards.DECK_SIZE)], "budget": budget}
+    if title:
+        blob["title"] = title
+    if intro:
+        blob["intro"] = intro
+    return blob
+
+
+def write_html(blob: dict, out: str) -> None:
+    """The self-contained viewer page: the template with the data blob inlined (``</`` escaped so a string in
+    the data cannot close the script tag)."""
+    with open(TEMPLATE, encoding="utf-8") as f:
+        page = f.read()
+    data = json.dumps(blob, separators=(",", ":")).replace("</", "<\\/")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(page.replace("__DATA__", data))
 
 
 def main(argv=None) -> None:
@@ -223,16 +270,15 @@ def main(argv=None) -> None:
     p.add_argument("--lf", default=os.path.join("models", "study11", "LF-B.pt"))
     p.add_argument("--games", type=int, default=10)
     p.add_argument("--workers", type=int, default=10)
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", required=True, help="a .json data blob, or a .html page (the viewer with the data inlined)")
     a = p.parse_args(argv)
     games = list(Parallel(n_jobs=a.workers)(delayed(play_one)(a.lf, SEED_BASE + i) for i in range(a.games)))
-    tokens = [{"label": lab, "name": nm} for lab, nm in zip(F3.INSTANCE_LABELS, F3.INSTANCE_NAMES)]
-    tokens += [{"label": lab, "name": None} for lab in F3.STATE_LABELS[18:]]
-    blob = {"tokens": tokens, "heads": 6, "images": _card_images(), "games": games, "lf": a.lf,
-            "engine_names": [cards.card_name(c) for c in range(cards.DECK_SIZE)],
-            "budget": "hybrid-k20-l3"}
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(blob, f, separators=(",", ":"))
+    blob = make_blob(games, a.lf, "hybrid-k20-l3")
+    if a.out.lower().endswith(".html"):
+        write_html(blob, a.out)
+    else:
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(blob, f, separators=(",", ":"))
     print(f"{len(games)} games, {sum(len(g['steps']) for g in games)} decisions -> {a.out} "
           f"({os.path.getsize(a.out) / 1e6:.1f} MB); first player won {sum(g['winner'] == g['starter'] for g in games)}"
           f"/{len(games)}; endings {[g['reason']['kind'] for g in games]}")
